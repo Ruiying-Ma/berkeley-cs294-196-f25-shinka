@@ -1,0 +1,100 @@
+# Sample SysEvolve config using OpenAI
+max_iterations: 50
+checkpoint_interval: 5
+log_level: "DEBUG"
+language: "python"
+
+evolution_method: "base"
+num_top_programs: 2
+num_random_programs: 5
+
+diff_based_evolution: true
+max_code_length: 30000
+
+enable_parallel: false
+parallel_evaluations: 2
+
+# Checkpoint settings
+enable_checkpoints: true
+log_prompts: true
+
+# LLM configuration (nested under llm)
+llm:
+  temperature: 0.7
+  max_tokens: 30000
+  top_p: 0.95
+  timeout: 180
+  retries: 3
+  retry_delay: 5
+
+  # LLM ensemble configuration (evolution models)
+  models:
+    # - name: "gpt-5"
+    #   weight: 1.0
+    - name: "gemini-2.5-flash"
+      weight: 1.0  # Lower weight for the conservative model
+      # api_base: "https://api.openai.com/v1"
+      # api_key: ${OPENAI_API_KEY}
+      api_base: "https://generativelanguage.googleapis.com/v1beta/openai/"
+      api_key: ${GEMINI_API_KEY}
+    # - name: "gpt-4.1-mini" # o3-mini
+    #   weight: 0.2
+    #   api_key: "${OPENAI_API_KEY}"
+    #   api_base: "https://api.openai.com/v1"
+
+# Evaluator LLM ensemble (falls back to models if omitted)
+# evaluator_models:
+#   - name: "gpt-4o-mini"
+#     weight: 1.0
+#     temperature: 0.7
+#     top_p: 0.95
+#     max_tokens: 4096
+#     timeout: 60
+
+# Evolution settings
+population_size: 30
+elite_ratio: 0.2
+
+# Evaluation settings
+timeout: 60
+max_retries: 2
+
+# Cascade evaluation settings
+cascade_evaluation: true
+
+# LLM feedback settings
+use_llm_feedback: false
+llm_feedback_weight: 0.1
+
+# Artifact handling settings
+enable_artifacts: true
+max_artifact_storage: 104857600  # 100MB per program
+artifacts_base_path: null  # Defaults to db_path/artifacts
+artifact_size_threshold: 32768  # 32KB threshold
+cleanup_old_artifacts: true
+artifact_retention_days: 30
+
+# Artifact rendering settings
+include_artifacts: true
+max_artifact_bytes: 20480  # 20KB in prompt
+artifact_security_filter: true
+
+# System message for the LLM
+system_message: |
+  You are an expert in database transaction optimization. 
+  Only change code within EVOLVE-BLOCK-START and EVOLVE-BLOCK-END.
+  Your task is to improve a scheduling function to find better schedules for transactional workloads made up of read and write operations to data items. There are conflicts between these transactions on items and reducing the delay of these conflicts will lead to schedules with lower makespan. Focus on improving the get_best_schedule function to find a schedule with as low makespan as possible.
+
+  **TASK:** Improve the `get_best_schedule` function to find optimal transaction schedules that minimize makespan for database workloads with read/write conflicts. 
+  
+  **PROBLEM SPECIFICS:**
+  - **Input:** JSON workload with transactions like `"txn0":"w-17 r-5 w-3 r-4 r-54 r-14 w-6 r-11 w-22 r-7 w-1 w-8 w-9 w-27 r-2 r-25"`
+  - **Operations:** Each transaction is a sequence of read (`r-{key}`) and write (`w-{key}`) operations on data items
+  - **Conflicts:** Read-write and write-write conflicts on the same key create dependencies between transactions
+  - **Goal:** Find transaction ordering that minimizes total makespan
+
+  Focus on evolving the `get_best_schedule` function to produce the best schedule possible with the lowest makespan.
+
+  Explain step-by-step the reasoning process for your solution and how this will lead to a better schedule.
+
+

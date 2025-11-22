@@ -1,0 +1,79 @@
+evaluate_function:
+  _target_: examples.eplb.evaluate.main
+  program_path: ???
+  results_dir: ???
+
+distributed_job_config:
+  _target_: shinka.launch.SlurmCondaJobConfig
+  modules:
+  - "cuda/12.4"
+  - "cudnn/8.9.7"
+  - "hpcx/2.20"
+  eval_program_path: "shinka/eval_hydra.py"
+  conda_env: "shinka"
+  time: "00:15:00" 
+  cpus: 1
+  gpus: 0
+  mem: "16G"
+
+evo_config:
+  task_sys_msg: |
+    You are an expert in parallel computing and load balancing algorithms, specializing in Mixture-of-Expert (MoE) models. The goal is to optimize the Expert Parallelism Load Balancer (EPLB) algorithm for vLLM.
+
+    This algorithm takes load metrics recorded by the vLLM server and rearranges experts to balance the load. It can replicate some experts to achieve better load balancing.
+
+    Your dual objectives are (EQUALLY IMPORTANT):
+    1. Improve load balancing efficiency - maximize the balancedness score by distributing expert loads evenly across GPUs
+    2. Improve computational efficiency - reduce the algorithm's execution time, as perfect load balancing is NP-hard
+    
+    SCORING FORMULA (50% weight each):
+    - Balancedness score: average_load / max_load (higher is better, measures load distribution quality)
+    - Speed score: 0.02 / average_runtime (higher is better, measures algorithm speed)
+    - Combined score = 0.5 * balancedness_score + 0.5 * speed_score
+    
+    CRITICAL: Fast algorithms are AS VALUABLE as perfectly balanced ones! A slightly less balanced but much faster algorithm may score higher overall. Optimize for BOTH metrics equally!
+
+    Key directions to explore (prioritize speed AND balancedness equally):
+    1. SPEED: Reduce computational overhead - minimize sorting, lookups, and iterations
+    2. SPEED: Use efficient data structures - lists instead of complex tensors where appropriate
+    3. SPEED: Add simple caching only when beneficial (avoid complex cache overhead)
+    4. SPEED: Consider approximation algorithms that trade slight optimality for major speed gains
+    5. BALANCE: The balanced_packing function can use better packing heuristics (greedy LPT works well)
+    6. BALANCE: The replicate_experts strategy could use smarter replication policies
+    7. BALANCE: The hierarchical balancing approach may benefit from alternative grouping strategies
+    8. TOPOLOGY: Explore GPU-aware placement strategies that account for NVLink topology
+    9. OPTIMIZATION: Consider dynamic programming or memoization for repeated subproblems (but watch overhead!)
+    10. EFFICIENCY: The sorting and indexing operations could be vectorized more efficiently
+    
+    IMPORTANT: Avoid over-engineering! Simple, fast greedy heuristics often outperform complex optimization when speed is weighted equally.
+
+    The algorithm operates on workload tensors with shape [num_layers, num_logical_experts] and must produce valid mappings that respect hardware constraints (num_replicas, num_groups, num_nodes, num_gpus).
+
+    Make sure all tensor operations are correct and the output maintains proper structure for the vLLM inference engine.
+
+    Be creative and try to find new balancing strategies that outperform the baseline greedy hierarchical approach.
+  language: "python"
+  init_program_path: "examples/eplb/initial.py"
+  job_type: "slurm_conda"
+  llm_models:
+    - "o4-mini"
+    - "gpt-5"
+    - "gpt-5-mini"
+    - "gpt-5-nano"
+  llm_dynamic_selection: ucb
+  llm_kwargs:
+    temperatures:
+      - 0.0
+      - 0.5
+      - 1.0
+    max_tokens: 16384
+  meta_rec_interval: 10
+  meta_llm_models:
+    - "gpt-5-nano"
+  meta_llm_kwargs:
+    temperatures:
+      - 0.0
+  embedding_model: "text-embedding-3-small"
+
+exp_name: "shinka_eplb"
+

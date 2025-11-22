@@ -1,0 +1,109 @@
+evaluate_function:
+  _target_: examples.llm_sql.evaluate.main
+  program_path: ???
+  results_dir: ???
+
+distributed_job_config:
+  _target_: shinka.launch.SlurmCondaJobConfig
+  modules:
+  - "cuda/12.4"
+  - "cudnn/8.9.7"
+  - "hpcx/2.20"
+  eval_program_path: "shinka/eval_hydra.py"
+  conda_env: "shinka"
+  time: "00:20:00" 
+  cpus: 4
+  gpus: 0
+  mem: "32G"
+
+evo_config:
+  task_sys_msg: |
+    You are an expert in data optimization and LLM prompt caching. Your task is to evolve the DataFrame reordering algorithm to maximize prefix hit count (PHC) for efficient LLM prompt caching.
+
+    Problem Context:
+    - You are given a pandas DataFrame with text data in rows and columns
+    - The goal is to reorder columns (and optionally rows) to maximize prefix reuse when processing rows sequentially
+    - Prefix reuse occurs when consecutive rows have matching character sequences starting from the beginning
+    - This reduces LLM computation costs by reusing cached prefixes
+
+    Objective:
+    - Dual objective: (1) maximize prefix hit rate across consecutive rows and (2) minimize algorithm runtime
+    - Your goal is to evolve the Evolved class such that when rows are processed sequentially, they reuse as much prefix as possible
+    - Prefix reuse is measured by counting matching characters from the start of each row compared to all previously seen rows
+    - The combined score balances accuracy (95% weight) and speed (5% weight)
+
+    Formally:
+    - For a given column ordering C, PHC(C) = sum over all rows r of longest_common_prefix(r, all_previous_rows)
+    - Hit rate = PHC / total_string_length (normalized to 0-1)
+    - Runtime is measured in wall-clock seconds
+    - Combined score = 0.95 * average_hit_rate + 0.05 * (12 - min(12, average_runtime)) / 12
+
+    Required API (DO NOT CHANGE):
+    - Keep the Evolved class structure and reorder method signature
+    - The reorder method must accept: df, early_stop, row_stop, col_stop, col_merge, one_way_dep, distinct_value_threshold, parallel
+    - Must return: Tuple[pd.DataFrame, List[List[str]]]
+
+    Algorithm Design Guidelines:
+    1. Group rows by common values to maximize shared prefixes
+    2. Order columns by their contribution to prefix hits (frequency × length²)
+    3. Use recursive grouping to handle hierarchical patterns
+    4. Consider parallel processing for scalability
+    5. Implement early stopping for efficiency
+    6. Handle high-cardinality columns appropriately
+    7. Support column merging for related fields
+    8. Optimize the balance between greedy local decisions and global optimality
+
+    Key Methods to Optimize:
+    - find_max_group_value: Select the best grouping value
+    - reorder_columns_for_value: Determine column order for grouped rows
+    - recursive_reorder: Main recursive reordering logic
+    - column_recursion: Handle column-wise recursion within groups
+    - recursive_split_and_reorder: Parallel divide-and-conquer strategy
+
+    Constraints:
+    - Preserve all rows and data (no loss of information)
+    - Return DataFrame with same shape as input (except for column merges)
+    - Keep memory usage reasonable for large datasets
+    - Maintain deterministic behavior for reproducibility
+
+    Be creative and explore novel approaches:
+    - Alternative grouping strategies (multi-value, hierarchical, graph-based)
+    - Better heuristics for column ordering
+    - Adaptive algorithms that learn from data characteristics
+    - Hybrid approaches combining multiple strategies
+    - Machine learning-inspired optimization techniques
+
+    The algorithm will be evaluated on 5 diverse datasets:
+    1. Movies database (entertainment data)
+    2. Beer reviews (product data)
+    3. BIRD (forum posts)
+    4. PDMX (metadata)
+    5. Products (e-commerce data)
+
+    Focus on generalizable improvements that work well across different data distributions.
+  language: "python"
+  init_program_path: "examples/llm_sql/initial.py"
+  job_type: "slurm_conda"
+  llm_models:
+    - "o4-mini"
+    - "gpt-5"
+    - "gpt-5-mini"
+    - "gpt-5-nano"
+  llm_dynamic_selection: ucb
+  llm_kwargs:
+    temperatures:
+      - 0.0
+      - 0.5
+      - 1.0
+    max_tokens: 32768
+  meta_rec_interval: 10
+  meta_llm_models:
+    - "gpt-5-nano"
+  meta_llm_kwargs:
+    temperatures:
+      - 0.0
+  embedding_model: "text-embedding-3-small"
+
+exp_name: "shinka_llm_sql"
+
+

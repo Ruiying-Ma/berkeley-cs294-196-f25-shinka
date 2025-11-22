@@ -173,3 +173,12 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Evolution experiment results
+results/
+results_*/
+
+# Large data files
+expert-load.json
+*.json.gz
+*.pkl.gz

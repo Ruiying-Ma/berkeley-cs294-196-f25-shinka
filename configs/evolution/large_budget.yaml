@@ -8,7 +8,7 @@ evo_config:
     - 0.4
     - 0.4
     - 0.2
-  num_generations: 300
+  num_generations: 100
   max_parallel_jobs: 6
   max_patch_resamples: 3
   max_patch_attempts: 3
@@ -24,7 +24,7 @@ evo_config:
       - 0.0
       - 0.5
       - 1.0
-    max_tokens: 16384
+    max_tokens: 36384
   meta_rec_interval: 10
   meta_llm_models:
     - "gpt-4.1"
