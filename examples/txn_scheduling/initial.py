@@ -11,11 +11,28 @@ import os
 def find_repo_root(start_path):
     """Find the repository root by looking for openevolve_examples directory."""
     current = os.path.abspath(start_path)
+    # Search up the directory tree
     while current != os.path.dirname(current):  # Stop at filesystem root
-        if os.path.exists(os.path.join(current, 'openevolve_examples', 'txn_scheduling')):
+        candidate = os.path.join(current, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
             return current
         current = os.path.dirname(current)
-    raise RuntimeError("Could not find openevolve_examples directory")
+    
+    # If not found by searching up, try common locations relative to known paths
+    # This handles when the program is copied to a results directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    possible_roots = [
+        script_dir,  # Current directory
+        os.path.dirname(script_dir),  # Parent
+        os.path.dirname(os.path.dirname(script_dir)),  # Grandparent
+        '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',  # Absolute path fallback
+    ]
+    for root in possible_roots:
+        candidate = os.path.join(root, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return root
+    
+    raise RuntimeError(f"Could not find openevolve_examples directory. Searched from: {start_path}")
 
 repo_root = find_repo_root(os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'txn_scheduling'))

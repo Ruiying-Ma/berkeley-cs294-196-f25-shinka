@@ -1,0 +1,48 @@
+evaluate_function:
+  _target_: examples.prism.evaluate.main
+  program_path: ???
+  results_dir: ???
+
+distributed_job_config:
+  _target_: shinka.launch.SlurmCondaJobConfig
+  modules:
+  - "cuda/12.4"
+  - "cudnn/8.9.7"
+  - "hpcx/2.20"
+  eval_program_path: "shinka/eval_hydra.py"
+  conda_env: "shinka"
+  time: "00:15:00" 
+  cpus: 1
+  gpus: 0
+  mem: "16G"
+
+evo_config:
+  task_sys_msg: |
+    You are an expert for model placement on GPUs. Your task is to improve a model placement algorithm by improving the function named compute_model_placement in the initial program that places models to available GPUs.
+    
+    The algorithm must MINIMIZE the maximum KVPR across all GPUs while ensuring models can fit into the GPUs' memory. Note that KVPR is KV cache pressure for a GPU. It indicates how crowded a GPU is. For a specific GPU, its KVPR is computed as sum(model.req_rate/model.slo for model in models) / (GPU_MEM_SIZE - sum(model.model_size for model in models)), where models are the models on this GPU. The generated program should be as simple as possible and the code should be executed correctly without errors.
+  language: "python"
+  init_program_path: "examples/prism/initial.py"
+  job_type: "slurm_conda"
+  llm_models:
+    - "o4-mini"
+    - "gpt-5"
+    - "gpt-5-mini"
+    - "gpt-5-nano"
+  llm_dynamic_selection: ucb
+  llm_kwargs:
+    temperatures:
+      - 0.0
+      - 0.5
+      - 1.0
+    max_tokens: 16384
+  meta_rec_interval: 10
+  meta_llm_models:
+    - "gpt-5-nano"
+  meta_llm_kwargs:
+    temperatures:
+      - 0.0
+  embedding_model: "text-embedding-3-small"
+
+exp_name: "shinka_prism"
+

@@ -1,28 +1,31 @@
 import functools
 import importlib.util
 import json
-import os
 import time
 import traceback
+import os
 from typing import TypedDict
 
 import torch
 
-# Use path relative to this file's location, not current working directory
-WORKLOAD_PATH = os.path.join(os.path.dirname(__file__), "expert-load.json")
+# Try the specified path first, fall back to local if not found
+WORKLOAD_PATH_REMOTE = "/home/bowen/vllm/expert-load/expert-load-20250627_103226-1200.json"
+WORKLOAD_PATH_LOCAL = os.path.join(os.path.dirname(__file__), "expert-load.json")
+
+# Use remote if it exists, otherwise use local
+if os.path.exists(WORKLOAD_PATH_REMOTE):
+    WORKLOAD_PATH = WORKLOAD_PATH_REMOTE
+    print(f"Using remote workload: {WORKLOAD_PATH}")
+else:
+    WORKLOAD_PATH = WORKLOAD_PATH_LOCAL
+    print(f"Remote workload not found, using local: {WORKLOAD_PATH}")
+
 REBALANCE_INTERVAL = 100
 
 NUM_REPLICAS = 288
 NUM_GROUPS = 8
 NUM_GPUS = 32
 NUM_NODES = 4
-
-# Check if workload file exists
-if not os.path.exists(WORKLOAD_PATH):
-    raise FileNotFoundError(f"Workload file {WORKLOAD_PATH} not found. "
-        "Please download the workload file as instructed in the `README.md` "
-        "under the `eplb` directory."
-    )
 
 @functools.cache
 def load_workloads(path: str) -> list[torch.Tensor]: 
@@ -164,4 +167,51 @@ def evaluate(program_path: str) -> EvaluationResult:
         "combined_score": 0.0,
         "error": "No error",
     }
+
+
+if __name__ == "__main__":
+    import sys
     
+    programs = [
+        ('initial_program.py', 'Baseline'),
+        ('best_shinka_program.py', 'Best v1'),
+        ('best_shinka_program_2.py', 'Best v2 (new)'),
+    ]
+    
+    print('=' * 80)
+    print('COMPARATIVE EVALUATION WITH CUSTOM WORKLOAD')
+    print('=' * 80)
+    print()
+    
+    results = []
+    for prog_path, prog_name in programs:
+        if not os.path.exists(prog_path):
+            print(f'Warning: {prog_path} not found, skipping...')
+            continue
+        print(f'Evaluating {prog_name}...')
+        result = evaluate(prog_path)
+        results.append((prog_name, result))
+        print()
+    
+    print('=' * 80)
+    print('COMPARISON TABLE')
+    print('=' * 80)
+    print(f"{'Program':<20} {'Balancedness':>15} {'Speed':>12} {'Combined':>12}")
+    print('-' * 80)
+    for prog_name, result in results:
+        bal = result.get('balancedness_score', 0)
+        speed = result.get('speed_score', 0)
+        combined = result.get('combined_score', 0)
+        print(f'{prog_name:<20} {bal:>15.6f} {speed:>12.6f} {combined:>12.6f}')
+    print('=' * 80)
+    
+    # Show improvement
+    if len(results) >= 2:
+        baseline_score = results[0][1].get('combined_score', 0)
+        for i in range(1, len(results)):
+            prog_name = results[i][0]
+            score = results[i][1].get('combined_score', 0)
+            if baseline_score > 0:
+                improvement = ((score - baseline_score) / baseline_score) * 100
+                print(f'{prog_name} vs Baseline: {improvement:+.2f}%')
+

@@ -1,0 +1,16 @@
+{
+  "combined_score": 0.8340686853551077,
+  "public": {
+    "counter_repair_accuracy": "0.826",
+    "status_repair_accuracy": "1.000",
+    "confidence_calibration": "0.822",
+    "num_scenarios": 0
+  },
+  "private": {
+    "combined_score": 0.8340686853551077,
+    "counter_repair_accuracy": 0.8262134328323463,
+    "status_repair_accuracy": 1.0,
+    "confidence_calibration": 0.8220430536542402,
+    "num_tests": 30
+  }
+}

@@ -18,28 +18,24 @@ distributed_job_config:
 
 evo_config:
   task_sys_msg: |
-    You are an expert in transaction scheduling and database optimization. The goal is to minimize the total makespan across three different workload types by optimizing the scheduling algorithm.
+    You are an expert in database transaction optimization.
+    Your task is to improve a scheduling function to find better schedules for transactional workloads made up of read and write operations to data items. There are conflicts between these transactions on items and reducing the delay of these conflicts will lead to schedules with lower makespan. Focus on improving the get_best_schedule function to find a schedule with as low makespan as possible.
 
-    Key directions to explore:
-    1. The greedy cost sampling strategy can be improved with better sampling techniques
-    2. Consider different starting point selection strategies beyond random
-    3. Explore adaptive sampling rates based on workload characteristics
-    4. The cost calculation function can be optimized for different workload patterns
-    5. Consider workload-aware scheduling that adapts to transaction patterns
-    6. Explore hybrid approaches combining multiple scheduling strategies
-    7. The random sampling component can be replaced with more intelligent selection
-    8. Consider parallel processing opportunities for independent transactions
-    9. Explore dynamic parameter tuning based on workload characteristics
-    10. Consider machine learning approaches for pattern recognition in transaction sequences
+    **TASK:** Improve the `get_best_schedule` function to find optimal transaction schedules that minimize makespan for database workloads with read/write conflicts. 
 
-    The algorithm should handle three workload types:
-    - Workload 1: Complex mixed read/write transactions with varying lengths
-    - Workload 2: Simple read-then-write pattern transactions  
-    - Workload 3: Minimal read/write operations
+    **PROBLEM SPECIFICS:**
+    - **Input:** JSON workload with transactions like `"txn0":"w-17 r-5 w-3 r-4 r-54 r-14 w-6 r-11 w-22 r-7 w-1 w-8 w-9 w-27 r-2 r-25"`
+    - **Operations:** Each transaction is a sequence of read (`r-{key}`) and write (`w-{key}`) operations on data items
+    - **Conflicts:** Read-write and write-write conflicts on the same key create dependencies between transactions
+    - **Goal:** Find transaction ordering that minimizes total makespan
 
-    Make sure that all schedules are valid (no duplicates, all transactions included) and the algorithm runs efficiently.
+     **SEARCH SUGGESTIONS:**
+    - **Greedy:** You can try a greedy algorithm to iteratively pick the transaction that increases makespan the least.
+    - Avoid only using heuristics like transaction length, number of writes, etc. because these do not correspond to the actual makespan of the schedule.
 
-    Be creative and try to find new scheduling strategies that outperform the baseline greedy approach.
+    Focus on evolving the `get_best_schedule` function to produce the best schedule possible with the lowest makespan.
+
+    Explain step-by-step the reasoning process for your solution and how this will lead to a better schedule.
   language: "python"
   init_program_path: "examples/txn_scheduling/initial.py"
   job_type: "slurm_conda"

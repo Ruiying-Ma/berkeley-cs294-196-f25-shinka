@@ -12,14 +12,14 @@ def main():
     cli_overrides = sys.argv[1:] if len(sys.argv) > 1 else []
     
     # Initialize Hydra with the config from the main configs directory
-    with initialize(version_base=None, config_path="../../configs", job_name="eplb_evolution"):
+    with initialize(version_base=None, config_path="../../configs", job_name="txn_scheduling_evolution"):
         base_overrides = [
-            "variant@_global_=eplb_example",
-            "job_config.eval_program_path=examples/eplb/evaluate.py"  # Override for local execution
+            "variant@_global_=txn_scheduling_example",
+            "job_config.eval_program_path=examples/txn_scheduling/evaluate.py"  # Override for local execution
         ]
         cfg = compose(config_name="config", overrides=base_overrides + cli_overrides)
         
-    print("EPLB Evolution Configuration:")
+    print("Transaction Scheduling Evolution Configuration:")
     print(OmegaConf.to_yaml(cfg, resolve=True))
     
     # Instantiate configs
@@ -39,4 +39,3 @@ def main():
 
 if __name__ == "__main__":
     results_data = main()
-
