@@ -81,6 +81,7 @@ run_experiment() {
     python examples/prism/run_evo.py \
         evo_config.num_generations=100 \
         evo_config.llm_models="[${model_name}]" \
+        evo_config.meta_llm_models="[${model_name}]" \
         evo_config.llm_dynamic_selection='null' \
         results_dir="${RESULTS_BASE_DIR}" \
         exp_name="shinka_prism_${config_name}_run${run_number}_${TIMESTAMP}" \
