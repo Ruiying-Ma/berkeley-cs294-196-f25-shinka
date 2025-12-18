@@ -2,6 +2,11 @@ examples/caching_*/
 bash_script/
 run_evo_default.py
 test_llm.py
+examples/eplb/
+examples/llm_sql/
+examples/prism/
+examples/telemetry_repair/
+examples/txn_scheduling/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
