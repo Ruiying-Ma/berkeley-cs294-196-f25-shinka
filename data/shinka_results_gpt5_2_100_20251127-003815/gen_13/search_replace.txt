@@ -1,0 +1,286 @@
+<NAME>
+slru_lrfu_tinylfu_admission_scan_guard
+</NAME>
+
+<DESCRIPTION>
+I add a lightweight TinyLFU-style frequency sketch to guide admission and promotion decisions, and I temper the protected segment adaptation to reduce oscillations and scan pollution. Specifically:
+- Use a small Count-Min Sketch (4 hashes, width 2048) with periodic aging to estimate key popularity.
+- On insert (miss), admit to protected only if the sketch estimate ≥ 2; otherwise, keep in probation. This prevents one-hit wonders from polluting the protected segment.
+- On hit in probation, promote to protected only if the sketch estimate ≥ 2; otherwise, stay in probation but boost score. This gates promotion by frequency.
+- Increase protected capacity on real promotions; remove the previous aggressive reduction on protected hits to avoid oscillation.
+- Add a simple scan guard: track miss streak; if it exceeds 2×current cache size, reduce protected cap to at most ~25% to favor recency during scans.
+- Slightly lengthen the LRFU half-life from 8 to 16 to remember useful frequency longer.
+
+These changes improve hit rates across mixed workloads by combining SLRU’s two segments with LRFU’s decay and TinyLFU’s frequency-aware admission, while mitigating scans.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+# Configuration: half-life in number of accesses for score decay.
+# After DECAY_HALF_LIFE accesses without a hit, a key's score halves.
+DECAY_HALF_LIFE = 8
+DECAY_BASE = 2 ** (-1.0 / DECAY_HALF_LIFE)
+=======
+# Configuration: half-life in number of accesses for score decay.
+# After DECAY_HALF_LIFE accesses without a hit, a key's score halves.
+DECAY_HALF_LIFE = 16
+DECAY_BASE = 2 ** (-1.0 / DECAY_HALF_LIFE)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+# Per-key metadata for cached objects
+_key_score = dict()      # key -> float decayed frequency score
+_key_last_time = dict()  # key -> int last access_count when we updated its score
+
+# Segmented resident sets
+_probation = set()       # keys admitted recently or with single hit
+_protected = set()       # keys with demonstrated frequency
+_prot_cap = 0            # adaptive target size (in number of keys) for protected segment
+
+def _prune_membership(cache_snapshot):
+=======
+# Per-key metadata for cached objects
+_key_score = dict()      # key -> float decayed frequency score
+_key_last_time = dict()  # key -> int last access_count when we updated its score
+
+# Segmented resident sets
+_probation = set()       # keys admitted recently or with single hit
+_protected = set()       # keys with demonstrated frequency
+_prot_cap = 0            # adaptive target size (in number of keys) for protected segment
+
+# TinyLFU-style frequency sketch (small CM-sketch with periodic aging)
+_sketch_d = 4
+_sketch_width_power = 11  # width = 2^11 = 2048
+_sketch_w = 1 << _sketch_width_power
+_sketch_mask = _sketch_w - 1
+_sketch_tables = [[0] * _sketch_w for _ in range(_sketch_d)]
+_sketch_ops = 0
+_sketch_age_period = max(1024, _sketch_w)
+_sketch_seeds = (0x9e3779b1, 0x85ebca77, 0xc2b2ae3d, 0x27d4eb2f)
+
+_miss_streak = 0  # simple scan detector
+
+def _sketch_idx(h: int, i: int) -> int:
+    s = _sketch_seeds[i % len(_sketch_seeds)]
+    x = (h ^ s) * 0x9e3779b97f4a7c15
+    # keep to python int then mask to width
+    return (x ^ (x >> 33)) & _sketch_mask
+
+def _sketch_maybe_age():
+    global _sketch_ops
+    _sketch_ops += 1
+    if _sketch_ops % _sketch_age_period == 0:
+        for t in _sketch_tables:
+            for j in range(_sketch_w):
+                t[j] >>= 1
+
+def _sketch_increment(key: str, amount: int = 1):
+    h = hash(key)
+    for i in range(_sketch_d):
+        idx = _sketch_idx(h, i)
+        v = _sketch_tables[i][idx] + amount
+        _sketch_tables[i][idx] = 255 if v > 255 else v
+    _sketch_maybe_age()
+
+def _sketch_estimate(key: str) -> int:
+    h = hash(key)
+    est = 1 << 30
+    for i in range(_sketch_d):
+        v = _sketch_tables[i][_sketch_idx(h, i)]
+        if v < est:
+            est = v
+    return est
+
+def _prune_membership(cache_snapshot):
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global _prot_cap
+    now = cache_snapshot.access_count
+
+    _prune_membership(cache_snapshot)
+
+    # Initialize protected capacity target if unset
+    cur_cap = max(1, len(cache_snapshot.cache))
+    if _prot_cap <= 0:
+        _prot_cap = max(1, cur_cap // 2)
+
+    # Update decayed score and last time
+    _ensure_meta(obj.key, now)
+
+    # Promotion logic and adaptive protected sizing
+    if obj.key in _probation:
+        # Promote to protected on first observed hit
+        _probation.discard(obj.key)
+        _protected.add(obj.key)
+        # Bias toward larger protected region when we observe probation hits
+        if _prot_cap < cur_cap:
+            _prot_cap += 1
+    else:
+        # If unknown to segments, treat as protected (robustness)
+        _protected.add(obj.key)
+        _probation.discard(obj.key)
+        # Slightly reduce protected target on protected hits to keep room for recency
+        if _prot_cap > 1:
+            _prot_cap -= 1
+
+    # Frequency boost; slightly stronger in protected
+    if obj.key in _protected:
+        _key_score[obj.key] += 1.5
+    else:
+        _key_score[obj.key] += 1.0
+
+    # Enforce protected capacity by demoting weakest protected key
+    _enforce_protected_cap(now)
+=======
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global _prot_cap, _miss_streak
+    now = cache_snapshot.access_count
+
+    _prune_membership(cache_snapshot)
+
+    # Initialize protected capacity target if unset
+    cur_cap = max(1, len(cache_snapshot.cache))
+    if _prot_cap <= 0:
+        _prot_cap = max(1, cur_cap // 2)
+
+    # Count this access in the frequency sketch
+    _sketch_increment(obj.key, 1)
+
+    # Update decayed score and last time
+    _ensure_meta(obj.key, now)
+
+    # Reset miss streak on hit
+    _miss_streak = 0
+
+    # Promotion logic gated by TinyLFU estimate
+    est = _sketch_estimate(obj.key)
+    if obj.key in _probation:
+        if est >= 2:
+            _probation.discard(obj.key)
+            _protected.add(obj.key)
+            # Bias toward larger protected region when we observe qualified promotions
+            if _prot_cap < cur_cap:
+                _prot_cap += 1
+        else:
+            # Stay in probation; just boost score a bit
+            pass
+    elif obj.key in _protected:
+        # Already protected; keep as is
+        pass
+    else:
+        # If unknown to segments but cache hit (robustness), consider it hot enough to protect
+        if est >= 2:
+            _protected.add(obj.key)
+            _probation.discard(obj.key)
+        else:
+            _probation.add(obj.key)
+            _protected.discard(obj.key)
+
+    # Frequency boost; slightly stronger in protected
+    if obj.key in _protected:
+        _key_score[obj.key] += 1.5
+    else:
+        _key_score[obj.key] += 1.0
+
+    # Enforce protected capacity by demoting weakest protected key
+    _enforce_protected_cap(now)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global _prot_cap
+    now = cache_snapshot.access_count
+
+    _prune_membership(cache_snapshot)
+
+    # Initialize protected capacity on cold start
+    cur_cap = max(1, len(cache_snapshot.cache))
+    if _prot_cap <= 0:
+        _prot_cap = max(1, cur_cap // 2)
+
+    # Admit into probation with a small initial score to reduce scan pollution.
+    _probation.add(obj.key)
+    _protected.discard(obj.key)
+
+    _key_last_time[obj.key] = now
+    _key_score[obj.key] = 0.1
+=======
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global _prot_cap, _miss_streak
+    now = cache_snapshot.access_count
+
+    _prune_membership(cache_snapshot)
+
+    # Initialize protected capacity on cold start
+    cur_cap = max(1, len(cache_snapshot.cache))
+    if _prot_cap <= 0:
+        _prot_cap = max(1, cur_cap // 2)
+
+    # Count this access (miss) in the frequency sketch
+    _sketch_increment(obj.key, 1)
+    est = _sketch_estimate(obj.key)
+
+    # Admission: hot-admit to protected only if estimated frequency is at least 2
+    if est >= 2:
+        _protected.add(obj.key)
+        _probation.discard(obj.key)
+        _key_last_time[obj.key] = now
+        _key_score[obj.key] = 0.6  # slightly higher initial score for protected admits
+        if _prot_cap < cur_cap:
+            _prot_cap += 1
+    else:
+        _probation.add(obj.key)
+        _protected.discard(obj.key)
+        _key_last_time[obj.key] = now
+        _key_score[obj.key] = 0.1  # conservative initial score to avoid scan pollution
+
+    # Update miss streak and apply a simple scan guard
+    _miss_streak += 1
+    if _miss_streak > 2 * cur_cap and _prot_cap > max(1, cur_cap // 4):
+        # Shift toward recency under sustained misses (scans)
+        _prot_cap = max(max(1, cur_cap // 4), _prot_cap - max(1, _prot_cap // 2))
+
+    # Enforce protected capacity by demoting weakest protected key if needed
+    _enforce_protected_cap(now)
+>>>>>>> REPLACE
+
+</DIFF>

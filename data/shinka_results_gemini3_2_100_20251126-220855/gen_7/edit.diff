@@ -1,0 +1,220 @@
+--- a/original.py
++++ b/original.py
+@@ -1,131 +1,129 @@
+ # EVOLVE-BLOCK-START
+-"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
++from collections import OrderedDict
+ 
+-m_key_metadata = dict()
++# Global ARC State
++# m_t1: Recent items (in cache)
++# m_t2: Frequent items (in cache)
++# m_b1: Ghost Recent (evicted history)
++# m_b2: Ghost Frequent (evicted history)
++# m_p: Target size for T1
++m_t1 = OrderedDict()
++m_t2 = OrderedDict()
++m_b1 = OrderedDict()
++m_b2 = OrderedDict()
++m_p = 0.0
+ 
+ def evict(cache_snapshot, obj):
+     '''
+-    This function defines how the algorithm chooses the eviction victim.
+-    - Args:
+-        - `cache_snapshot`: A snapshot of the current cache state.
+-        - `obj`: The new object that needs to be inserted into the cache.
+-    - Return:
+-        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
++    ARC Eviction Policy.
++    - Adapts m_p based on hits in ghost lists (B1/B2).
++    - Selects victim from T1 or T2 based on target size m_p.
+     '''
+-    # SLRU Implementation
+-    # Segments: 0 = Probationary, 1 = Protected
+-    PROTECTED_RATIO = 0.8
++    global m_p
+     capacity = cache_snapshot.capacity
+-    limit_prot = capacity * PROTECTED_RATIO
+-
+-    lru_prob_key = None
+-    lru_prob_ts = float('inf')
+-    lru_prot_key = None
+-    lru_prot_ts = float('inf')
+-    num_prot = 0
+-
+-    for key in cache_snapshot.cache:
+-        # metadata: [segment, timestamp]
+-        # Default to probationary if missing (safety)
+-        meta = m_key_metadata.get(key, [0, 0])
+-        segment = meta[0]
+-        ts = meta[1]
+-
+-        if segment > 0:
+-            num_prot += 1
+-            if ts < lru_prot_ts:
+-                lru_prot_ts = ts
+-                lru_prot_key = key
+-        else:
+-            if ts < lru_prob_ts:
+-                lru_prob_ts = ts
+-                lru_prob_key = key
+-
+-    # Logic to enforce segment sizes and choose victim
+-    if num_prot > limit_prot:
+-        # Protected segment is full, demote LRU of Protected to Probationary
+-        if lru_prot_key:
+-            # Demote: Set segment to 0 and update timestamp to now (MRU of Prob)
+-            m_key_metadata[lru_prot_key][0] = 0
+-            m_key_metadata[lru_prot_key][1] = cache_snapshot.access_count
+-
+-        # After demotion (or if we couldn't demote), evict from Probationary
+-        if lru_prob_key:
+-            return lru_prob_key
+-        else:
+-            # If Probationary was empty (and we just demoted someone who is kept),
+-            # strictly speaking, we need to evict.
+-            # If we demoted lru_prot_key, it is now in Probationary.
+-            # Ideally we pick the LRU of the NEW Probationary set.
+-            # If Prob was empty, the demoted item is the ONLY item in Prob.
+-            # So we would evict it.
+-            return lru_prot_key
++    key = obj.key
++    
++    # 1. Adapt m_p (Target T1 size)
++    # If hit in B1 (Recency Ghost), increase p (favor Recency)
++    # If hit in B2 (Frequency Ghost), decrease p (favor Frequency)
++    if key in m_b1:
++        delta = 1.0
++        if len(m_b1) < len(m_b2):
++            delta = float(len(m_b2)) / len(m_b1)
++        m_p = min(float(capacity), m_p + delta)
++    elif key in m_b2:
++        delta = 1.0
++        if len(m_b2) < len(m_b1):
++            delta = float(len(m_b1)) / len(m_b2)
++        m_p = max(0.0, m_p - delta)
++    
++    # 2. Select Victim
++    # We evict from T1 if it exceeds the target size p, 
++    # or under specific boundary conditions implied by ARC.
++    replace_p = m_p
++    len_t1 = len(m_t1)
++    
++    evict_t1 = False
++    if len_t1 > 0:
++        if len_t1 > replace_p:
++            evict_t1 = True
++        elif (key in m_b2) and (len_t1 == int(replace_p)):
++             # If we hit B2, we want to shrink T1, so if we are at the limit, evict T1.
++             evict_t1 = True
++    
++    # If T2 is empty, we must evict from T1 regardless of p
++    if evict_t1 or not m_t2:
++        return next(iter(m_t1))
+     else:
+-        # Protected not full, evict from Probationary if possible
+-        if lru_prob_key:
+-            return lru_prob_key
+-        else:
+-            # Probationary empty, must evict from Protected
+-            return lru_prot_key
++        return next(iter(m_t2))
+ 
+ def update_after_hit(cache_snapshot, obj):
+     '''
+-    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+-    - Args:
+-        - `cache_snapshot`: A snapshot of the current cache state.
+-        - `obj`: The object accessed during the cache hit.
+-    - Return: `None`
++    On hit, move to MRU of T2 (Frequent list).
+     '''
+-    global m_key_metadata
+-    if obj.key in m_key_metadata:
+-        # Promote to Protected (1) and update timestamp
+-        m_key_metadata[obj.key] = [1, cache_snapshot.access_count]
++    key = obj.key
++    if key in m_t1:
++        del m_t1[key]
++        m_t2[key] = None
++    elif key in m_t2:
++        m_t2.move_to_end(key)
+     else:
+-        # Should normally exist, but handle gracefully
+-        m_key_metadata[obj.key] = [1, cache_snapshot.access_count]
++        # Fallback for sync issues, though shouldn't occur
++        m_t2[key] = None
+ 
+ def update_after_insert(cache_snapshot, obj):
+     '''
+-    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+-    - Args:
+-        - `cache_snapshot`: A snapshot of the current cache state.
+-        - `obj`: The object that was just inserted into the cache.
+-    - Return: `None`
++    On insert, place in T1 or promote ghost to T2.
+     '''
+-    global m_key_metadata
+-    # Insert into Probationary (0)
+-    m_key_metadata[obj.key] = [0, cache_snapshot.access_count]
++    key = obj.key
++    if key in m_b1:
++        del m_b1[key]
++        m_t2[key] = None
++    elif key in m_b2:
++        del m_b2[key]
++        m_t2[key] = None
++    else:
++        m_t1[key] = None
+ 
+ def update_after_evict(cache_snapshot, obj, evicted_obj):
+     '''
+-    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+-    - Args:
+-        - `cache_snapshot`: A snapshot of the current cache state.
+-        - `obj`: The object to be inserted into the cache.
+-        - `evicted_obj`: The object that was just evicted from the cache.
+-    - Return: `None`
++    Move evicted item to corresponding ghost list (B1 or B2).
++    Maintain ghost list sizes.
+     '''
+-    global m_key_metadata
+-    m_key_metadata.pop(evicted_obj.key, None)
++    key = evicted_obj.key
++    capacity = cache_snapshot.capacity
++    
++    if key in m_t1:
++        del m_t1[key]
++        m_b1[key] = None
++    elif key in m_t2:
++        del m_t2[key]
++        m_b2[key] = None
++        
++    # Lazy cleanup of ghost lists to keep memory bounded
++    if len(m_b1) > capacity:
++        m_b1.popitem(last=False)
++    if len(m_b2) > capacity * 2:
++        m_b2.popitem(last=False)
+ 
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

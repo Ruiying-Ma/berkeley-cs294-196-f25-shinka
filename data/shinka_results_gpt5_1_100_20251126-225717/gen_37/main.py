@@ -1,0 +1,421 @@
+# EVOLVE-BLOCK-START
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+
+from collections import deque
+
+# General timestamp ledger (key -> last access time)
+m_key_timestamp = dict()
+
+# Segmented LRU metadata: probation and protected segments (key -> last access time)
+_probation = dict()
+_protected = dict()
+
+# Ghost histories (ARC-like feedback) (key -> last seen time when evicted)
+_ghost_probation = dict()
+_ghost_protected = dict()
+
+# Adaptive target for protected share of cache
+_prot_ratio = 0.66  # frequency bias baseline
+
+def _clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+def _cap(cache_snapshot):
+    cap = int(getattr(cache_snapshot, "capacity", 1) or 1)
+    return max(cap, 1)
+
+def _get_caps(cache_snapshot):
+    """Compute target sizes for probation and protected segments using adaptive ratio."""
+    global _prot_ratio
+    total_cap = _cap(cache_snapshot)
+    # Bound protected ratio to keep both segments non-empty when cap > 1
+    lo = 0.1 if total_cap > 1 else 0.0
+    hi = 0.9 if total_cap > 1 else 1.0
+    pr = _clamp(_prot_ratio, lo, hi)
+    prot_cap = int(round(total_cap * pr))
+    prot_cap = min(max(prot_cap, 1 if total_cap > 1 else 0), total_cap - 1 if total_cap > 1 else 1)
+    prob_cap = max(total_cap - prot_cap, 1)
+    return prob_cap, prot_cap
+
+def _lru_key_in(seg_dict, cache_snapshot):
+    """Return the LRU key from seg_dict that is currently in the cache."""
+    min_key = None
+    min_ts = None
+    cache_keys = cache_snapshot.cache.keys()
+    for k, ts in seg_dict.items():
+        if k in cache_keys:
+            if (min_ts is None) or (ts < min_ts):
+                min_ts = ts
+                min_key = k
+    return min_key
+
+def _lru_key(seg_dict):
+    """Return the LRU key from seg_dict irrespective of cache presence."""
+    min_key = None
+    min_ts = None
+    for k, ts in seg_dict.items():
+        if (min_ts is None) or (ts < min_ts):
+            min_ts = ts
+            min_key = k
+    return min_key
+
+def _trim_ghosts(cache_snapshot):
+    """Keep ghost histories bounded to avoid memory growth."""
+    total_cap = _cap(cache_snapshot)
+    limit = max(2 * total_cap, 1)
+    # Remove oldest from the larger ghost first
+    while (len(_ghost_probation) + len(_ghost_protected)) > limit:
+        if len(_ghost_probation) >= len(_ghost_protected):
+            k = _lru_key(_ghost_probation)
+            if k is None:
+                break
+            _ghost_probation.pop(k, None)
+        else:
+            k = _lru_key(_ghost_protected)
+            if k is None:
+                break
+            _ghost_protected.pop(k, None)
+
+# TinyLFU-like frequency counters with periodic aging
+_freq = {}              # key -> small int
+_FREQ_MAX = 7
+_last_age = 0
+
+def _age_frequency(now, cap):
+    global _last_age
+    if now - _last_age >= cap:
+        for k in list(_freq.keys()):
+            v = _freq.get(k, 0) >> 1
+            if v > 0:
+                _freq[k] = v
+            else:
+                _freq.pop(k, None)
+        _last_age = now
+
+def _bump_freq(k, inc=1):
+    if inc <= 0:
+        return
+    _freq[k] = min(_FREQ_MAX, _freq.get(k, 0) + inc)
+
+# Scan detector: sliding window of last W events (2 = hit, 1 = new miss, 0 = ghost miss)
+_scan_W = None
+_scan_q = deque()
+_scan_hits = 0
+_scan_new = 0
+_touch = {}  # key -> number of recent touches while in probation (for promotion gating)
+
+def _init_scan(cache_snapshot):
+    global _scan_W
+    cap = _cap(cache_snapshot)
+    W = max(2 * cap, 8)
+    if _scan_W != W:
+        _scan_W = W
+        _scan_q.clear()
+        # Keep counters roughly in sync
+        global _scan_hits, _scan_new
+        _scan_hits = 0
+        _scan_new = 0
+
+def _record_event(kind):
+    global _scan_hits, _scan_new
+    if kind == 'hit':
+        val = 2
+    elif kind == 'new_miss':
+        val = 1
+    else:
+        val = 0
+    _scan_q.append(val)
+    if val == 2:
+        _scan_hits += 1
+    elif val == 1:
+        _scan_new += 1
+    while len(_scan_q) > (_scan_W or 8):
+        old = _scan_q.popleft()
+        if old == 2:
+            _scan_hits -= 1
+        elif old == 1:
+            _scan_new -= 1
+
+def _in_scan_mode():
+    if not _scan_q or _scan_W is None or len(_scan_q) < _scan_W:
+        return False
+    total = max(1, len(_scan_q))
+    hit_rate = _scan_hits / total
+    new_rate = _scan_new / total
+    return (new_rate > 0.6 and hit_rate < 0.2)
+
+def _protected_sample_victim(cache_snapshot, sample_size=3):
+    """
+    Choose a protected victim among the oldest few by recency, evicting the one
+    with the lowest TinyLFU frequency. Fall back to pure LRU if needed.
+    """
+    if not _protected:
+        return None
+    # Build candidate list of keys currently present in the cache
+    cache_keys = cache_snapshot.cache.keys()
+    candidates = [(k, ts) for k, ts in _protected.items() if k in cache_keys]
+    if not candidates:
+        return None
+    # Pick the oldest few by timestamp
+    # Efficiently select up to sample_size oldest without full sort
+    selected = []
+    for _ in range(min(sample_size, len(candidates))):
+        # find min ts element among remaining
+        min_idx = None
+        min_ts = None
+        for idx, (k, ts) in enumerate(candidates):
+            if (min_ts is None) or ts < min_ts:
+                min_ts = ts
+                min_idx = idx
+        selected.append(candidates[min_idx][0])
+        # remove selected
+        candidates[min_idx] = candidates[-1]
+        candidates.pop()
+    # Among selected, choose lowest frequency; tie-break by oldest (we already picked oldest first)
+    best = None
+    best_f = None
+    for k in selected:
+        f = _freq.get(k, 0)
+        if best is None or f < best_f:
+            best = k
+            best_f = f
+    if best is not None:
+        return best
+    # Fallback to LRU in protected
+    return _lru_key_in(_protected, cache_snapshot)
+
+def _demote_over_protected_limit(cache_snapshot):
+    """
+    If protected exceeds its capacity target, demote a frequency-cold, old item
+    back into probation using the same sampling heuristic.
+    """
+    prob_cap, prot_cap = _get_caps(cache_snapshot)
+    if len(_protected) <= prot_cap:
+        return
+    # pick a protected victim (to demote rather than evict)
+    pick = _protected_sample_victim(cache_snapshot, sample_size=5 if len(_protected) > prot_cap else 3)
+    if pick is None:
+        pick = _lru_key_in(_protected, cache_snapshot)
+    if pick is not None:
+        ts = _protected.pop(pick, m_key_timestamp.get(pick, 0))
+        _probation[pick] = ts
+
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    global _prot_ratio
+    _init_scan(cache_snapshot)
+    now = cache_snapshot.access_count
+    cap = _cap(cache_snapshot)
+    _age_frequency(now, cap)
+
+    # Ghost-guided adaptation: respond to reuse signals
+    g_prot = obj.key in _ghost_protected
+    g_prob = obj.key in _ghost_probation
+    if g_prot and not g_prob:
+        _prot_ratio = _clamp(_prot_ratio + 0.1, 0.1, 0.9)
+    elif g_prob and not g_prot:
+        _prot_ratio = _clamp(_prot_ratio - 0.1, 0.1, 0.9)
+
+    # Recompute targets
+    prob_cap, prot_cap = _get_caps(cache_snapshot)
+
+    # Decide source segment for eviction
+    victim_key = None
+    if g_prot and len(_probation) > 0:
+        # Favor keeping protected if incoming shows protected ghost
+        victim_key = _lru_key_in(_probation, cache_snapshot)
+    elif g_prob and len(_protected) > 0:
+        # Favor recency by evicting from protected
+        victim_key = _protected_sample_victim(cache_snapshot, sample_size=5 if len(_protected) > prot_cap else 3)
+        if victim_key is None:
+            victim_key = _lru_key_in(_protected, cache_snapshot)
+    else:
+        # Evict from the segment exceeding its target
+        if len(_probation) > 0 and (len(_probation) >= prob_cap or len(_protected) == 0):
+            victim_key = _lru_key_in(_probation, cache_snapshot)
+        if victim_key is None and len(_protected) > 0:
+            victim_key = _protected_sample_victim(cache_snapshot, sample_size=5 if len(_protected) > prot_cap else 3)
+            if victim_key is None:
+                victim_key = _lru_key_in(_protected, cache_snapshot)
+
+    if victim_key is None:
+        # Fallback: pick any key from the cache
+        for k in cache_snapshot.cache:
+            victim_key = k
+            break
+    return victim_key
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_key_timestamp, _probation, _protected, _prot_ratio
+    _init_scan(cache_snapshot)
+    now = cache_snapshot.access_count
+    cap = _cap(cache_snapshot)
+    _age_frequency(now, cap)
+
+    k = obj.key
+
+    # Record event and frequency
+    _record_event('hit')
+    _bump_freq(k, 1)
+
+    # Update timestamp ledger
+    m_key_timestamp[k] = now
+
+    in_scan = _in_scan_mode()
+
+    if k in _probation:
+        # Gated promotion during scans: require two touches
+        if in_scan and _touch.get(k, 0) < 1:
+            _touch[k] = _touch.get(k, 0) + 1
+            _probation[k] = now  # refresh recency
+        else:
+            _probation.pop(k, None)
+            _protected[k] = now
+            _touch[k] = 0
+            # Slightly favor protected on successful reuse
+            _prot_ratio = _clamp(_prot_ratio + 1.0 / max(20, cap), 0.1, 0.9)
+            # Keep protected within its target by demoting a cold old one
+            _demote_over_protected_limit(cache_snapshot)
+    elif k in _protected:
+        # Refresh recency within protected
+        _protected[k] = now
+    else:
+        # Metadata missing (should be rare on hit): protect it
+        _protected[k] = now
+        _demote_over_protected_limit(cache_snapshot)
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp, _probation, _protected, _ghost_probation, _ghost_protected, _prot_ratio
+    _init_scan(cache_snapshot)
+    now = cache_snapshot.access_count
+    cap = _cap(cache_snapshot)
+    _age_frequency(now, cap)
+
+    k = obj.key
+
+    # Update ledger
+    m_key_timestamp[k] = now
+
+    # Classify event for scan detector
+    if k in _ghost_protected or k in _ghost_probation:
+        _record_event('miss')
+    else:
+        _record_event('new_miss')
+
+    in_scan = _in_scan_mode()
+
+    # Admission using ghost hints; scan-aware to reduce pollution
+    g_prot = k in _ghost_protected
+    g_prob = k in _ghost_probation
+
+    if g_prot:
+        _ghost_protected.pop(k, None)
+    if g_prob:
+        _ghost_probation.pop(k, None)
+
+    if in_scan:
+        # Under scans, always admit cold into probation
+        _probation[k] = now
+        _touch[k] = 0
+        # Tilt slightly toward recency
+        _prot_ratio = _clamp(_prot_ratio - 0.05, 0.1, 0.9)
+    else:
+        if g_prot or g_prob:
+            # ARC-like: re-admit ghost hits to protected to capture frequency
+            _protected[k] = now
+            _touch[k] = 2
+            # Adjust share based on which ghost signaled
+            if g_prot and not g_prob:
+                _prot_ratio = _clamp(_prot_ratio + 0.05, 0.1, 0.9)
+            elif g_prob and not g_prot:
+                _prot_ratio = _clamp(_prot_ratio - 0.05, 0.1, 0.9)
+            # Credit frequency on re-admission
+            _bump_freq(k, 2 if g_prob else 3)
+        else:
+            # Default cold admission to probation
+            _probation[k] = now
+            _touch[k] = 0
+
+    # Keep protected within target by demoting cold old entries if needed
+    _demote_over_protected_limit(cache_snapshot)
+
+    # Bound ghost histories
+    _trim_ghosts(cache_snapshot)
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp, _probation, _protected, _ghost_probation, _ghost_protected, _freq, _touch
+    if evicted_obj is None:
+        return
+
+    k = evicted_obj.key
+    ts = cache_snapshot.access_count
+
+    # Record ghost by segment membership
+    if k in _protected:
+        _protected.pop(k, None)
+        _ghost_protected[k] = ts
+    elif k in _probation:
+        _probation.pop(k, None)
+        _ghost_probation[k] = ts
+    else:
+        # Unknown to our metadata; assume probation eviction
+        _ghost_probation[k] = ts
+
+    # Clean auxiliary state
+    m_key_timestamp.pop(k, None)
+    _freq.pop(k, None)
+    _touch.pop(k, None)
+
+    # Bound ghost histories
+    _trim_ghosts(cache_snapshot)
+
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

@@ -1,0 +1,82 @@
+<NAME>
+ghost_expansion_and_bonus
+</NAME>
+
+<DESCRIPTION>
+This optimization introduces two changes to the S3-FIFO implementation to improve hit rates, particularly for looping patterns and working set stability:
+
+1.  **Expanded Ghost Registry**: The capacity of the `ghost_registry` is increased from `1x` to `2x` the cache capacity. This larger history window allows the algorithm to detect and recover from looping patterns that are larger than the cache but revisit items eventually (e.g., Traces 27, 28).
+
+2.  **Ghost Rescue Bonus**: When an item is rescued from the ghost registry (indicating it was recently evicted but is now accessed again), it is promoted to the Main queue with its `accessed_bit` set (conceptually frequency=1). In the original code, rescued items started with `accessed_bit` cleared (frequency=0). By giving them a "starting hit," we ensure they survive at least one full scan of the Main queue, providing stability for the working set and reducing thrashing for items that have proven their recurrence.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+            if candidate_key in accessed_bits:
+                # Hit in S -> Promote to M (Probation passed)
+                accessed_bits.discard(candidate_key)
+                m_queue[candidate_key] = None
+            else:
+                # Victim found in S
+                # Record in Ghost to catch loops later
+                ghost_registry[candidate_key] = None
+                if len(ghost_registry) > capacity:
+                    ghost_registry.popitem(last=False)
+                return candidate_key
+=======
+            if candidate_key in accessed_bits:
+                # Hit in S -> Promote to M (Probation passed)
+                accessed_bits.discard(candidate_key)
+                m_queue[candidate_key] = None
+            else:
+                # Victim found in S
+                # Record in Ghost to catch loops later
+                ghost_registry[candidate_key] = None
+                if len(ghost_registry) > capacity * 2:
+                    ghost_registry.popitem(last=False)
+                return candidate_key
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+                if len(s_queue) < s_target:
+                    s_queue[candidate_key] = None # Insert at tail of S
+                else:
+                    # Drop and add to Ghost
+                    ghost_registry[candidate_key] = None
+                    if len(ghost_registry) > capacity:
+                        ghost_registry.popitem(last=False)
+                    return candidate_key
+=======
+                if len(s_queue) < s_target:
+                    s_queue[candidate_key] = None # Insert at tail of S
+                else:
+                    # Drop and add to Ghost
+                    ghost_registry[candidate_key] = None
+                    if len(ghost_registry) > capacity * 2:
+                        ghost_registry.popitem(last=False)
+                    return candidate_key
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    if key in ghost_registry:
+        # Rescue from Ghost -> Insert directly to Main
+        m_queue[key] = None
+        del ghost_registry[key]
+    else:
+        # New item -> Insert into Small (Probation)
+        s_queue[key] = None
+
+    # Reset access bit: Item starts cold (freq=0) until hit again
+    accessed_bits.discard(key)
+=======
+    if key in ghost_registry:
+        # Rescue from Ghost -> Insert directly to Main
+        m_queue[key] = None
+        del ghost_registry[key]
+        # Rescue bonus: Mark as accessed to survive initial Main scan
+        accessed_bits.add(key)
+    else:
+        # New item -> Insert into Small (Probation)
+        s_queue[key] = None
+        # Reset access bit: Item starts cold (freq=0) until hit again
+        accessed_bits.discard(key)
+>>>>>>> REPLACE
+</DIFF>

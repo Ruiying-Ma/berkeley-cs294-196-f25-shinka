@@ -1,0 +1,45 @@
+<NAME>
+s3_fifo_tuning
+</NAME>
+
+<DESCRIPTION>
+This update applies three targeted optimizations to the S3-FIFO implementation to improve scan resistance and loop handling:
+
+1.  **Reduce Small Queue Ratio (10% -> 5%)**: Decreasing `_SMALL_RATIO` to 0.05 reduces the size of the probation queue. This allows scan traffic (one-time accesses) to pass through and be evicted more quickly, preventing it from polluting the cache. It implicitly reserves more space (95%) for the Main protected queue.
+2.  **Increase Ghost Capacity (2x -> 5x)**: Expanding the ghost registry capacity allows the algorithm to track a longer history of evicted items. This is crucial for detecting larger loops (like in Trace 14 and 27) that exceed the cache size but fit within extended history, enabling "second chance" promotion for these recurring patterns.
+3.  **Raise Frequency Cap (5 -> 7)**: Increasing the frequency saturation point in `update_after_hit` allows the algorithm to better discriminate between "moderately used" and "very hot" items, providing a stronger buffer in the Main queue for the most valuable objects.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+# Constants
+_SMALL_RATIO = 0.1
+=======
+# Constants
+_SMALL_RATIO = 0.05
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+                # Expanded ghost capacity (2x) for better loop detection
+                if len(_s3_ghost) > capacity * 2:
+                    _s3_ghost.popitem(last=False)
+=======
+                # Expanded ghost capacity (5x) for better loop detection
+                if len(_s3_ghost) > capacity * 5:
+                    _s3_ghost.popitem(last=False)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def update_after_hit(cache_snapshot, obj):
+    global _s3_freq
+    _check_reset(cache_snapshot)
+    curr = _s3_freq.get(obj.key, 0)
+    # Cap frequency higher to support Decay strategy
+    _s3_freq[obj.key] = min(curr + 1, 5)
+=======
+def update_after_hit(cache_snapshot, obj):
+    global _s3_freq
+    _check_reset(cache_snapshot)
+    curr = _s3_freq.get(obj.key, 0)
+    # Cap frequency higher to support Decay strategy
+    _s3_freq[obj.key] = min(curr + 1, 7)
+>>>>>>> REPLACE
+</DIFF>

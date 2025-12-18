@@ -1,0 +1,747 @@
+--- a/original.py
++++ b/original.py
+@@ -1,479 +1,434 @@
+ # EVOLVE-BLOCK-START
+-"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
++"""Windowed Tiny-SLRU with ARC-style ghost adaptation and scan resistance."""
+ 
+ from collections import OrderedDict
+ 
+-# Segmented LRU (SLRU) metadata:
+-# - _probation: objects seen once (newly inserted), LRU-ordered
+-# - _protected: objects that have been hit (promoted), LRU-ordered
+-# We adapt the protected fraction slightly based on runtime signals.
+-_probation = OrderedDict()   # key -> None (value unused)
+-_protected = OrderedDict()   # key -> None (value unused)
+-_key_seg = dict()            # key -> 'prob' or 'prot'
+-
+-# Ghost histories to recognize re-references to recently evicted items
+-_ghost_probation = OrderedDict()  # key -> epoch of ghost insertion
+-_ghost_protected = OrderedDict()  # key -> epoch of ghost insertion
++# Segments:
++# - _win: small window LRU to capture bursty recency
++# - _prob: probation (T1): main recency
++# - _prot: protected (T2): main frequency
++_win = OrderedDict()     # key -> None
++_prob = OrderedDict()    # key -> None
++_prot = OrderedDict()    # key -> None
++_key_seg = {}            # key -> 'win' | 'prob' | 'prot'
++
++# Ghost histories (ARC-style)
++_B1 = OrderedDict()      # recently evicted from recency side (win/prob), key -> epoch
++_B2 = OrderedDict()      # recently evicted from protected, key -> epoch
+ _GHOST_LIMIT_MULT = 2
+ 
+-# TinyLFU-like lightweight decayed frequency
+-_refcnt = {}                 # key -> (count, epoch)
++# TinyLFU-like decayed frequency (dictionary + epoch aging)
++_freq = {}               # key -> (count, epoch)
+ _epoch = 0
+ _last_epoch_tick = 0
+-_DECAY_WINDOW = 128          # accesses between epochs; adjusted using capacity
+-_last_victim_score = 0.0
+-
+-_PROTECTED_FRAC = 0.8        # target fraction of cache to allocate to protected segment
+-_ADAPT_STEP = 0.02           # step used to adjust protected fraction within [0.05, 0.95]
+-
+-# Scan-resistance and two-touch gating (epoch-scoped, low overhead)
++_DECAY_WINDOW = 128
++
++# Targets and adaptation
++_WIN_FRAC = 0.15         # fraction of cache for window
++_PROT_FRAC = 0.70        # of (total - window) reserved for protected
++_MIN_WIN = 0.05
++_MAX_WIN = 0.35
++_ADAPT_STEP = 0.02
++_last_victim_score = 0
++
++# Scan detection
+ _scan_mode = False
+-_scan_mode_epochs_left = 0
+-_epoch_unique = set()        # unique keys observed within the current decay window
+-_touched_once = {}           # key -> epoch when first touched in probation (for two-touch in scan mode)
+-
+-# Sampling parameters for LRFU-like victim selection
+-_BASE_PROB_SAMPLE = 3
+-_BASE_PROT_SAMPLE = 2
+-
+-# Admission guard and adaptation helpers
+-# We bias eviction choice to avoid evicting items hotter than the incoming object (TinyLFU-like).
+-# Additionally, adapt protected fraction based on eviction mix over a small window.
+-_ADMISSION_GUARD = True
++_epoch_unique = set()
++
++# Two-touch gating for promotions
++_two_touch = {}          # key -> epoch of first touch
++
++# Sampling parameters for victim selection
++_S_WIN = 2
++_S_PROB = 4
++_S_PROT = 2
++
++# Stats to adapt protected in corner cases
+ _evict_prob_cnt = 0
+ _evict_prot_cnt = 0
+ 
+ 
+-def _increase_protected():
+-    global _PROTECTED_FRAC
+-    _PROTECTED_FRAC = min(0.95, _PROTECTED_FRAC + _ADAPT_STEP)
+-
+-
+-def _decrease_protected():
+-    global _PROTECTED_FRAC
+-    _PROTECTED_FRAC = max(0.05, _PROTECTED_FRAC - _ADAPT_STEP)
+-
+-
++# -------- Helpers --------
+ def _ensure_params(cache_snapshot):
+-    """Initialize/adjust parameters that depend on capacity."""
+     global _DECAY_WINDOW
+     cap = max(cache_snapshot.capacity, 1)
+-    # Tie decay window to capacity to align half-life with working-set size
+     _DECAY_WINDOW = max(64, cap)
+ 
+ 
+ def _maybe_age(cache_snapshot):
+-    """Advance epoch based on access_count, and trim ghost lists and manage scan mode."""
+-    global _epoch, _last_epoch_tick, _scan_mode, _scan_mode_epochs_left, _epoch_unique
++    global _epoch, _last_epoch_tick, _scan_mode
+     _ensure_params(cache_snapshot)
+     if cache_snapshot.access_count - _last_epoch_tick >= _DECAY_WINDOW:
+-        # Evaluate the last window's uniqueness and hit rate to detect scans
++        # Simple scan heuristic: many uniques with poor hit-rate => enter scan mode briefly
+         window = max(1, _DECAY_WINDOW)
+         unique_density = min(1.0, len(_epoch_unique) / float(window))
+-        hit_rate = cache_snapshot.hit_count / max(1, float(cache_snapshot.access_count))
+-        if unique_density > 0.7 and hit_rate < 0.2:
+-            _scan_mode = True
+-            _scan_mode_epochs_left = 1
+-            # During scans, lean away from protected a bit
+-            _decrease_protected()
+-        else:
+-            if _scan_mode_epochs_left > 0:
+-                _scan_mode_epochs_left -= 1
+-            _scan_mode = _scan_mode_epochs_left > 0
+-        # Reset unique tracker for the new window
++        hit_rate = cache_snapshot.hit_count / max(1.0, float(cache_snapshot.access_count))
++        _scan_mode = (unique_density > 0.7 and hit_rate < 0.25)
++
+         _epoch_unique.clear()
+-
+         _epoch += 1
+         _last_epoch_tick = cache_snapshot.access_count
+-        # Trim ghost histories to bounded size
++
++        # Trim ghosts
+         limit = max(1, _GHOST_LIMIT_MULT * max(cache_snapshot.capacity, 1))
+-        while len(_ghost_probation) > limit:
+-            _ghost_probation.popitem(last=False)
+-        while len(_ghost_protected) > limit:
+-            _ghost_protected.popitem(last=False)
++        while len(_B1) > limit:
++            _B1.popitem(last=False)
++        while len(_B2) > limit:
++            _B2.popitem(last=False)
+ 
+ 
+ def _score(key):
+-    """Return decayed frequency score for a key."""
+-    ce = _refcnt.get(key)
++    ce = _freq.get(key)
+     if ce is None:
+         return 0
+     c, e = ce
+     de = _epoch - e
+     if de > 0:
+-        # decay by halving per epoch (cap max shifts to avoid zeroing too fast)
+         c = c >> min(6, de)
+     return max(0, c)
+ 
+ 
+ def _inc(key):
+-    """Increment decayed frequency count for a key."""
+-    c, e = _refcnt.get(key, (0, _epoch))
++    c, e = _freq.get(key, (0, _epoch))
+     if e != _epoch:
+         c = c >> min(6, _epoch - e)
+         e = _epoch
+-    # cap growth to avoid overflow
+     c = min(c + 1, 1 << 30)
+-    _refcnt[key] = (c, e)
++    _freq[key] = (c, e)
++
++
++def _safe_remove_from_all(k):
++    _win.pop(k, None)
++    _prob.pop(k, None)
++    _prot.pop(k, None)
++    _key_seg.pop(k, None)
++    _two_touch.pop(k, None)
++
++
++def _place(k, seg, mru=True):
++    # Remove from all, then place into target segment
++    _safe_remove_from_all(k)
++    if seg == 'win':
++        _win[k] = None
++        if not mru:  # move to LRU side if requested
++            _win.move_to_end(k, last=False)
++    elif seg == 'prob':
++        _prob[k] = None
++        if not mru:
++            _prob.move_to_end(k, last=False)
++    else:
++        _prot[k] = None
++    _key_seg[k] = seg
+ 
+ 
+ def _sync_metadata(cache_snapshot):
+-    """Ensure SLRU metadata matches current cache content."""
+     cached_keys = set(cache_snapshot.cache.keys())
+-
+-    # Remove entries no longer in cache
++    # purge metadata of non-cached keys
+     for k in list(_key_seg.keys()):
+         if k not in cached_keys:
+-            if _key_seg.get(k) == 'prob':
+-                _probation.pop(k, None)
+-            else:
+-                _protected.pop(k, None)
+-            _key_seg.pop(k, None)
+-
+-    # Add cached keys missing from metadata into probation MRU
++            _safe_remove_from_all(k)
++    # add missing keys as probation MRU (will be repositioned by insert/hit flows)
+     for k in cached_keys:
+         if k not in _key_seg:
+-            _probation[k] = None
+-            _key_seg[k] = 'prob'
++            _place(k, 'prob', mru=True)
+ 
+ 
+ def _rebalance(cache_snapshot):
+-    """Demote protected LRU entries if protected size exceeds target."""
+     total = len(cache_snapshot.cache)
+     if total <= 0:
+         return
+-    target = max(1, int(total * _PROTECTED_FRAC))
+-
+-    while len(_protected) > target:
+-        # Demote protected LRU to probation MRU
+-        k, _ = _protected.popitem(last=False)
+-        _probation[k] = None
++    # window target
++    win_target = max(1, int(total * _WIN_FRAC))
++    while len(_win) > win_target:
++        k, _ = _win.popitem(last=False)  # window LRU -> probation MRU
++        _prob[k] = None
+         _key_seg[k] = 'prob'
+ 
++    # protected target (of main = total - window)
++    main_total = max(0, total - len(_win))
++    prot_target = max(0, int(main_total * _PROT_FRAC))
++    while len(_prot) > prot_target:
++        k, _ = _prot.popitem(last=False)  # demote protected LRU to probation MRU
++        _prob[k] = None
++        _key_seg[k] = 'prob'
++
+ 
+ def _sample_lru_keys(od, n):
+-    """Return up to n keys from the LRU side (front) of an OrderedDict."""
+     res = []
+     it = iter(od.keys())
+-    for i in range(n):
++    for _ in range(n):
+         try:
+             res.append(next(it))
+         except StopIteration:
+             break
+     return res
+ 
+ 
+-def _victim_tuple(key, seg, rec_idx):
+-    """Tuple for comparing eviction candidates. Lower is colder."""
+-    # Prefer lower frequency; tie-break by segment (probation preferred), then by older recency (smaller index)
+-    return (_score(key), 0 if seg == 'prob' else 1, rec_idx, key)
+-
+-
++def _hot_thr(cache_snapshot):
++    cap = max(1, cache_snapshot.capacity)
++    if cap >= 256:
++        return 3
++    if cap >= 64:
++        return 2
++    return 2
++
++
++# -------- Core API --------
+ def evict(cache_snapshot, obj):
+-    '''
+-    This function defines how the algorithm chooses the eviction victim.
+-    - Args:
+-        - `cache_snapshot`: A snapshot of the current cache state.
+-        - `obj`: The new object that needs to be inserted into the cache.
+-    - Return:
+-        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+-    '''
+-    # Keep metadata consistent and properly segmented before choosing a victim
++    """
++    Choose an eviction victim key to make space for obj.
++    """
+     _maybe_age(cache_snapshot)
+     _sync_metadata(cache_snapshot)
+     _rebalance(cache_snapshot)
+ 
+-    # Track key for scan detection unique density
++    # Track unique for scan detection
+     try:
+         _epoch_unique.add(obj.key)
+     except Exception:
+         pass
+ 
+-    # Clean up stale entries (if any)
+-    for k in list(_probation.keys()):
+-        if k not in cache_snapshot.cache:
+-            _probation.pop(k, None)
+-            _key_seg.pop(k, None)
+-    for k in list(_protected.keys()):
+-        if k not in cache_snapshot.cache:
+-            _protected.pop(k, None)
+-            _key_seg.pop(k, None)
+-
+-    # If metadata is empty, fallback
+     if not cache_snapshot.cache:
+         return None
+ 
+-    # Adaptive sampling sizes
+-    prob_sample = _BASE_PROB_SAMPLE
+-    prot_sample = _BASE_PROT_SAMPLE
+-    if _scan_mode:
+-        prob_sample += 1
+-        prot_sample = max(1, prot_sample - 1)
+-    if len(_probation) > len(_protected) + 2:
+-        prob_sample += 1
+-
+-    # Incoming-aware admission guard: avoid evicting hotter items if possible
+     incoming_score = _score(obj.key)
+-
+-    # Build candidate tuples from both segments' LRU sides
++    hot_thr = _hot_thr(cache_snapshot)
++
++    # Prefer evicting from window during scans to avoid polluting main
++    if _scan_mode and _win:
++        # If window non-empty, choose its LRU
++        for k in _sample_lru_keys(_win, 1):
++            if k in cache_snapshot.cache:
++                return k
++
+     candidates = []
+-    # Probation candidates
+-    pkeys = _sample_lru_keys(_probation, prob_sample)
+-    for idx, pk in enumerate(pkeys):
+-        if pk in cache_snapshot.cache:
+-            s = _score(pk)
+-            hotter = 1 if (_ADMISSION_GUARD and s > incoming_score) else 0
+-            segpref = 0  # probation preferred
+-            candidates.append((hotter, s, segpref, idx, pk))
+-    # Protected candidates
+-    tkeys = _sample_lru_keys(_protected, prot_sample)
+-    for idx, tk in enumerate(tkeys):
+-        if tk in cache_snapshot.cache:
+-            s = _score(tk)
+-            hotter = 1 if (_ADMISSION_GUARD and s > incoming_score) else 0
+-            segpref = 1  # protected less preferred
+-            candidates.append((hotter, s, segpref, idx, tk))
++    # Gather LRU-side samples from segments
++    for idx, k in enumerate(_sample_lru_keys(_win, _S_WIN)):
++        if k in cache_snapshot.cache:
++            s = _score(k)
++            hotter = 1 if s > incoming_score else 0
++            shield = 1 if s >= hot_thr else 0
++            seg_rank = 0  # window preferred
++            candidates.append((hotter, shield, s, seg_rank, idx, k))
++    for idx, k in enumerate(_sample_lru_keys(_prob, _S_PROB)):
++        if k in cache_snapshot.cache:
++            s = _score(k)
++            hotter = 1 if s > incoming_score else 0
++            shield = 1 if s >= hot_thr else 0
++            seg_rank = 1
++            candidates.append((hotter, shield, s, seg_rank, idx, k))
++    for idx, k in enumerate(_sample_lru_keys(_prot, _S_PROT)):
++        if k in cache_snapshot.cache:
++            s = _score(k)
++            hotter = 1 if s > incoming_score else 0
++            shield = 1 if s >= hot_thr else 0
++            seg_rank = 2  # protected least preferred
++            candidates.append((hotter, shield, s, seg_rank, idx, k))
+ 
+     if not candidates:
+-        # Fallback: pick any key from cache if metadata got desynced
++        # fallback
+         return next(iter(cache_snapshot.cache.keys()))
+ 
+-    # Choose coldest by (hotter_than_incoming, score, segment preference, recency)
+-    best = min(candidates)
+-    candid_obj_key = best[4]
+-    victim_from_protected = (_key_seg.get(candid_obj_key) == 'prot')
+-
+-    # Adaptive tuning: if we are forced to evict from protected, reduce its target fraction slightly
+-    if victim_from_protected:
+-        _decrease_protected()
+-
+-    return candid_obj_key
++    # Select by: not hotter than incoming, not shielded hot, low score, prefer window/prob, older index
++    hotter, shield, s, seg_rank, idx, victim = min(candidates)
++    # If we ended up evicting from protected, we are being too aggressive; gently bias by shrinking prot in rebalance
++    if _key_seg.get(victim) == 'prot':
++        # count for later adaptation
++        global _evict_prot_cnt
++        _evict_prot_cnt += 1
++    else:
++        global _evict_prob_cnt
++        _evict_prob_cnt += 1
++    return victim
+ 
+ 
+ def update_after_hit(cache_snapshot, obj):
+-    '''
+-    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+-    - Args:
+-        - `cache_snapshot`: A snapshot of the current cache state.
+-        - `obj`: The object accessed during the cache hit.
+-    - Return: `None`
+-    '''
++    """
++    Update metadata after a cache hit.
++    """
+     _maybe_age(cache_snapshot)
+     _sync_metadata(cache_snapshot)
+ 
+     k = obj.key
+     _inc(k)
+     try:
+         _epoch_unique.add(k)
+     except Exception:
+         pass
+ 
+     seg = _key_seg.get(k)
+ 
+-    if seg == 'prob':
++    fresh_window = max(1, int(max(cache_snapshot.capacity, 1)))
++    if seg == 'win':
++        last = _two_touch.get(k)
++        if last is not None and (_epoch - last) <= 1:
++            _two_touch.pop(k, None)
++            _place(k, 'prot', mru=True)  # two-touch promotion
++        else:
++            _two_touch[k] = _epoch
++            # refresh within window
++            if k in _win:
++                _win.move_to_end(k, last=True)
++            else:
++                _place(k, 'win', mru=True)
++    elif seg == 'prob':
+         if _scan_mode:
+-            # Two-touch gating under scans: first hit refreshes probation,
+-            # second hit within a short epoch window promotes to protected.
+-            last = _touched_once.get(k)
++            # require two-touch in probation during scans
++            last = _two_touch.get(k)
+             if last is not None and (_epoch - last) <= 1:
+-                _touched_once.pop(k, None)
+-                _probation.pop(k, None)
+-                _protected[k] = None  # MRU
+-                _key_seg[k] = 'prot'
++                _two_touch.pop(k, None)
++                _place(k, 'prot', mru=True)
+             else:
+-                _touched_once[k] = _epoch
+-                # Refresh to MRU of probation
+-                if k in _probation:
+-                    _probation.move_to_end(k, last=True)
+-                else:
+-                    _probation[k] = None
+-                # Avoid immediate expansion of protected during scans
++                _two_touch[k] = _epoch
++                if k in _prob:
++                    _prob.move_to_end(k, last=True)
+         else:
+-            # Promote to protected on first hit
+-            _probation.pop(k, None)
+-            _protected[k] = None  # inserted at MRU
+-            _key_seg[k] = 'prot'
+-            _increase_protected()  # hits in probation signal benefit from a larger protected segment
++            _place(k, 'prot', mru=True)
+     elif seg == 'prot':
+-        # Refresh recency in protected
+-        if k in _protected:
+-            _protected.move_to_end(k, last=True)
++        # refresh protected
++        if k in _prot:
++            _prot.move_to_end(k, last=True)
+         else:
+-            # If somehow missing from the structure, reinsert into protected
+-            _protected[k] = None
+-            _key_seg[k] = 'prot'
+-        # Clear any stale two-touch marker
+-        _touched_once.pop(k, None)
++            _place(k, 'prot', mru=True)
++        _two_touch.pop(k, None)
+     else:
+-        # Unknown key (shouldn't happen on hit).
+-        # In scan mode, keep in probation with refresh; otherwise, promote.
+-        if _scan_mode:
+-            _probation[k] = None
+-            _key_seg[k] = 'prob'
+-            _probation.move_to_end(k, last=True)
+-        else:
+-            _probation[k] = None
+-            _key_seg[k] = 'prob'
+-            _probation.pop(k, None)
+-            _protected[k] = None
+-            _key_seg[k] = 'prot'
+-            _increase_protected()
++        # unknown key: place to window
++        _place(k, 'win', mru=True)
+ 
+     _rebalance(cache_snapshot)
+ 
+ 
+ def update_after_insert(cache_snapshot, obj):
+-    '''
+-    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+-    - Args:
+-        - `cache_snapshot`: A snapshot of the current cache state.
+-        - `obj`: The object that was just inserted into the cache.
+-    - Return: `None`
+-    '''
++    """
++    Update metadata right after inserting a new object.
++    """
+     _maybe_age(cache_snapshot)
+     _sync_metadata(cache_snapshot)
++
+     k = obj.key
+     _inc(k)
+     try:
+         _epoch_unique.add(k)
+     except Exception:
+         pass
+ 
+-    # Decide segment placement using ghost history (segment-aware)
+-    g_prot_epoch = _ghost_protected.get(k)
+-    g_prob_epoch = _ghost_probation.get(k)
+-    recent_prot_ghost = (g_prot_epoch is not None) and (_epoch - g_prot_epoch <= 2)
+-    recent_prob_ghost = (g_prob_epoch is not None) and (_epoch - g_prob_epoch <= 2)
+-    incoming_score = _score(k)
+-
+-    # Reset any existing placement
+-    if _key_seg.get(k) == 'prot':
+-        _protected.pop(k, None)
++    # Decide placement with ghost awareness
++    g1 = _B1.get(k)
++    g2 = _B2.get(k)
++    recent1 = g1 is not None and (_epoch - g1) <= 2
++    recent2 = g2 is not None and (_epoch - g2) <= 2
++
++    if _scan_mode:
++        # scan resistance: insert cold into probation LRU (avoid polluting window)
++        _place(k, 'prob', mru=False)
+     else:
+-        _probation.pop(k, None)
+-
+-    if _scan_mode:
+-        # Scan resistance: insert at probation LRU to minimize pollution,
+-        # require two-touch before promotion via update_after_hit.
+-        _probation[k] = None
+-        _probation.move_to_end(k, last=False)  # LRU side
+-        _key_seg[k] = 'prob'
++        if recent2:
++            _place(k, 'prot', mru=True)
++        elif recent1:
++            _place(k, 'prob', mru=True)
++        else:
++            # default into window MRU
++            _place(k, 'win', mru=True)
++
++    _rebalance(cache_snapshot)
++
++
++def update_after_evict(cache_snapshot, obj, evicted_obj):
++    """
++    Update metadata after evicting a victim.
++    """
++    _maybe_age(cache_snapshot)
++
++    victim_key = evicted_obj.key
++    seg = _key_seg.get(victim_key, None)
++
++    # record victim score for admission guidance (if used later)
++    global _last_victim_score
++    _last_victim_score = _score(victim_key)
++
++    # Ghost recording
++    if seg == 'prot':
++        _B2[victim_key] = _epoch
++        _prot.pop(victim_key, None)
++        global _evict_prot_cnt
++        _evict_prot_cnt += 1
+     else:
+-        if recent_prot_ghost:
+-            # Re-admit into protected due to recent protected ghost hit
+-            _protected[k] = None
+-            _key_seg[k] = 'prot'
+-            _increase_protected()
+-        elif recent_prob_ghost:
+-            # A B1-like hit suggests we need more recency; bias towards probation and shrink protected a bit
+-            _decrease_protected()
+-            _probation[k] = None
+-            _key_seg[k] = 'prob'
+-            _probation.move_to_end(k, last=True)  # MRU in probation
+-            _inc(k)
+-        else:
+-            # Admission guard: if incoming is not hotter than last victim, insert cold at probation LRU
+-            if _ADMISSION_GUARD and incoming_score <= _last_victim_score:
+-                _probation[k] = None
+-                _key_seg[k] = 'prob'
+-                _probation.move_to_end(k, last=False)  # LRU side (deprioritize)
+-            elif incoming_score >= 2:
+-                # Strongly hot objects can be admitted protected
+-                _protected[k] = None
+-                _key_seg[k] = 'prot'
+-                _increase_protected()
+-            else:
+-                # Default: probation MRU
+-                _probation[k] = None
+-                _key_seg[k] = 'prob'
+-                _probation.move_to_end(k, last=True)
+-
+-    _rebalance(cache_snapshot)
+-
+-
+-def update_after_evict(cache_snapshot, obj, evicted_obj):
+-    '''
+-    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+-    - Args:
+-        - `cache_snapshot`: A snapshot of the current cache state.
+-        - `obj`: The object to be inserted into the cache.
+-        - `evicted_obj`: The object that was just evicted from the cache.
+-    - Return: `None`
+-    '''
+-    _maybe_age(cache_snapshot)
+-    # Record into ghost according to the segment it was evicted from
+-    k = evicted_obj.key
+-    seg = _key_seg.get(k, None)
+-    # Store last victim score for potential future enhancements
+-    global _last_victim_score, _evict_prob_cnt, _evict_prot_cnt
+-    _last_victim_score = _score(k)
+-
+-    if seg == 'prob':
+-        _ghost_probation[k] = _epoch
+-        _probation.pop(k, None)
++        # Treat window/prob evictions as B1
++        _B1[victim_key] = _epoch
++        _win.pop(victim_key, None)
++        _prob.pop(victim_key, None)
++        global _evict_prob_cnt
+         _evict_prob_cnt += 1
+-    elif seg == 'prot':
+-        _ghost_protected[k] = _epoch
+-        _protected.pop(k, None)
+-        _evict_prot_cnt += 1
+-
+-    # Clean any stale two-touch markers
+-    _touched_once.pop(k, None)
+-
+-    _key_seg.pop(k, None)
+-
+-    # Trim ghost histories to bounded size
++
++    _two_touch.pop(victim_key, None)
++    _key_seg.pop(victim_key, None)
++
++    # Ghost bound
+     limit = max(1, _GHOST_LIMIT_MULT * max(cache_snapshot.capacity, 1))
+-    while len(_ghost_probation) > limit:
+-        _ghost_probation.popitem(last=False)
+-    while len(_ghost_protected) > limit:
+-        _ghost_protected.popitem(last=False)
+-
+-    # Adaptive protected tuning: if we evicted from probation but the incoming object is hotter,
+-    # increase protected to preserve hot items better.
++    while len(_B1) > limit:
++        _B1.popitem(last=False)
++    while len(_B2) > limit:
++        _B2.popitem(last=False)
++
++    # ARC-like dynamic window tuning based on incoming object's presence in ghosts
+     try:
+-        if seg == 'prob' and _score(obj.key) > _last_victim_score:
+-            _increase_protected()
++        fresh_window = max(1, int(max(cache_snapshot.capacity, 1)))
++        key_in = obj.key
++        step = _ADAPT_STEP
++        if key_in in _B1:
++            age = _epoch - _B1.get(key_in, _epoch)
++            w = max(0.0, 1.0 - (age / float(fresh_window)))
++            # amplify when fresh; damp under scans
++            mult = (1.0 + 2.0 * w) * (0.7 if _scan_mode else 1.0)
++            _adj = step * mult
++            # increase window
++            global _WIN_FRAC
++            _WIN_FRAC = min(_MAX_WIN, _WIN_FRAC + _adj)
++        elif key_in in _B2:
++            age = _epoch - _B2.get(key_in, _epoch)
++            w = max(0.0, 1.0 - (age / float(fresh_window)))
++            mult = (1.0 + 1.5 * w) * (1.2 if _scan_mode else 1.0)
++            _adj = step * mult
++            _WIN_FRAC = max(_MIN_WIN, _WIN_FRAC - _adj)
+     except Exception:
+         pass
+ 
+-    # Eviction-mix adaptation over a short window
++    # Occasional mix-based nudge to protected ratio to avoid prolonged protected evictions
+     try:
+         total = _evict_prob_cnt + _evict_prot_cnt
+         window = max(8, min(int(max(cache_snapshot.capacity, 1)), 128))
+         if total >= window:
+             if _evict_prot_cnt > _evict_prob_cnt:
+-                _decrease_protected()
++                # reduce protected pressure by slightly lowering PROT share
++                global _PROT_FRAC
++                _PROT_FRAC = max(0.50, _PROT_FRAC - 0.02)
+             elif _evict_prob_cnt > _evict_prot_cnt:
+-                _increase_protected()
++                _PROT_FRAC = min(0.85, _PROT_FRAC + 0.02)
+             _evict_prot_cnt = 0
+             _evict_prob_cnt = 0
+     except Exception:
+-        # Be conservative if anything goes wrong
+         _evict_prot_cnt = 0
+         _evict_prob_cnt = 0
+ 
+-    # After an eviction, ensure protected segment still respects target (it might shrink due to target change)
+     _rebalance(cache_snapshot)
+-
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

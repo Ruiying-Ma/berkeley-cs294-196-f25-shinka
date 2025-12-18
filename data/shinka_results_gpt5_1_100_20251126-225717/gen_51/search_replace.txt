@@ -1,0 +1,513 @@
+<NAME>
+arc_adaptive_guarded_slru
+</NAME>
+
+<DESCRIPTION>
+I introduce ARC-style adaptation with origin-aware ghost lists and a short guard window to better handle scans and phase changes, while keeping the existing decayed-LFU scoring. The changes:
+
+1) Split ghost history into B1/B2 (from probation/protected) to learn from where items were evicted. Use this to adapt the protected share ratio dynamically instead of a fixed 0.8. Increase protected when B2 ghosts hit, decrease when B1 ghosts hit.
+
+2) Update eviction to select the segment based on ARC signals: evict from probation when the incoming key is in B2 (favor frequency) and from protected when it's in B1 (favor recency). If the protected segment exceeds its target, evict there; otherwise default to probation. During a guard window triggered when a strong protected item is evicted, prefer evicting from probation.
+
+3) Improve demotion enforcement by selecting the demotion candidate via decayed LFU score with age tiebreak, not pure LRU. This retains truly hot items.
+
+4) Update admission: direct admission to protected from ghost only if ghost is fresh and not in guard. Also nudge protected share on ghost-based reads.
+
+5) Add a guard window after evicting strong protected items (based on decayed score), to resist scan pollution: avoid direct protected admission and tilt evictions toward probation during the window.
+
+These changes keep the code lightweight while significantly improving adaptability across diverse workloads, especially those with scans or shifting hot sets, thereby reducing miss rates.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+# Ghost history: tracks last-access time for recently evicted keys to bias re-admission
+_ghost_last_access = dict()  # key -> last access time recorded at eviction
+
+# SLRU segments
+_probation = set()
+_protected = set()
+_PROTECTED_RATIO = 0.8
+=======
+# Ghost history: tracks last-access time for recently evicted keys to bias re-admission
+_ghost_last_access = dict()  # key -> last access time recorded at eviction
+# Origin-aware ghost histories for ARC-like adaptation
+_ghost_from_probation = dict()  # B1: evicted from probation
+_ghost_from_protected = dict()  # B2: evicted from protected
+
+# SLRU segments
+_probation = set()
+_protected = set()
+
+# Adaptive protected share (ratio 0..1), initialized moderately frequency-biased
+_prot_ratio = 0.7
+
+# Guard window to resist scans after evicting strong protected items
+_guard_until = 0
+_GUARD_STRENGTH_THRESH = 2.0
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def _protected_limit(cache_snapshot):
+    cap = max(int(getattr(cache_snapshot, "capacity", 1)), 1)
+    # At least 1 item protected, up to 80% of capacity
+    return max(1, int(_PROTECTED_RATIO * cap))
+=======
+def _protected_limit(cache_snapshot):
+    cap = max(int(getattr(cache_snapshot, "capacity", 1)), 1)
+    # Adaptive protected share with bounds to keep both segments non-empty
+    ratio = max(0.1 if cap > 1 else 0.0, min(0.9 if cap > 1 else 1.0, float(_prot_ratio)))
+    limit = int(ratio * cap)
+    if cap > 1:
+        limit = min(max(limit, 1), cap - 1)
+    else:
+        limit = 1
+    return max(1, limit)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def _enforce_protected_limit(cache_snapshot):
+    """Demote oldest from protected until within limit."""
+    limit = _protected_limit(cache_snapshot)
+    if not _protected:
+        return
+    while len(_protected) > limit:
+        # Demote LRU from protected to probation
+        oldest = None
+        oldest_ts = None
+        for kk in _protected:
+            ts = _last_update.get(kk, 0)
+            if oldest_ts is None or ts < oldest_ts:
+                oldest = kk
+                oldest_ts = ts
+        if oldest is None:
+            break
+        _protected.discard(oldest)
+        _probation.add(oldest)
+=======
+def _enforce_protected_limit(cache_snapshot):
+    """Demote least-valuable from protected until within limit (decayed LFU with age tiebreak)."""
+    limit = _protected_limit(cache_snapshot)
+    if not _protected:
+        return
+    now = cache_snapshot.access_count
+    hl = _half_life(cache_snapshot)
+    while len(_protected) > limit:
+        # Choose min by (decayed_score, last_update) among protected
+        cand = None
+        cand_score = None
+        cand_ts = None
+        for kk in _protected:
+            cs = _current_score(kk, now, hl)
+            ts = _last_update.get(kk, 0)
+            if (cand is None) or (cs < cand_score) or (cs == cand_score and ts < cand_ts):
+                cand = kk
+                cand_score = cs
+                cand_ts = ts
+        if cand is None:
+            break
+        _protected.discard(cand)
+        _probation.add(cand)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    now = cache_snapshot.access_count
+    hl = _half_life(cache_snapshot)
+
+    # Ensure segments reflect current cache contents
+    _prune_and_seed_segments(cache_snapshot)
+
+    in_cache = set(cache_snapshot.cache.keys())
+    prob = _probation.intersection(in_cache)
+    prot = _protected.intersection(in_cache)
+
+    # Prefer evicting from probation (SLRU). Use LRU with frequency tiebreaker.
+    if prob:
+        victim = None
+        best_tuple = None  # (last_update, decayed_score)
+        for k in prob:
+            lu = _last_update.get(k, 0)
+            cs = _current_score(k, now, hl)
+            tup = (lu, cs)
+            if best_tuple is None or tup < best_tuple:
+                best_tuple = tup
+                victim = k
+        return victim
+
+    # If probation empty, evict from protected: pick lowest decayed score, tiebreak by oldest
+    if prot:
+        victim = None
+        min_score = None
+        min_last = None
+        for k in prot:
+            cs = _current_score(k, now, hl)
+            lu = _last_update.get(k, 0)
+            if (min_score is None) or (cs < min_score) or (cs == min_score and lu < min_last):
+                victim = k
+                min_score = cs
+                min_last = lu
+        return victim
+
+    # Fallback (should not happen): pick any key in cache
+    for k in cache_snapshot.cache:
+        return k
+    return None
+=======
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - ARC-inspired: adapt protected share using origin-aware ghosts.
+    - Prefer evicting from probation unless protected exceeds target or ARC/guard logic says otherwise.
+    '''
+    global _prot_ratio
+    now = cache_snapshot.access_count
+    hl = _half_life(cache_snapshot)
+
+    # Ensure segments reflect current cache contents
+    _prune_and_seed_segments(cache_snapshot)
+
+    in_cache = set(cache_snapshot.cache.keys())
+    prob = _probation.intersection(in_cache)
+    prot = _protected.intersection(in_cache)
+    prot_limit = _protected_limit(cache_snapshot)
+
+    # ARC-like adaptation using ghost origin of the incoming key
+    in_b1 = False
+    in_b2 = False
+    if obj is not None:
+        ok = obj.key
+        in_b1 = ok in _ghost_from_probation
+        in_b2 = ok in _ghost_from_protected
+        if in_b2 and not in_b1:
+            _prot_ratio = min(0.9, _prot_ratio + 0.05)
+        elif in_b1 and not in_b2:
+            _prot_ratio = max(0.1, _prot_ratio - 0.05)
+        # Recompute limit after adjusting ratio
+        prot_limit = _protected_limit(cache_snapshot)
+
+    # Decide segment to evict from
+    choose_probation = True
+    if now <= _guard_until and prob:
+        # During guard window protect T2 by evicting from T1
+        choose_probation = True
+    else:
+        if in_b2 and prob:
+            choose_probation = True
+        elif in_b1 and prot:
+            choose_probation = False
+        else:
+            if prot and len(prot) > prot_limit:
+                choose_probation = False
+            elif prob:
+                choose_probation = True
+            elif prot:
+                choose_probation = False
+            else:
+                choose_probation = True  # fallback
+
+    # Choose victim in selected segment
+    if choose_probation and prob:
+        victim = None
+        best_tuple = None  # (last_update, decayed_score)
+        for k in prob:
+            lu = _last_update.get(k, 0)
+            cs = _current_score(k, now, hl)
+            tup = (lu, cs)
+            if best_tuple is None or tup < best_tuple:
+                best_tuple = tup
+                victim = k
+        if victim is not None:
+            return victim
+
+    if prot:
+        victim = None
+        min_score = None
+        min_last = None
+        for k in prot:
+            cs = _current_score(k, now, hl)
+            lu = _last_update.get(k, 0)
+            if (min_score is None) or (cs < min_score) or (cs == min_score and lu < min_last):
+                victim = k
+                min_score = cs
+                min_last = lu
+        if victim is not None:
+            return victim
+
+    # Fallback (should not happen): pick any key in cache
+    for k in cache_snapshot.cache:
+        return k
+    return None
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_hit(cache_snapshot, obj):
+    '''
+    Update metadata immediately after a cache hit.
+    '''
+    global m_key_timestamp, _score, _last_update, _ghost_last_access, _probation, _protected
+
+    now = cache_snapshot.access_count
+    k = obj.key
+    hl = _half_life(cache_snapshot)
+
+    # Ensure segments reflect current cache contents
+    _prune_and_seed_segments(cache_snapshot)
+
+    # Update decayed score lazily on access
+    cur = _current_score(k, now, hl)
+    _score[k] = cur + 1.0
+    _last_update[k] = now
+
+    # Promotion: if hit in probation, move to protected
+    if k in _probation:
+        _probation.discard(k)
+        _protected.add(k)
+    elif k not in _protected:
+        # If key was unknown to segments but in cache, start in probation then promote on first hit
+        _probation.add(k)
+        _probation.discard(k)
+        _protected.add(k)
+
+    # Enforce protected size limit via demotion (LRU)
+    _enforce_protected_limit(cache_snapshot)
+
+    # Maintain general ledger and ghost recency (used for admission)
+    m_key_timestamp[k] = now
+    _ghost_last_access[k] = now  # keep last access fresh for this key
+=======
+def update_after_hit(cache_snapshot, obj):
+    '''
+    Update metadata immediately after a cache hit.
+    '''
+    global m_key_timestamp, _score, _last_update, _ghost_last_access, _probation, _protected, _prot_ratio
+
+    now = cache_snapshot.access_count
+    k = obj.key
+    hl = _half_life(cache_snapshot)
+
+    # Ensure segments reflect current cache contents
+    _prune_and_seed_segments(cache_snapshot)
+
+    # Update decayed score lazily on access
+    cur = _current_score(k, now, hl)
+    _score[k] = cur + 1.0
+    _last_update[k] = now
+
+    # Promotion: if hit in probation, move to protected and slightly favor protected share
+    if k in _probation:
+        _probation.discard(k)
+        _protected.add(k)
+        _prot_ratio = min(0.9, _prot_ratio + 1.0 / max(20, max(int(getattr(cache_snapshot, "capacity", 1)), 1)))
+    elif k not in _protected:
+        # If key was unknown to segments but in cache, start in probation then promote on first hit
+        _probation.add(k)
+        _probation.discard(k)
+        _protected.add(k)
+
+    # Enforce protected size limit via demotion (value-aware)
+    _enforce_protected_limit(cache_snapshot)
+
+    # Maintain general ledger and ghost recency (used for admission)
+    m_key_timestamp[k] = now
+    _ghost_last_access[k] = now  # keep last access fresh for this key
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Update metadata immediately after inserting a new object into the cache.
+    '''
+    global m_key_timestamp, _score, _last_update, _ghost_last_access, _probation, _protected
+
+    now = cache_snapshot.access_count
+    k = obj.key
+    hl = _half_life(cache_snapshot)
+
+    # Admission bias: if the key was seen recently in ghost, insert directly into protected.
+    base = 0.3
+    place_in_protected = False
+    last_ghost = _ghost_last_access.get(k)
+    if last_ghost is not None and (now - last_ghost) <= hl:
+        base = 1.2
+        place_in_protected = True
+
+    _score[k] = base
+    _last_update[k] = now
+    m_key_timestamp[k] = now
+
+    # Place new object into SLRU segments
+    _prune_and_seed_segments(cache_snapshot)
+    if place_in_protected:
+        _protected.add(k)
+        _probation.discard(k)
+        _enforce_protected_limit(cache_snapshot)
+    else:
+        _probation.add(k)
+        _protected.discard(k)
+    # Keep ghost record; don't delete so brief reinsertions can still get bias.
+=======
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Update metadata immediately after inserting a new object into the cache.
+    '''
+    global m_key_timestamp, _score, _last_update, _ghost_last_access, _probation, _protected, _prot_ratio, _ghost_from_probation, _ghost_from_protected, _guard_until
+
+    now = cache_snapshot.access_count
+    k = obj.key
+    hl = _half_life(cache_snapshot)
+
+    # Admission bias: if the key was seen recently in ghost, prefer protected unless in guard window.
+    base = 0.3
+    place_in_protected = False
+    last_ghost = _ghost_last_access.get(k)
+    in_b1 = k in _ghost_from_probation
+    in_b2 = k in _ghost_from_protected
+
+    # ARC-style adaptation of protected share
+    if in_b2 and not in_b1:
+        _prot_ratio = min(0.9, _prot_ratio + 0.05)
+    elif in_b1 and not in_b2:
+        _prot_ratio = max(0.1, _prot_ratio - 0.05)
+
+    if last_ghost is not None and (now - last_ghost) <= hl and not (now <= _guard_until):
+        base = 1.2
+        place_in_protected = True
+
+    _score[k] = base
+    _last_update[k] = now
+    m_key_timestamp[k] = now
+
+    # Place new object into SLRU segments
+    _prune_and_seed_segments(cache_snapshot)
+    if place_in_protected:
+        _protected.add(k)
+        _probation.discard(k)
+        _enforce_protected_limit(cache_snapshot)
+    else:
+        _probation.add(k)
+        _protected.discard(k)
+
+    # Do not clear ghosts aggressively; keep for adaptation but trim size in evict handler
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Update metadata immediately after evicting the victim.
+    '''
+    global m_key_timestamp, _score, _last_update, _ghost_last_access, _probation, _protected
+
+    if evicted_obj is None:
+        return
+
+    ek = evicted_obj.key
+    # Record last access time of evicted key into ghost for admission decisions
+    last_seen = _last_update.get(ek, cache_snapshot.access_count)
+    _ghost_last_access[ek] = last_seen
+
+    # Remove from main metadata and SLRU segments
+    _score.pop(ek, None)
+    _last_update.pop(ek, None)
+    m_key_timestamp.pop(ek, None)
+    _probation.discard(ek)
+    _protected.discard(ek)
+
+    # Bound ghost size to avoid unbounded growth: keep up to ~50x capacity recent ghosts
+    cap = max(int(getattr(cache_snapshot, "capacity", 1)), 1)
+    max_ghost = max(50 * cap, 100)  # ensure reasonable minimum
+    if len(_ghost_last_access) > max_ghost:
+        # Evict the stalest ghosts
+        target = len(_ghost_last_access) - max_ghost
+        stale_items = sorted(_ghost_last_access.items(), key=lambda x: x[1])[:target]
+        for key, _ in stale_items:
+            _ghost_last_access.pop(key, None)
+=======
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Update metadata immediately after evicting the victim.
+    '''
+    global m_key_timestamp, _score, _last_update, _ghost_last_access, _probation, _protected, _ghost_from_probation, _ghost_from_protected, _guard_until
+
+    if evicted_obj is None:
+        return
+
+    now = cache_snapshot.access_count
+    hl = _half_life(cache_snapshot)
+    ek = evicted_obj.key
+
+    # Determine origin (probation or protected) and record into corresponding ghost
+    was_prob = ek in _probation
+    was_prot = ek in _protected
+
+    # Record last access time of evicted key into ghost for admission decisions
+    last_seen = _last_update.get(ek, now)
+    _ghost_last_access[ek] = last_seen
+    if was_prob:
+        _ghost_from_probation[ek] = now
+    elif was_prot:
+        _ghost_from_protected[ek] = now
+    else:
+        # Unknown; assume probation
+        _ghost_from_probation[ek] = now
+
+    # If evicting a strong protected item, enable a short guard window
+    if was_prot:
+        strength = _current_score(ek, now, hl)
+        if strength >= _GUARD_STRENGTH_THRESH:
+            cap = max(int(getattr(cache_snapshot, "capacity", 1)), 1)
+            _guard_until = now + max(1, cap // 2)
+
+    # Remove from main metadata and SLRU segments
+    _score.pop(ek, None)
+    _last_update.pop(ek, None)
+    m_key_timestamp.pop(ek, None)
+    _probation.discard(ek)
+    _protected.discard(ek)
+
+    # Bound ghost sizes to avoid unbounded growth
+    cap = max(int(getattr(cache_snapshot, "capacity", 1)), 1)
+    max_ghost = max(50 * cap, 100)  # ensure reasonable minimum
+    if len(_ghost_last_access) > max_ghost:
+        # Evict the stalest ghosts
+        target = len(_ghost_last_access) - max_ghost
+        stale_items = sorted(_ghost_last_access.items(), key=lambda x: x[1])[:target]
+        for key, _ in stale_items:
+            _ghost_last_access.pop(key, None)
+            _ghost_from_probation.pop(key, None)
+            _ghost_from_protected.pop(key, None)
+    # Also trim origin ghosts independently to cap
+    for ghost_dict in (_ghost_from_probation, _ghost_from_protected):
+        if len(ghost_dict) > max_ghost:
+            target = len(ghost_dict) - max_ghost
+            stale = sorted(ghost_dict.items(), key=lambda x: x[1])[:target]
+            for key, _ in stale:
+                ghost_dict.pop(key, None)
+>>>>>>> REPLACE
+
+</DIFF>

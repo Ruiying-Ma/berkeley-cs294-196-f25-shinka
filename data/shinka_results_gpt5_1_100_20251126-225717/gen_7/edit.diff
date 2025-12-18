@@ -1,0 +1,298 @@
+--- a/original.py
++++ b/original.py
+@@ -1,176 +1,261 @@
+ # EVOLVE-BLOCK-START
+ """Cache eviction algorithm using decayed LFU with ghost-admission bias."""
+ 
+ import math
+ 
+ # Compatibility ledger from legacy code (kept but not relied upon for policy)
+ m_key_timestamp = dict()
+ 
+ # Per-key decayed frequency state
+ _score = dict()          # key -> decayed frequency score (float)
+ _last_update = dict()    # key -> last timestamp when score was updated (int)
+ 
+ # Ghost history: tracks last-access time for recently evicted keys to bias re-admission
+ _ghost_last_access = dict()  # key -> last access time recorded at eviction
++
++# SLRU segments
++_probation = set()
++_protected = set()
++_PROTECTED_RATIO = 0.8
+ 
+ 
+ def _half_life(cache_snapshot):
+     """
+     Choose a decay half-life scaled to cache capacity.
+     Larger caches get a longer memory; smaller caches emphasize recency more.
+     """
+     cap = max(int(getattr(cache_snapshot, "capacity", 1)), 1)
+     # Empirically effective: ~1.5x capacity accesses as half-life
+     return max(8, int(1.5 * cap))
+ 
+ 
+ def _decay_factor(delta, hl):
+     if hl <= 0:
+         return 0.0
+     # Exponential decay to half every 'hl' accesses: 0.5 ** (delta/hl)
+     return math.pow(0.5, float(delta) / float(hl))
+ 
+ 
+ def _current_score(key, now, hl):
+     s = _score.get(key, 0.0)
+     last = _last_update.get(key, now)
+     if s <= 0.0:
+         return 0.0
+     delta = now - last
+     if delta <= 0:
+         return s
+     return s * _decay_factor(delta, hl)
+ 
+ 
++def _protected_limit(cache_snapshot):
++    cap = max(int(getattr(cache_snapshot, "capacity", 1)), 1)
++    # At least 1 item protected, up to 80% of capacity
++    return max(1, int(_PROTECTED_RATIO * cap))
++
++
++def _prune_and_seed_segments(cache_snapshot):
++    """Keep SLRU segments consistent with actual cache keys and seed unknown keys into probation."""
++    in_cache = set(cache_snapshot.cache.keys())
++    # Drop any keys that are no longer in cache
++    _probation.intersection_update(in_cache)
++    _protected.intersection_update(in_cache)
++    # Seed any missing cached keys into probation (e.g., after cold start)
++    unknown = in_cache.difference(_probation).difference(_protected)
++    if unknown:
++        _probation.update(unknown)
++
++
++def _enforce_protected_limit(cache_snapshot):
++    """Demote oldest from protected until within limit."""
++    limit = _protected_limit(cache_snapshot)
++    if not _protected:
++        return
++    while len(_protected) > limit:
++        # Demote LRU from protected to probation
++        oldest = None
++        oldest_ts = None
++        for kk in _protected:
++            ts = _last_update.get(kk, 0)
++            if oldest_ts is None or ts < oldest_ts:
++                oldest = kk
++                oldest_ts = ts
++        if oldest is None:
++            break
++        _protected.discard(oldest)
++        _probation.add(oldest)
++
++
+ def evict(cache_snapshot, obj):
+     '''
+     This function defines how the algorithm chooses the eviction victim.
+     - Args:
+         - `cache_snapshot`: A snapshot of the current cache state.
+         - `obj`: The new object that needs to be inserted into the cache.
+     - Return:
+         - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+     '''
+     now = cache_snapshot.access_count
+     hl = _half_life(cache_snapshot)
+ 
+-    # Select the key with the minimal decayed LFU score; tie-break by oldest last_update (LRU-ish).
+-    min_key = None
+-    min_score = None
+-    min_last = None
+-
+-    for k in cache_snapshot.cache.keys():
+-        cs = _current_score(k, now, hl)
+-        lu = _last_update.get(k, now)
+-        if (min_score is None) or (cs < min_score) or (cs == min_score and lu < min_last):
+-            min_key = k
+-            min_score = cs
+-            min_last = lu
+-
+-    # Fallback (should not happen, but keep safe)
+-    if min_key is None:
+-        for k in cache_snapshot.cache:
+-            min_key = k
+-            break
+-    return min_key
++    # Ensure segments reflect current cache contents
++    _prune_and_seed_segments(cache_snapshot)
++
++    in_cache = set(cache_snapshot.cache.keys())
++    prob = _probation.intersection(in_cache)
++    prot = _protected.intersection(in_cache)
++
++    # Prefer evicting from probation (SLRU). Use LRU with frequency tiebreaker.
++    if prob:
++        victim = None
++        best_tuple = None  # (last_update, decayed_score)
++        for k in prob:
++            lu = _last_update.get(k, 0)
++            cs = _current_score(k, now, hl)
++            tup = (lu, cs)
++            if best_tuple is None or tup < best_tuple:
++                best_tuple = tup
++                victim = k
++        return victim
++
++    # If probation empty, evict from protected: pick lowest decayed score, tiebreak by oldest
++    if prot:
++        victim = None
++        min_score = None
++        min_last = None
++        for k in prot:
++            cs = _current_score(k, now, hl)
++            lu = _last_update.get(k, 0)
++            if (min_score is None) or (cs < min_score) or (cs == min_score and lu < min_last):
++                victim = k
++                min_score = cs
++                min_last = lu
++        return victim
++
++    # Fallback (should not happen): pick any key in cache
++    for k in cache_snapshot.cache:
++        return k
++    return None
+ 
+ 
+ def update_after_hit(cache_snapshot, obj):
+     '''
+     Update metadata immediately after a cache hit.
+     '''
+-    global m_key_timestamp, _score, _last_update, _ghost_last_access
++    global m_key_timestamp, _score, _last_update, _ghost_last_access, _probation, _protected
+ 
+     now = cache_snapshot.access_count
+     k = obj.key
+     hl = _half_life(cache_snapshot)
++
++    # Ensure segments reflect current cache contents
++    _prune_and_seed_segments(cache_snapshot)
+ 
+     # Update decayed score lazily on access
+     cur = _current_score(k, now, hl)
+     _score[k] = cur + 1.0
+     _last_update[k] = now
+ 
++    # Promotion: if hit in probation, move to protected
++    if k in _probation:
++        _probation.discard(k)
++        _protected.add(k)
++    elif k not in _protected:
++        # If key was unknown to segments but in cache, start in probation then promote on first hit
++        _probation.add(k)
++        _probation.discard(k)
++        _protected.add(k)
++
++    # Enforce protected size limit via demotion (LRU)
++    _enforce_protected_limit(cache_snapshot)
++
+     # Maintain general ledger and ghost recency (used for admission)
+     m_key_timestamp[k] = now
+     _ghost_last_access[k] = now  # keep last access fresh for this key
+ 
+ 
+ def update_after_insert(cache_snapshot, obj):
+     '''
+     Update metadata immediately after inserting a new object into the cache.
+     '''
+-    global m_key_timestamp, _score, _last_update, _ghost_last_access
++    global m_key_timestamp, _score, _last_update, _ghost_last_access, _probation, _protected
+ 
+     now = cache_snapshot.access_count
+     k = obj.key
+     hl = _half_life(cache_snapshot)
+ 
+-    # Admission bias: if the key was seen recently in ghost, give it a stronger initial score.
+-    # Otherwise, keep a conservative initial score to avoid pollution.
++    # Admission bias: if the key was seen recently in ghost, insert directly into protected.
+     base = 0.3
++    place_in_protected = False
+     last_ghost = _ghost_last_access.get(k)
+-    if last_ghost is not None:
+-        # Recently evicted and accessed within a half-life -> boost
+-        if (now - last_ghost) <= hl:
+-            base = 1.2
++    if last_ghost is not None and (now - last_ghost) <= hl:
++        base = 1.2
++        place_in_protected = True
+ 
+     _score[k] = base
+     _last_update[k] = now
+     m_key_timestamp[k] = now
+-    # We do not remove from ghost here; admission bias can persist for a short time.
++
++    # Place new object into SLRU segments
++    _prune_and_seed_segments(cache_snapshot)
++    if place_in_protected:
++        _protected.add(k)
++        _probation.discard(k)
++        _enforce_protected_limit(cache_snapshot)
++    else:
++        _probation.add(k)
++        _protected.discard(k)
++    # Keep ghost record; don't delete so brief reinsertions can still get bias.
+ 
+ 
+ def update_after_evict(cache_snapshot, obj, evicted_obj):
+     '''
+     Update metadata immediately after evicting the victim.
+     '''
+-    global m_key_timestamp, _score, _last_update, _ghost_last_access
++    global m_key_timestamp, _score, _last_update, _ghost_last_access, _probation, _protected
+ 
+     if evicted_obj is None:
+         return
+ 
+     ek = evicted_obj.key
+     # Record last access time of evicted key into ghost for admission decisions
+     last_seen = _last_update.get(ek, cache_snapshot.access_count)
+     _ghost_last_access[ek] = last_seen
+ 
+-    # Remove from main metadata
++    # Remove from main metadata and SLRU segments
+     _score.pop(ek, None)
+     _last_update.pop(ek, None)
+     m_key_timestamp.pop(ek, None)
++    _probation.discard(ek)
++    _protected.discard(ek)
+ 
+     # Bound ghost size to avoid unbounded growth: keep up to ~50x capacity recent ghosts
+     cap = max(int(getattr(cache_snapshot, "capacity", 1)), 1)
+     max_ghost = max(50 * cap, 100)  # ensure reasonable minimum
+     if len(_ghost_last_access) > max_ghost:
+         # Evict the stalest ghosts
+-        # Remove approx 10% overflow to amortize cost
+         target = len(_ghost_last_access) - max_ghost
+-        # Sort by last access ascending and drop 'target' items
+-        # For performance, do a simple selection loop without full sort
+-        # but given this triggers rarely, a sort is fine.
+         stale_items = sorted(_ghost_last_access.items(), key=lambda x: x[1])[:target]
+         for key, _ in stale_items:
+             _ghost_last_access.pop(key, None)
+ 
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

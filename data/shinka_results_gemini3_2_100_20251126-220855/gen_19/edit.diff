@@ -1,0 +1,295 @@
+--- a/original.py
++++ b/original.py
+@@ -1,157 +1,180 @@
+ # EVOLVE-BLOCK-START
+-"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
++"""Cache eviction algorithm using LIRS (Low Inter-reference Recency Set)"""
++from collections import OrderedDict
+ 
+-# ARC (Adaptive Replacement Cache) Global State
+-m_lru = {}    # key -> access_count (timestamp)
+-m_t1 = set()  # T1: Recent set (keys)
+-m_t2 = set()  # T2: Frequent set (keys)
+-m_b1 = set()  # B1: Ghost Recent set (keys)
+-m_b2 = set()  # B2: Ghost Frequent set (keys)
+-m_p = 0.0     # Adaptation parameter (target size of T1)
+-m_last_access_count = 0 # To detect trace resets
++# LIRS Global State
++m_s = OrderedDict()    # Stack S: Tracks recency of LIR and HIR blocks.
++m_q = OrderedDict()    # Queue Q: Tracks resident HIR blocks.
++m_lir = set()          # Set of LIR (hot) block keys.
++m_last_access_count = -1
++m_h_lir_ratio = 0.99   # Target LIR size ratio (99% LIR, 1% HIR)
+ 
+-def check_reset(cache_snapshot):
+-    global m_last_access_count, m_lru, m_t1, m_t2, m_b1, m_b2, m_p
+-    current_count = cache_snapshot.access_count
+-    if current_count < m_last_access_count:
+-        # Trace reset detected
+-        m_lru.clear()
+-        m_t1.clear()
+-        m_t2.clear()
+-        m_b1.clear()
+-        m_b2.clear()
+-        m_p = 0.0
+-    m_last_access_count = current_count
++def _check_reset(cache_snapshot):
++    """Resets global state if a new trace is detected."""
++    global m_s, m_q, m_lir, m_last_access_count
++    if cache_snapshot.access_count < m_last_access_count:
++        m_s.clear()
++        m_q.clear()
++        m_lir.clear()
++    m_last_access_count = cache_snapshot.access_count
++
++def _prune_stack():
++    """Removes HIR blocks from the bottom of the stack S."""
++    global m_s, m_lir
++    while m_s:
++        # Peek at the bottom (oldest) item
++        bottom_key = next(iter(m_s))
++        if bottom_key in m_lir:
++            # Stop if we hit an LIR block. The bottom of S must always be an LIR block
++            # (defining the maximum recency for LIR status).
++            break
++        # Remove HIR block from bottom of S
++        m_s.popitem(last=False)
+ 
+ def evict(cache_snapshot, obj):
+     '''
+-    Choose eviction victim using ARC logic.
++    LIRS Eviction Policy:
++    - Primary Victim: LRU of the HIR Queue (Q).
++    - Fallback: If Q is empty, evict from LIR (requires demotion).
+     '''
+-    check_reset(cache_snapshot)
+-    global m_p, m_t1, m_t2, m_b1, m_b2, m_lru
++    _check_reset(cache_snapshot)
++    global m_s, m_q, m_lir
+ 
+-    # Adaptation of p
+-    if obj.key in m_b1:
+-        delta = 1.0
+-        if len(m_b1) < len(m_b2):
+-            delta = float(len(m_b2)) / len(m_b1)
+-        m_p = min(float(cache_snapshot.capacity), m_p + delta)
+-    elif obj.key in m_b2:
+-        delta = 1.0
+-        if len(m_b2) < len(m_b1):
+-            delta = float(len(m_b1)) / len(m_b2)
+-        m_p = max(0.0, m_p - delta)
+-
+-    # Determine victim
+-    victim_key = None
+-
+-    # ARC Replace Logic
+-    # We rely on m_t1 and m_t2 tracking the keys in cache.
+-    # We must filter by actual cache content to be safe against state drift or initialization.
+-    t1_candidates = [k for k in m_t1 if k in cache_snapshot.cache]
+-    t2_candidates = [k for k in m_t2 if k in cache_snapshot.cache]
+-
+-    # Fallback if sets are empty but cache is not (should not happen if consistent)
+-    if not t1_candidates and not t2_candidates:
+-        # Use full cache as fallback
+-        t1_candidates = list(cache_snapshot.cache.keys())
+-
+-    evict_from_t1 = False
+-    if len(t1_candidates) > 0:
+-        if len(t1_candidates) > m_p:
+-            evict_from_t1 = True
+-        elif (obj.key in m_b2) and (len(t1_candidates) == int(m_p)):
+-            evict_from_t1 = True
+-
+-    # If T1 is chosen, or if T2 is empty, evict from T1
+-    if (evict_from_t1 or not t2_candidates) and t1_candidates:
+-        victim_key = min(t1_candidates, key=lambda k: m_lru.get(k, 0))
+-    else:
+-        # Otherwise evict from T2
+-        victim_key = min(t2_candidates, key=lambda k: m_lru.get(k, 0))
+-
+-    return victim_key
++    # 1. Try to evict from Resident HIR set (Q)
++    if m_q:
++        return next(iter(m_q))
++    
++    # 2. If Q is empty (rare, but possible if cache is all LIR), evict from LIR.
++    # The LIR block to evict is the one at the bottom of S (the least recent LIR).
++    if m_s:
++        victim = next(iter(m_s))
++        return victim
++    
++    # 3. Fallback for safety (should not happen if cache is populated)
++    if cache_snapshot.cache:
++        return next(iter(cache_snapshot.cache))
++    return None
+ 
+ def update_after_hit(cache_snapshot, obj):
+     '''
+-    Update metadata after hit. Move to T2 (Frequent).
++    Handle Cache Hit:
++    - If LIR: Update recency in S, prune S.
++    - If Resident HIR:
++      - If in S: Promote to LIR (hit in stack).
++      - If not in S: Keep as HIR, update recency.
+     '''
+-    check_reset(cache_snapshot)
+-    global m_lru, m_t1, m_t2
+-    m_lru[obj.key] = cache_snapshot.access_count
++    _check_reset(cache_snapshot)
++    global m_s, m_q, m_lir, m_h_lir_ratio
++    
++    key = obj.key
++    capacity = cache_snapshot.capacity
++    target_lir = max(1, int(capacity * m_h_lir_ratio))
+ 
+-    if obj.key in m_t1:
+-        m_t1.remove(obj.key)
+-        m_t2.add(obj.key)
+-    # If in T2, it stays in T2. LRU updated.
++    if key in m_lir:
++        # Case 1: LIR Block Hit
++        # Move to top of S
++        if key in m_s:
++            m_s.move_to_end(key)
++        else:
++            # Recovery if state drifted
++            m_s[key] = 1
++        _prune_stack()
++
++    elif key in m_q:
++        # Case 2: Resident HIR Block Hit
++        if key in m_s:
++            # Case 2a: In S -> Promote to LIR
++            del m_q[key]
++            m_lir.add(key)
++            m_s.move_to_end(key)
++            
++            # Maintain LIR capacity
++            if len(m_lir) > target_lir:
++                # Demote the bottom LIR block to HIR
++                demoted = next(iter(m_s))
++                m_s.popitem(last=False) # Remove from S (will rejoin as HIR logic requires? No, see below)
++                m_lir.remove(demoted)
++                m_q[demoted] = 1        # Add to Q
++                _prune_stack()
++        else:
++            # Case 2b: Not in S -> Stay Resident HIR
++            m_s[key] = 1 # Add to S (becomes most recent)
++            m_q.move_to_end(key) # Update in Q
++            m_s.move_to_end(key) # Redundant but safe
++            
++    else:
++        # Metadata missing? Treat as Resident HIR
++        m_s[key] = 1
++        m_q[key] = 1
+ 
+ def update_after_insert(cache_snapshot, obj):
+     '''
+-    Update metadata after insert. Handle ghost hits.
++    Handle Cache Miss (Insert):
++    - If in S (Non-resident HIR): Promote to LIR.
++    - Else: Insert as new Resident HIR.
+     '''
+-    check_reset(cache_snapshot)
+-    global m_lru, m_t1, m_t2, m_b1, m_b2
+-    m_lru[obj.key] = cache_snapshot.access_count
++    _check_reset(cache_snapshot)
++    global m_s, m_q, m_lir, m_h_lir_ratio
++    
++    key = obj.key
++    capacity = cache_snapshot.capacity
++    target_lir = max(1, int(capacity * m_h_lir_ratio))
+ 
+-    # Ghost hits promote to T2
+-    if obj.key in m_b1:
+-        m_b1.remove(obj.key)
+-        m_t2.add(obj.key)
+-    elif obj.key in m_b2:
+-        m_b2.remove(obj.key)
+-        m_t2.add(obj.key)
++    if key in m_s:
++        # Case 3: Hit on Non-resident HIR (Ghost hit within history window)
++        # Promote to LIR
++        m_lir.add(key)
++        m_s.move_to_end(key)
++        
++        if len(m_lir) > target_lir:
++            # Demote bottom LIR
++            demoted = next(iter(m_s))
++            m_s.popitem(last=False)
++            m_lir.remove(demoted)
++            m_q[demoted] = 1
++            _prune_stack()
+     else:
+-        # New object -> T1
+-        m_t1.add(obj.key)
+-        # Safety: ensure not in T2
+-        if obj.key in m_t2:
+-            m_t2.remove(obj.key)
++        # Case 4: Cold Miss / New Block
++        # Insert as Resident HIR
++        m_s[key] = 1
++        m_q[key] = 1
+ 
+ def update_after_evict(cache_snapshot, obj, evicted_obj):
+     '''
+-    Update metadata after eviction. Move to ghosts.
++    Handle Eviction:
++    - Remove from Q or LIR sets.
++    - If in S, it effectively becomes a Non-resident HIR (ghost).
+     '''
+-    check_reset(cache_snapshot)
+-    global m_t1, m_t2, m_b1, m_b2, m_lru
+-
+-    if evicted_obj.key in m_t1:
+-        m_t1.remove(evicted_obj.key)
+-        m_b1.add(evicted_obj.key)
+-    elif evicted_obj.key in m_t2:
+-        m_t2.remove(evicted_obj.key)
+-        m_b2.add(evicted_obj.key)
+-
+-    # Manage ghost size (limit total ghosts to capacity)
+-    target_ghost_size = cache_snapshot.capacity
+-    if len(m_b1) + len(m_b2) > target_ghost_size:
+-        ghost_keys = list(m_b1) + list(m_b2)
+-        if ghost_keys:
+-            victim_ghost = min(ghost_keys, key=lambda k: m_lru.get(k, 0))
+-            if victim_ghost in m_b1:
+-                m_b1.remove(victim_ghost)
+-            elif victim_ghost in m_b2:
+-                m_b2.remove(victim_ghost)
+-            if victim_ghost in m_lru:
+-                del m_lru[victim_ghost]
++    key = evicted_obj.key
++    global m_q, m_lir
++    
++    if key in m_q:
++        del m_q[key]
++    if key in m_lir:
++        m_lir.remove(key)
++    
++    # Note: We do NOT remove from m_s here. 
++    # If the key is in m_s, it remains there as "Non-resident HIR" 
++    # until it is pruned from the bottom of S.
+ 
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

@@ -1,0 +1,168 @@
+<NAME>
+slru_promotion_with_quota
+</NAME>
+
+<DESCRIPTION>
+I replace the plain LRU policy with a two-segment SLRU (Segmented LRU) that separates entries into probation (recent, unproven) and protected (frequent) segments. This improves robustness across workloads by keeping repeatedly accessed objects longer, while allowing one-hit wonders to be evicted preferentially.
+
+Key ideas:
+- On insert: items start in probation.
+- On hit: probation items are promoted to protected; protected items just refresh recency.
+- Protected segment has a dynamic quota (80% of capacity). When it exceeds the quota, its LRU item is demoted back to probation to ensure we always have candidates to evict from probation first.
+- Eviction prefers the LRU from the probation segment; if none exist, it evicts the global LRU.
+
+This design blends recency and frequency without heavy overhead, approximating ARC/2Q behavior, and typically yields lower miss rates on mixed or bursty workloads while remaining simple and efficient. It keeps metadata per key only (last access timestamp and segment flag) and uses the provided access_count as time. The update routines maintain consistency, and the evict routine is robust to edge cases.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+
+m_key_timestamp = dict()
+
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    candid_obj_key = None
+    min_ts = min(m_key_timestamp.values())
+    candid_obj_keys = list(key for key in cache_snapshot.cache if m_key_timestamp[key] == min_ts)
+    candid_obj_key = candid_obj_keys[0]
+    return candid_obj_key
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_key_timestamp
+    assert obj.key in m_key_timestamp
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp
+    assert obj.key not in m_key_timestamp
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp
+    assert obj.key not in m_key_timestamp
+    assert evicted_obj.key in m_key_timestamp
+    m_key_timestamp.pop(evicted_obj.key)
+=======
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+
+# Metadata
+# - m_key_timestamp: last access time for each cached key
+# - m_key_segment: 'p' = protected (frequent), 'b' = probation (recent/unproven)
+m_key_timestamp = dict()
+m_key_segment = dict()
+
+def _protected_limit(cache_snapshot):
+    """Target size for the protected segment (80% of capacity, at least 1)."""
+    try:
+        cap = int(cache_snapshot.capacity)
+    except Exception:
+        cap = max(1, len(cache_snapshot.cache))
+    return max(1, int(0.8 * cap))
+
+def _demote_if_needed(cache_snapshot):
+    """Ensure protected segment does not exceed its quota by demoting its LRU."""
+    prot_limit = _protected_limit(cache_snapshot)
+    prot_keys = [k for k in cache_snapshot.cache if m_key_segment.get(k) == 'p']
+    if len(prot_keys) <= prot_limit:
+        return
+    # Demote LRU from protected to probation
+    lru_key = min(prot_keys, key=lambda k: m_key_timestamp.get(k, float('inf')))
+    m_key_segment[lru_key] = 'b'
+
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    # Prefer evicting from probation (items not yet proven frequent)
+    probation_keys = [k for k in cache_snapshot.cache if m_key_segment.get(k, 'b') == 'b']
+    if probation_keys:
+        victim = min(probation_keys, key=lambda k: m_key_timestamp.get(k, float('inf')))
+        return victim
+    # Fallback: evict global LRU
+    all_keys = list(cache_snapshot.cache.keys())
+    victim = min(all_keys, key=lambda k: m_key_timestamp.get(k, float('inf')))
+    return victim
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_key_timestamp, m_key_segment
+    # Refresh recency
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+    # Promote to protected on first post-admission hit
+    if m_key_segment.get(obj.key, 'b') == 'b':
+        m_key_segment[obj.key] = 'p'
+    # Enforce protected quota
+    _demote_if_needed(cache_snapshot)
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp, m_key_segment
+    # New entries start in probation
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+    m_key_segment[obj.key] = 'b'
+    # Keep protected within quota as cache grows
+    _demote_if_needed(cache_snapshot)
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp, m_key_segment
+    # Clean up all metadata for the evicted object
+    m_key_timestamp.pop(evicted_obj.key, None)
+    m_key_segment.pop(evicted_obj.key, None)
+>>>>>>> REPLACE
+
+</DIFF>

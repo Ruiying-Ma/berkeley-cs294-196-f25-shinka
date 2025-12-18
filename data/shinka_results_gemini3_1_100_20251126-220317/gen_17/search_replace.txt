@@ -1,0 +1,260 @@
+<NAME>
+s3_fifo_refined
+</NAME>
+
+<DESCRIPTION>
+Implementing a refined version of S3-FIFO algorithm.
+S3-FIFO divides the cache into a small FIFO queue (Small, 10% capacity) and a main FIFO queue (Main, 90% capacity).
+New items are inserted into Small.
+Eviction policy:
+1. If Small is larger than its target size (10%) or Main is empty, eviction candidates are chosen from Small.
+   - If the candidate has been accessed (hit), it is promoted to Main (Lazy promotion).
+   - Otherwise, it is evicted and its key is added to a Ghost cache.
+2. If Small is within target size, candidates are chosen from Main.
+   - If the candidate has been accessed, it is reinserted at the tail of Main (Second Chance).
+   - Otherwise, it is evicted.
+Ghost cache tracks items evicted from Small to catch items with longer reuse distances ("rescue"). If a miss occurs for a key in Ghost, it is inserted directly into Main.
+This algorithm provides scan resistance (scans pass through Small) and handles frequency/recency via Main's management.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+# EVOLVE-BLOCK-START
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+
+# ARC Globals
+m_t1 = dict() # Recency (L1)
+m_t2 = dict() # Frequency (L2)
+m_b1 = dict() # Ghost Recency
+m_b2 = dict() # Ghost Frequency
+p = 0         # Adaptive parameter
+
+def evict(cache_snapshot, obj):
+    '''
+    ARC Eviction Logic with Randomization:
+    - Adapt p based on hits in ghost lists (B1, B2).
+    - Decide whether to evict from T1 or T2 based on p and T1 size.
+    - Use Random Eviction to robustly handle loops and large working sets.
+    '''
+    global p
+    import random
+
+    capacity = cache_snapshot.capacity
+
+    # Adaptation: If the incoming object (miss) is in a ghost list
+    if obj.key in m_b1:
+        delta = 1
+        if len(m_b1) < len(m_b2):
+             delta = len(m_b2) / len(m_b1)
+        p = min(capacity, p + delta)
+    elif obj.key in m_b2:
+        delta = 1
+        if len(m_b2) < len(m_b1):
+             delta = len(m_b1) / len(m_b2)
+        p = max(0, p - delta)
+
+    # Decision: Select victim
+    evict_t1 = False
+    if len(m_t1) > 0:
+        if len(m_t1) > p:
+            evict_t1 = True
+        elif obj.key in m_b2 and len(m_t1) == int(p):
+            evict_t1 = True
+        elif len(m_t2) == 0:
+            evict_t1 = True
+
+    if evict_t1:
+        return random.choice(list(m_t1.keys()))
+    else:
+        return random.choice(list(m_t2.keys()))
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    On Cache Hit:
+    - If obj in T1, move to T2 (MRU).
+    - If obj in T2, move to MRU of T2.
+    '''
+    global m_t1, m_t2
+
+    if obj.key in m_t1:
+        del m_t1[obj.key]
+        m_t2[obj.key] = None
+    elif obj.key in m_t2:
+        del m_t2[obj.key]
+        m_t2[obj.key] = None
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On Cache Insert (Miss):
+    - Place obj in T1 or T2.
+    '''
+    global m_t1, m_t2, m_b1, m_b2, p
+
+    # Reset state at start of new trace (access_count starts at 1 usually for first miss)
+    if cache_snapshot.access_count <= 1:
+        m_t1.clear()
+        m_t2.clear()
+        m_b1.clear()
+        m_b2.clear()
+        p = 0
+
+    # Check if it was a ghost
+    is_ghost = False
+    if obj.key in m_b1:
+        del m_b1[obj.key]
+        is_ghost = True
+    if obj.key in m_b2:
+        del m_b2[obj.key]
+        is_ghost = True
+
+    if is_ghost:
+        # History hit -> promote to frequency list
+        m_t2[obj.key] = None
+    else:
+        # New item -> probation list
+        m_t1[obj.key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    After Eviction:
+    - Update ghost lists.
+    '''
+    global m_t1, m_t2, m_b1, m_b2
+
+    if evicted_obj.key in m_t1:
+        del m_t1[evicted_obj.key]
+        m_b1[evicted_obj.key] = None
+    elif evicted_obj.key in m_t2:
+        del m_t2[evicted_obj.key]
+        m_b2[evicted_obj.key] = None
+
+    # Constrain ghost list sizes to capacity
+    capacity = cache_snapshot.capacity
+    while len(m_b1) > capacity:
+        m_b1.pop(next(iter(m_b1)))
+    while len(m_b2) > capacity:
+        m_b2.pop(next(iter(m_b2)))
+
+# EVOLVE-BLOCK-END
+=======
+# EVOLVE-BLOCK-START
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+
+# S3-FIFO-Refined Globals
+q_small = dict()
+q_main = dict()
+q_ghost = dict()
+s_hits = set()
+
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO Eviction Logic:
+    - 10% Small (Nursery), 90% Main.
+    - Lazy promotion/reinsertion on eviction.
+    '''
+    global q_small, q_main, q_ghost, s_hits
+
+    capacity = cache_snapshot.capacity
+    # Target size for small queue
+    target_small = max(1, int(capacity * 0.1))
+
+    while True:
+        # Check Small first if it's over budget or Main is empty
+        if len(q_small) > target_small or not q_main:
+            if not q_small:
+                # Fallback if both empty (should not happen in full cache)
+                if q_main:
+                    candidate = next(iter(q_main))
+                else:
+                    return next(iter(cache_snapshot.cache))
+            else:
+                candidate = next(iter(q_small))
+
+            if candidate in s_hits:
+                # Hit in Small -> Promote to Main
+                s_hits.discard(candidate)
+                if candidate in q_small:
+                    del q_small[candidate]
+                q_main[candidate] = None
+            else:
+                # Evict from Small
+                return candidate
+        else:
+            # Check Main
+            if not q_main:
+                # Should not reach here due to loop logic, but safety
+                target_small = -1 # Force small check next loop
+                continue
+
+            candidate = next(iter(q_main))
+            if candidate in s_hits:
+                # Hit in Main -> Reinsert to Main Tail
+                s_hits.discard(candidate)
+                if candidate in q_main:
+                    del q_main[candidate]
+                q_main[candidate] = None
+            else:
+                # Evict from Main
+                return candidate
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    Record hit.
+    '''
+    global s_hits
+    s_hits.add(obj.key)
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Handle new insertion:
+    - Reset state if trace changed.
+    - Insert to Main if Ghost, else Small.
+    '''
+    global q_small, q_main, q_ghost, s_hits
+
+    # Detect trace reset
+    if cache_snapshot.access_count <= 1:
+        q_small.clear()
+        q_main.clear()
+        q_ghost.clear()
+        s_hits.clear()
+
+    key = obj.key
+    # Clear hit status for the new/re-inserted object
+    s_hits.discard(key)
+
+    if key in q_ghost:
+        # Rescue: Ghost -> Main
+        del q_ghost[key]
+        q_main[key] = None
+    else:
+        # New -> Small
+        q_small[key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Cleanup and Ghost management.
+    '''
+    global q_small, q_main, q_ghost, s_hits
+
+    key = evicted_obj.key
+
+    # Remove from queues if present (victim chosen in evict is not removed there)
+    if key in q_small:
+        del q_small[key]
+        # Evicted from Small -> Ghost
+        q_ghost[key] = None
+    elif key in q_main:
+        del q_main[key]
+        # Evicted from Main -> No Ghost (standard S3-FIFO)
+
+    if key in s_hits:
+        s_hits.discard(key)
+
+    # Manage Ghost capacity (same as cache capacity)
+    while len(q_ghost) > cache_snapshot.capacity:
+        q_ghost.pop(next(iter(q_ghost)))
+
+# EVOLVE-BLOCK-END
+>>>>>>> REPLACE
+</DIFF>

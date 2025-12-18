@@ -1,0 +1,255 @@
+--- a/original.py
++++ b/original.py
+@@ -1,139 +1,167 @@
+ # EVOLVE-BLOCK-START
+ """Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+ 
+-# S3-FIFO-Refined Globals
+-q_small = dict()
+-q_main = dict()
+-q_ghost = dict()
+-s_hits = set()
++# S3-FIFO-F (Frequency enhanced) Globals
++m_small = dict()
++m_main = dict()
++m_ghost_s = dict()
++m_ghost_m = dict()
++m_freq = dict()
+ 
+ def evict(cache_snapshot, obj):
+     '''
+-    S3-FIFO Eviction Logic:
+-    - 10% Small (Nursery), 90% Main.
+-    - Lazy promotion/reinsertion on eviction.
++    S3-FIFO-F Eviction:
++    - 10% Small, 90% Main.
++    - Uses frequency counters (0-3) for aging in Main instead of a binary second-chance.
++    - Promotes from Small to Main if freq > 0.
+     '''
+-    global q_small, q_main, q_ghost, s_hits
+-
++    global m_small, m_main, m_freq
++    
+     capacity = cache_snapshot.capacity
+-    # Target size for small queue
+     target_small = max(1, int(capacity * 0.1))
+-
+-    while True:
+-        # Check Small first if it's over budget or Main is empty
+-        if len(q_small) > target_small or not q_main:
+-            if not q_small:
+-                # Fallback if both empty (should not happen in full cache)
+-                if q_main:
+-                    candidate = next(iter(q_main))
+-                else:
+-                    return next(iter(cache_snapshot.cache))
++    
++    # Safety loop limit to prevent infinite reinsertions (though freq decrement guarantees termination)
++    # Worst case: All items have max freq (3). We iterate 3 * N times.
++    limit = (len(m_small) + len(m_main)) * 4 + 10
++    
++    while limit > 0:
++        limit -= 1
++        
++        # Determine which queue to evict from
++        evict_small = False
++        if len(m_small) > target_small:
++            evict_small = True
++        elif not m_main:
++            evict_small = True
++            
++        if evict_small:
++            if not m_small:
++                # Should not happen if cache is full
++                if m_main: return next(iter(m_main))
++                return next(iter(cache_snapshot.cache))
++                
++            candidate = next(iter(m_small))
++            freq = m_freq.get(candidate, 0)
++            
++            if freq > 0:
++                # Promote to Main
++                del m_small[candidate]
++                m_main[candidate] = None
++                # Cap freq for promoted item (2 gives it decent survival chance in Main)
++                m_freq[candidate] = min(freq, 2)
+             else:
+-                candidate = next(iter(q_small))
+-
+-            if candidate in s_hits:
+-                # Hit in Small -> Promote to Main
+-                s_hits.discard(candidate)
+-                if candidate in q_small:
+-                    del q_small[candidate]
+-                q_main[candidate] = None
+-            else:
+-                # Evict from Small
++                # Victim found in Small
+                 return candidate
+         else:
+             # Check Main
+-            if not q_main:
+-                # Should not reach here due to loop logic, but safety
+-                target_small = -1 # Force small check next loop
+-                continue
+-
+-            candidate = next(iter(q_main))
+-            if candidate in s_hits:
+-                # Hit in Main -> Reinsert to Main Tail
+-                s_hits.discard(candidate)
+-                if candidate in q_main:
+-                    del q_main[candidate]
+-                q_main[candidate] = None
++            if not m_main:
++                # Fallback
++                return next(iter(m_small))
++                
++            candidate = next(iter(m_main))
++            freq = m_freq.get(candidate, 0)
++            
++            if freq > 0:
++                # Reinsert / Aging
++                del m_main[candidate]
++                m_main[candidate] = None # Move to tail
++                m_freq[candidate] = freq - 1 # Decrement frequency (Aging)
+             else:
+-                # Evict from Main
++                # Victim found in Main
+                 return candidate
++    
++    # Emergency fallback
++    if m_small: return next(iter(m_small))
++    return next(iter(m_main))
+ 
+ def update_after_hit(cache_snapshot, obj):
+     '''
+-    Record hit.
++    On Hit: Increment frequency, saturated at 3.
+     '''
+-    global s_hits
+-    s_hits.add(obj.key)
++    global m_freq
++    m_freq[obj.key] = min(m_freq.get(obj.key, 0) + 1, 3)
+ 
+ def update_after_insert(cache_snapshot, obj):
+     '''
+-    Handle new insertion:
+-    - Reset state if trace changed.
+-    - Insert to Main if Ghost, else Small.
++    On Insert:
++    - Reset if new trace.
++    - Insert to Main if in Ghost (restoring some freq).
++    - Else Insert to Small.
+     '''
+-    global q_small, q_main, q_ghost, s_hits
++    global m_small, m_main, m_ghost_s, m_ghost_m, m_freq
+ 
+-    # Detect trace reset
+     if cache_snapshot.access_count <= 1:
+-        q_small.clear()
+-        q_main.clear()
+-        q_ghost.clear()
+-        s_hits.clear()
+-
++        m_small.clear()
++        m_main.clear()
++        m_ghost_s.clear()
++        m_ghost_m.clear()
++        m_freq.clear()
++        
+     key = obj.key
+-    # Clear hit status for the new/re-inserted object
+-    s_hits.discard(key)
+-
+-    if key in q_ghost:
+-        # Rescue: Ghost -> Main
+-        del q_ghost[key]
+-        q_main[key] = None
++    # Default initial frequency
++    m_freq[key] = 0
++    
++    if key in m_ghost_m:
++        # Rescuing from Main Ghost -> Main
++        del m_ghost_m[key]
++        m_main[key] = None
++        m_freq[key] = 1 # Restore warmth (1 life)
++    elif key in m_ghost_s:
++        # Rescuing from Small Ghost -> Main
++        del m_ghost_s[key]
++        m_main[key] = None
++        m_freq[key] = 0 # Probation in Main
+     else:
+         # New -> Small
+-        q_small[key] = None
++        m_small[key] = None
+ 
+ def update_after_evict(cache_snapshot, obj, evicted_obj):
+     '''
+-    Cleanup and Ghost management.
++    After Eviction:
++    - Move to appropriate Ghost list.
++    - Cleanup frequency map for fully evicted items.
+     '''
+-    global q_small, q_main, q_ghost, s_hits
+-
++    global m_small, m_main, m_ghost_s, m_ghost_m, m_freq
++    
+     key = evicted_obj.key
+-
+-    # Remove from queues if present (victim chosen in evict is not removed there)
+-    if key in q_small:
+-        del q_small[key]
+-        # Evicted from Small -> Ghost
+-        q_ghost[key] = None
+-    elif key in q_main:
+-        del q_main[key]
+-        # Evicted from Main -> No Ghost (standard S3-FIFO)
+-
+-    if key in s_hits:
+-        s_hits.discard(key)
+-
+-    # Manage Ghost capacity (same as cache capacity)
+-    while len(q_ghost) > cache_snapshot.capacity:
+-        q_ghost.pop(next(iter(q_ghost)))
+-
++    capacity = cache_snapshot.capacity
++    
++    # Identify source queue (victim was not removed in evict, only returned)
++    if key in m_small:
++        del m_small[key]
++        m_ghost_s[key] = None
++    elif key in m_main:
++        del m_main[key]
++        m_ghost_m[key] = None
++        
++    # Enforce Ghost Capacities and cleanup associated frequency data
++    while len(m_ghost_s) > capacity:
++        k = next(iter(m_ghost_s))
++        del m_ghost_s[k]
++        if k in m_freq: del m_freq[k]
++        
++    while len(m_ghost_m) > capacity:
++        k = next(iter(m_ghost_m))
++        del m_ghost_m[k]
++        if k in m_freq: del m_freq[k]
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

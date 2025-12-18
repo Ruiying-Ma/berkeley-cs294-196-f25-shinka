@@ -1,0 +1,95 @@
+<NAME>
+arc_tiny_lfu_demote_bias
+</NAME>
+
+<DESCRIPTION>
+I introduce a time-bounded demotion bias during detected scans to better protect against scan pollution: when the short scan guard is active, there are no B2 ghosts (no frequency evidence), and T2 is larger than T1, we force a single REPLACE to evict from T2 by setting the effective p to 0 for that access. This matches ARC semantics while limiting the weak floor on uniform/scan traces.
+
+Additionally, I make T2 eviction lightly frequency-aware within a tiny LRU-side window to prefer evicting the least frequently used and oldest item, reducing misses on noisy mixed workloads without over-biasing. I also strengthen the frequency signal by bumping hits and ghost-hit admissions by +2 (while keeping brand-new inserts at +1), and keep periodic decay to bound counts.
+
+Together, these adjustments stabilize p, improve handling of scans, and sharpen resident selection, expected to lower miss rates across heterogeneous traces.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+# One-time extra clamp flag during cold scan phases
+cold_extra_applied = False
+# Remember which list REPLACE selected from in evict (for accurate ghosting)
+last_replaced_from = None
+=======
+# One-time extra clamp flag during cold scan phases
+cold_extra_applied = False
+# Remember which list REPLACE selected from in evict (for accurate ghosting)
+last_replaced_from = None
+# Time-bounded demotion bias tracker (one-shot per access)
+last_demote_bias_access = -1
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    global arc_p, last_ghost_hit_access, cold_streak, scan_guard_until, cold_extra_applied, last_replaced_from
+=======
+    global arc_p, last_ghost_hit_access, cold_streak, scan_guard_until, cold_extra_applied, last_replaced_from, last_demote_bias_access
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    # ARC REPLACE with guard-adjusted effective p (short, gentle guard)
+    t1_sz = len(arc_T1)
+    guard_active = (scan_guard_until != -1 and cache_snapshot.access_count < scan_guard_until)
+    drop_unit = max(1, C // 16)
+    # gentle drop grows with cold_streak beyond ~C/2, bounded by drop_unit
+    drop = min(drop_unit, max(0, 1 + (cold_streak - max(1, C // 2)) // drop_unit))
+    p_eff = max(0, arc_p - (drop if guard_active else 0))
+=======
+    # ARC REPLACE with guard-adjusted effective p (short, gentle guard)
+    t1_sz = len(arc_T1)
+    guard_active = (scan_guard_until != -1 and cache_snapshot.access_count < scan_guard_until)
+    drop_unit = max(1, C // 16)
+    # gentle drop grows with cold_streak beyond ~C/2, bounded by drop_unit
+    drop = min(drop_unit, max(0, 1 + (cold_streak - max(1, C // 2)) // drop_unit))
+    p_eff = max(0, arc_p - (drop if guard_active else 0))
+    # Time-bounded demotion bias: on scans with no frequency evidence, evict from T2 once
+    if guard_active and len(arc_B2) == 0 and len(arc_T2) > len(arc_T1) and last_demote_bias_access != cache_snapshot.access_count:
+        p_eff = 0
+        last_demote_bias_access = cache_snapshot.access_count
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    else:
+        # Evict from T2: stick to pure LRU to avoid over-bias
+        candidate = next(iter(arc_T2)) if arc_T2 else None
+        if candidate is not None:
+            last_replaced_from = 'T2'
+=======
+    else:
+        # Evict from T2: lightly frequency-aware within a tiny LRU-side window
+        window2 = min(4, max(1, C // 16))
+        candidate = _pick_freq_aware_lru(arc_T2, window2) if arc_T2 else None
+        if candidate is not None:
+            last_replaced_from = 'T2'
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    m_key_freq[key] = m_key_freq.get(key, 0) + 1
+=======
+    m_key_freq[key] = m_key_freq.get(key, 0) + 2
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        # Ghost hits imply history: modest frequency bump
+        m_key_freq[key] = m_key_freq.get(key, 0) + 1
+=======
+        # Ghost hits imply history: stronger frequency bump
+        m_key_freq[key] = m_key_freq.get(key, 0) + 2
+>>>>>>> REPLACE
+
+</DIFF>

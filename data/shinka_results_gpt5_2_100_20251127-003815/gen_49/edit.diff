@@ -1,0 +1,698 @@
+--- a/original.py
++++ b/original.py
+@@ -1,401 +1,465 @@
+ # EVOLVE-BLOCK-START
+-"""Hybrid ARC + TinyLFU with LRFU-decayed sampling.
++"""LeCaR (learning LRU/LFU mix) + TinyLFU guard
+ 
+ Public API:
+ - evict(cache_snapshot, obj) -> key
+ - update_after_hit(cache_snapshot, obj)
+ - update_after_insert(cache_snapshot, obj)
+ - update_after_evict(cache_snapshot, obj, evicted_obj)
+ """
+ 
+ from collections import OrderedDict
+ 
+ 
+-class _ArcTinyLfuLrfu:
++class _LeCaR_TinyLFU:
+     """
+-    ARC resident sets with ghosts + TinyLFU for admission + LRFU decayed scores
+-    for fine-grained victim selection within segments.
+-    - T1: probationary (recency)
+-    - T2: protected (frequency)
+-    - B1, B2: ghosts to adapt ARC target p
++    LeCaR policy that mixes LRU and LFU using online multiplicative weights.
++    - LRU: OrderedDict for recency.
++    - LFU: frequency buckets (freq -> OrderedDict of keys) with min_freq tracking.
++    - TinyLFU: Count-Min Sketch for capacity-aware frequency estimates and aging.
++    - Learning: when a miss occurs on a key previously evicted by LRU (or LFU),
++      penalize that policy and reward the other; choose eviction from the
++      stronger policy, with TinyLFU-guarded tie-breaking.
+     """
+ 
+     __slots__ = (
+-        # ARC segments
+-        "T1", "T2", "B1", "B2", "p",
++        # LRU state
++        "lru",
++        # LFU state
++        "key_freq", "freq_buckets", "min_freq",
+         # TinyLFU sketch
+         "SKETCH_DEPTH", "sketch_w", "sketch", "sketch_ops", "age_threshold",
+-        # LRFU metadata
+-        "score", "last_time", "decay_half_life", "decay_base",
+-        # run/misc
+-        "last_access_seen", "miss_streak",
+-        # victim bookkeeping
+-        "last_victim_key", "last_victim_from",
+-        # sampling
++        # Learning weights
++        "w_lru", "w_lfu", "eta",
++        # Evicted-by history for regret
++        "evicted_by", "evicted_limit",
++        # Bookkeeping
++        "last_access_seen", "last_victim_key", "last_victim_policy",
++        # Sampling
+         "_sample_k",
+     )
+ 
+     def __init__(self):
+-        # Resident and ghost sets
+-        self.T1 = OrderedDict()
+-        self.T2 = OrderedDict()
+-        self.B1 = OrderedDict()
+-        self.B2 = OrderedDict()
+-        self.p = 0.0
++        # Resident structures
++        self.lru = OrderedDict()
++
++        self.key_freq = {}                 # key -> freq
++        self.freq_buckets = {}             # freq -> OrderedDict(keys)
++        self.min_freq = 1
+ 
+         # TinyLFU CMS
+         self.SKETCH_DEPTH = 4
+         self.sketch_w = 0
+         self.sketch = []
+         self.sketch_ops = 0
+         self.age_threshold = 0
+ 
+-        # LRFU decayed scoring
+-        self.score = {}
+-        self.last_time = {}
+-        self.decay_half_life = 16
+-        self.decay_base = 2 ** (-1.0 / float(self.decay_half_life))
++        # Learning weights
++        self.w_lru = 1.0
++        self.w_lfu = 1.0
++        self.eta = 0.05
++
++        # Evicted key -> policy that evicted it
++        self.evicted_by = OrderedDict()
++        self.evicted_limit = 0
+ 
+         # Misc
+         self.last_access_seen = -1
+-        self.miss_streak = 0
+-
+-        # Victim tracking
+         self.last_victim_key = None
+-        self.last_victim_from = None
+-
+-        # Sampling window from LRU side
++        self.last_victim_policy = None
++
++        # Sampling size
+         self._sample_k = 8
+ 
+-    # ---------- lifecycle / setup ----------
++    # ---------- lifecycle ----------
+ 
+     def _cap(self, cache_snapshot):
+         return max(1, int(cache_snapshot.capacity))
+ 
+     def _reset_if_new_run(self, cache_snapshot):
+         if cache_snapshot.access_count <= 1 or self.last_access_seen > cache_snapshot.access_count:
+-            self.T1.clear(); self.T2.clear()
+-            self.B1.clear(); self.B2.clear()
+-            self.p = 0.0
++            self.lru.clear()
++            self.key_freq.clear()
++            self.freq_buckets.clear()
++            self.min_freq = 1
++
+             self.sketch_w = 0
+             self.sketch = []
+             self.sketch_ops = 0
+             self.age_threshold = 0
+-            self.score.clear(); self.last_time.clear()
+-            self.decay_half_life = 16
+-            self.decay_base = 2 ** (-1.0 / float(self.decay_half_life))
+-            self.miss_streak = 0
++
++            self.w_lru = 1.0
++            self.w_lfu = 1.0
++            self.evicted_by.clear()
++            self.evicted_limit = 0
++
+             self.last_victim_key = None
+-            self.last_victim_from = None
++            self.last_victim_policy = None
+             self._sample_k = 8
++
+         self.last_access_seen = cache_snapshot.access_count
+ 
+     def _prune_metadata(self, cache_snapshot):
+-        # Keep resident sets consistent with actual cache
+-        cache_keys = cache_snapshot.cache.keys()
+-        for seg in (self.T1, self.T2):
+-            stale = [k for k in seg.keys() if k not in cache_keys]
+-            for k in stale:
+-                seg.pop(k, None)
+-        # Prune LRFU meta for non-resident non-ghost keys occasionally if needed
+-        # (we remove on eviction; here we are conservative)
++        # Keep LRU and LFU in sync with actual cache contents
++        cache_keys = set(cache_snapshot.cache.keys())
++
++        # LRU prune
++        for k in list(self.lru.keys()):
++            if k not in cache_keys:
++                self.lru.pop(k, None)
++
++        # LFU prune
++        for k in list(self.key_freq.keys()):
++            if k not in cache_keys:
++                self._lfu_remove(k)
++
++        # Bound evicted_by map
++        cap = self._cap(cache_snapshot)
++        if self.evicted_limit == 0:
++            self.evicted_limit = 4 * cap
++        while len(self.evicted_by) > self.evicted_limit:
++            self.evicted_by.popitem(last=False)
+ 
+     def _seed_from_cache(self, cache_snapshot):
+-        # If both segments empty but cache has content, seed T1
+-        if not self.T1 and not self.T2 and cache_snapshot.cache:
++        # Seed structures on first calls if cache already populated
++        if not self.lru and cache_snapshot.cache:
+             for k in cache_snapshot.cache.keys():
+-                self.T1[k] = None
+-
+-    # ---------- TinyLFU ----------
++                self._lru_mru(k)
++                self._lfu_add_new(k)
++
++    # ---------- TinyLFU CMS ----------
+ 
+     def _ensure_sketch(self, cache_snapshot):
+         if self.sketch_w:
+             return
+         cap = self._cap(cache_snapshot)
+         target = max(512, 4 * cap)  # capacity-aware width
+         w = 1
+         while w < target:
+             w <<= 1
+         self.sketch_w = w
+         self.sketch = [[0] * self.sketch_w for _ in range(self.SKETCH_DEPTH)]
+         self.sketch_ops = 0
+-        # Age period within [4C,16C], mid by default
++        # Age approximately every [4C, 16C] updates
+         self.age_threshold = max(4 * cap, min(16 * cap, 8 * cap))
+-        # Tune LRFU decay relative to capacity (shorter for small caches)
+-        self.decay_half_life = max(8, min(64, (cap // 2) or 8))
+-        self.decay_base = 2 ** (-1.0 / float(self.decay_half_life))
+-        # Sample size scales mildly with capacity
++        # Sampling scale to capacity
+         self._sample_k = max(4, min(12, (cap // 8) or 4))
++        # Bound evicted_by
++        self.evicted_limit = 4 * cap
+ 
+     def _hash_idx(self, key, i):
+         return (hash((key, i, 0x9E3779B97F4A7C15)) & (self.sketch_w - 1))
+ 
+     def _sketch_add(self, cache_snapshot, key, delta=1):
+         self._ensure_sketch(cache_snapshot)
+         if not self.sketch_w:
+             return
+         for i in range(self.SKETCH_DEPTH):
+             self.sketch[i][self._hash_idx(key, i)] += delta
+         self.sketch_ops += 1
+         if self.sketch_ops >= self.age_threshold:
+             for i in range(self.SKETCH_DEPTH):
+                 row = self.sketch[i]
+                 for j in range(self.sketch_w):
+                     row[j] >>= 1
+             self.sketch_ops = 0
+ 
+     def _sketch_est(self, cache_snapshot, key):
+         self._ensure_sketch(cache_snapshot)
+         if not self.sketch_w:
+             return 0
+         est = None
+         for i in range(self.SKETCH_DEPTH):
+             v = self.sketch[i][self._hash_idx(key, i)]
+             est = v if est is None or v < est else est
+         return est if est is not None else 0
+ 
+-    # ---------- LRFU decayed score ----------
+-
+-    def _ensure_meta(self, key, now):
+-        if key not in self.last_time:
+-            self.last_time[key] = now
+-        if key not in self.score:
+-            self.score[key] = 0.0
+-
+-    def _decayed_score(self, key, now):
+-        self._ensure_meta(key, now)
+-        old = self.last_time[key]
+-        dt = now - old
+-        if dt > 0:
+-            self.score[key] *= self.decay_base ** dt
+-            self.last_time[key] = now
+-        return self.score[key]
+-
+-    # ---------- helpers ----------
+-
+-    def _move_to_mru(self, seg, key):
+-        if key in seg:
+-            seg.move_to_end(key, last=True)
++    # ---------- LRU helpers ----------
++
++    def _lru_mru(self, key):
++        if key in self.lru:
++            self.lru.move_to_end(key, last=True)
+         else:
+-            seg[key] = None
+-
+-    def _trim_ghosts(self, cache_snapshot):
+-        cap = self._cap(cache_snapshot)
+-        max_g = 2 * cap
+-        while len(self.B1) + len(self.B2) > max_g:
+-            if len(self.B1) > len(self.B2):
+-                self.B1.popitem(last=False)
+-            else:
+-                self.B2.popitem(last=False)
+-
+-    def _eviction_sample(self, cache_snapshot, seg):
+-        """
+-        Sample up to K LRU keys from seg; choose with lexicographic min:
+-        (TinyLFU estimate, LRFU decayed score). Lower is colder.
+-        """
+-        if not seg:
++            self.lru[key] = None
++
++    def _lru_remove(self, key):
++        self.lru.pop(key, None)
++
++    def _sample_lru(self, cache_snapshot):
++        # Sample up to K from LRU side and pick lowest TinyLFU estimate
++        if not self.lru:
+             return None
+-        now = cache_snapshot.access_count
+-        sample_k = min(self._sample_k, len(seg))
+-        it = iter(seg.keys())  # LRU -> MRU
+-        best_k, best_f, best_d = None, None, None
+-        for _ in range(sample_k):
+-            k = next(it)
+-            f = self._sketch_est(cache_snapshot, k)
+-            d = self._decayed_score(k, now)
+-            if (best_k is None
+-                or f < best_f
+-                or (f == best_f and d < best_d)):
+-                best_k, best_f, best_d = k, f, d
+-                if best_f == 0 and best_d == 0.0:
+-                    # Can't do better
++        k = min(self._sample_k, len(self.lru))
++        it = iter(self.lru.keys())  # from LRU to MRU
++        best_k, best_f = None, None
++        for _ in range(k):
++            cand = next(it)
++            f = self._sketch_est(cache_snapshot, cand)
++            if best_k is None or f < best_f:
++                best_k, best_f = cand, f
++                if best_f == 0:
+                     break
+-        return best_k
+-
+-    def _replace_segment(self, cache_snapshot, incoming_key):
+-        """
+-        ARC Replace rule:
+-        if |T1| >= 1 and ((incoming in B2 and |T1| == p) or |T1| > p) -> evict from T1
+-        else evict from T2 (if non-empty), otherwise from T1.
+-        """
+-        t1 = len(self.T1)
+-        t2 = len(self.T2)
+-        cap = self._cap(cache_snapshot)
+-        p_int = int(round(max(0.0, min(float(cap), self.p))))
+-        if t1 >= 1 and ((incoming_key in self.B2 and t1 == p_int) or (t1 > p_int)):
+-            return "T1"
+-        if t2 == 0 and t1 > 0:
+-            return "T1"
+-        return "T2" if t2 > 0 else "T1"
++        return best_k if best_k is not None else next(iter(self.lru))
++
++    # ---------- LFU helpers ----------
++
++    def _bucket(self, freq):
++        b = self.freq_buckets.get(freq)
++        if b is None:
++            b = OrderedDict()
++            self.freq_buckets[freq] = b
++        return b
++
++    def _lfu_add_new(self, key):
++        # New items start at freq=1
++        self.key_freq[key] = 1
++        self._bucket(1)[key] = None
++        self.min_freq = 1
++
++    def _lfu_inc(self, key):
++        f = self.key_freq.get(key)
++        if f is None:
++            # If not found (metadata miss), add new
++            self._lfu_add_new(key)
++            return
++        b = self._bucket(f)
++        b.pop(key, None)
++        if not b:
++            # Remove empty bucket
++            self.freq_buckets.pop(f, None)
++            if self.min_freq == f:
++                self.min_freq = f + 1
++        nf = f + 1
++        self.key_freq[key] = nf
++        self._bucket(nf)[key] = None
++
++    def _lfu_remove(self, key):
++        f = self.key_freq.pop(key, None)
++        if f is None:
++            return
++        b = self._bucket(f)
++        b.pop(key, None)
++        if not b:
++            self.freq_buckets.pop(f, None)
++            if self.min_freq == f:
++                # Recompute min_freq
++                if self.key_freq:
++                    self.min_freq = min(self.key_freq.values())
++                else:
++                    self.min_freq = 1
++
++    def _lfu_victim_bucket(self):
++        # Return the coldest non-empty bucket and its frequency
++        if not self.key_freq:
++            return None, None
++        f = self.min_freq
++        if f in self.freq_buckets and self.freq_buckets[f]:
++            return self.freq_buckets[f], f
++        # Fallback: find the smallest available freq
++        if self.freq_buckets:
++            f = min(self.freq_buckets.keys())
++            self.min_freq = f
++            return self.freq_buckets[f], f
++        return None, None
++
++    def _sample_lfu(self, cache_snapshot):
++        b, _ = self._lfu_victim_bucket()
++        if not b:
++            return None
++        k = min(self._sample_k, len(b))
++        it = iter(b.keys())  # LRU within bucket
++        best_k, best_f = None, None
++        for _ in range(k):
++            cand = next(it)
++            f = self._sketch_est(cache_snapshot, cand)
++            if best_k is None or f < best_f:
++                best_k, best_f = cand, f
++                if best_f == 0:
++                    break
++        # Fallback to LRU in bucket
++        return best_k if best_k is not None else next(iter(b))
++
++    # ---------- learning ----------
++
++    def _normalize_weights(self):
++        s = self.w_lru + self.w_lfu
++        if s <= 0:
++            self.w_lru = self.w_lfu = 1.0
++            s = 2.0
++        # Normalize to sum=2 for stability
++        self.w_lru = 2.0 * (self.w_lru / s)
++        self.w_lfu = 2.0 * (self.w_lfu / s)
++
++    def _choose_policy(self):
++        # Choose the stronger policy deterministically (argmax)
++        return "LRU" if self.w_lru >= self.w_lfu else "LFU"
++
++    def _reward_policy(self, good, bad):
++        # Multiplicative weights: reward good, penalize bad
++        if good == "LRU":
++            self.w_lru *= (1.0 + self.eta)
++            self.w_lfu *= (1.0 - self.eta)
++        else:
++            self.w_lfu *= (1.0 + self.eta)
++            self.w_lru *= (1.0 - self.eta)
++        # Clamp to keep positive
++        self.w_lru = max(self.w_lru, 1e-6)
++        self.w_lfu = max(self.w_lfu, 1e-6)
++        self._normalize_weights()
+ 
+     # ---------- public API ----------
+ 
+     def evict(self, cache_snapshot, obj):
+         self._reset_if_new_run(cache_snapshot)
+         self._prune_metadata(cache_snapshot)
+         self._ensure_sketch(cache_snapshot)
+         self._seed_from_cache(cache_snapshot)
+ 
+-        seg_name = self._replace_segment(cache_snapshot, obj.key)
+-        victim = None
+-
+-        if seg_name == "T1" and self.T1:
+-            victim = self._eviction_sample(cache_snapshot, self.T1)
+-        elif seg_name == "T2" and self.T2:
+-            cand_t2 = self._eviction_sample(cache_snapshot, self.T2)
+-            if cand_t2 is not None:
+-                # TinyLFU guard: protect much hotter T2 vs incoming
+-                f_new = self._sketch_est(cache_snapshot, obj.key)
+-                f_t2 = self._sketch_est(cache_snapshot, cand_t2)
+-                if f_t2 > f_new + 1 and len(self.T1) > 0:
+-                    alt = self._eviction_sample(cache_snapshot, self.T1)
+-                    if alt is not None:
+-                        victim = alt
+-                        seg_name = "T1"
+-                    else:
+-                        victim = cand_t2
+-                else:
+-                    victim = cand_t2
+-
+-        if victim is None:
+-            # Fallback to any cached key
++        cand_lru = self._sample_lru(cache_snapshot)
++        cand_lfu = self._sample_lfu(cache_snapshot)
++
++        # If one structure is empty, fall back to the other
++        if cand_lru is None and cand_lfu is None:
++            # Fallback: any key
+             for k in cache_snapshot.cache.keys():
+-                victim = k
+-                seg_name = "T1" if k in self.T1 else ("T2" if k in self.T2 else None)
+-                break
+-
+-        self.last_victim_key = victim
+-        self.last_victim_from = seg_name
+-        return victim
++                self.last_victim_key = k
++                self.last_victim_policy = "LRU" if k in self.lru else ("LFU" if k in self.key_freq else None)
++                return k
++            return None
++        if cand_lru is None:
++            chosen = cand_lfu
++            chosen_policy = "LFU"
++        elif cand_lfu is None:
++            chosen = cand_lru
++            chosen_policy = "LRU"
++        else:
++            # Choose policy by learned weights
++            policy = self._choose_policy()
++            chosen = cand_lru if policy == "LRU" else cand_lfu
++            chosen_policy = policy
++
++            # TinyLFU guard: avoid evicting a much hotter item than the incoming object
++            f_new = self._sketch_est(cache_snapshot, obj.key)
++            f_ch = self._sketch_est(cache_snapshot, chosen)
++            other = cand_lfu if chosen_policy == "LRU" else cand_lru
++            f_ot = self._sketch_est(cache_snapshot, other) if other is not None else None
++            # If chosen is significantly hotter than incoming and the other is not worse, switch
++            if f_ch > f_new + 1 and (f_ot is not None and f_ot <= f_ch):
++                chosen = other
++                chosen_policy = "LFU" if chosen_policy == "LRU" else "LRU"
++
++        self.last_victim_key = chosen
++        self.last_victim_policy = chosen_policy
++        return chosen
+ 
+     def update_after_hit(self, cache_snapshot, obj):
+         self._reset_if_new_run(cache_snapshot)
+         self._prune_metadata(cache_snapshot)
+         self._ensure_sketch(cache_snapshot)
+ 
+-        now = cache_snapshot.access_count
+-        key = obj.key
+-        # Reset scan indicator and learn
+-        self.miss_streak = 0
+-        self._sketch_add(cache_snapshot, key, 1)
+-        # Bump decayed score
+-        s = self._decayed_score(key, now)
+-        self.score[key] = s + 1.0
+-
+-        if key in self.T2:
+-            self._move_to_mru(self.T2, key)
+-        elif key in self.T1:
+-            # Promote T1 -> T2 on hit
+-            self.T1.pop(key, None)
+-            self._move_to_mru(self.T2, key)
++        k = obj.key
++        # Learn in TinyLFU
++        self._sketch_add(cache_snapshot, k, 1)
++
++        # Update LRU recency
++        self._lru_mru(k)
++
++        # Update LFU frequency
++        if k in self.key_freq:
++            self._lfu_inc(k)
+         else:
+-            # Metadata miss but hit in cache: conservatively place in T1
+-            self._move_to_mru(self.T1, key)
++            # If metadata desynced (e.g., seeded late), add new
++            self._lfu_add_new(k)
+ 
+     def update_after_insert(self, cache_snapshot, obj):
+         self._reset_if_new_run(cache_snapshot)
+         self._prune_metadata(cache_snapshot)
+         self._ensure_sketch(cache_snapshot)
+ 
+-        now = cache_snapshot.access_count
+-        key = obj.key
+-        self.miss_streak += 1
+-        # Learn on admission and initialize decayed metadata
+-        self._sketch_add(cache_snapshot, key, 1)
+-        self.last_time[key] = now
+-        # Start with small score to reduce scan pollution
+-        self.score[key] = 0.5
+-
+-        cap = self._cap(cache_snapshot)
+-        # ARC adaptive p tuning based on ghost refaults
+-        if key in self.B1:
+-            delta = max(1, len(self.B2) // max(1, len(self.B1)))
+-            self.p = min(float(cap), self.p + float(delta))
+-            self.B1.pop(key, None)
+-            self._move_to_mru(self.T2, key)
+-        elif key in self.B2:
+-            delta = max(1, len(self.B1) // max(1, len(self.B2)))
+-            self.p = max(0.0, self.p - float(delta))
+-            self.B2.pop(key, None)
+-            self._move_to_mru(self.T2, key)
++        k = obj.key
++        # Learn in TinyLFU on admission
++        self._sketch_add(cache_snapshot, k, 1)
++
++        # If this key was previously evicted, update regret
++        policy = self.evicted_by.pop(k, None)
++        if policy == "LRU":
++            # LRU evicted it and we missed again -> reward LFU
++            self._reward_policy(good="LFU", bad="LRU")
++        elif policy == "LFU":
++            self._reward_policy(good="LRU", bad="LFU")
++
++        # Insert into resident structures
++        self._lru_mru(k)
++        if k in self.key_freq:
++            # If reinserted while metadata remained, treat as access
++            self._lfu_inc(k)
+         else:
+-            # Fresh miss: early promotion if clearly hot
+-            if self._sketch_est(cache_snapshot, key) >= 4:
+-                self._move_to_mru(self.T2, key)
+-            else:
+-                self._move_to_mru(self.T1, key)
+-
+-        # Bound ghosts
+-        self._trim_ghosts(cache_snapshot)
++            self._lfu_add_new(k)
+ 
+     def update_after_evict(self, cache_snapshot, obj, evicted_obj):
+         self._reset_if_new_run(cache_snapshot)
+         evk = evicted_obj.key
+ 
+-        # Remove from resident sets, track origin
+-        removed_from = None
+-        if evk in self.T1:
+-            self.T1.pop(evk, None)
+-            removed_from = "T1"
+-        elif evk in self.T2:
+-            self.T2.pop(evk, None)
+-            removed_from = "T2"
+-        else:
+-            removed_from = self.last_victim_from
+-
+-        # Place into ghost according to origin
+-        if removed_from == "T1":
+-            self.B1[evk] = None
+-        elif removed_from == "T2":
+-            self.B2[evk] = None
+-
+-        # Clean up LRFU metadata
+-        self.score.pop(evk, None)
+-        self.last_time.pop(evk, None)
+-
+-        self._trim_ghosts(cache_snapshot)
++        # Remove from resident structures
++        self._lru_remove(evk)
++        self._lfu_remove(evk)
++
++        # Record in evicted-by map for regret on future re-reference
++        policy = self.last_victim_policy
++        if policy is None:
++            # Heuristic fallback if not recorded
++            policy = "LRU" if evk in self.lru else ("LFU" if evk in self.key_freq else "LRU")
++        self.evicted_by[evk] = policy
++
++        # Bound evicted_by size
++        cap = self._cap(cache_snapshot)
++        self.evicted_limit = max(self.evicted_limit, 4 * cap)
++        while len(self.evicted_by) > self.evicted_limit:
++            self.evicted_by.popitem(last=False)
++
++        # Clear last victim marker if matches
+         if self.last_victim_key == evk:
+             self.last_victim_key = None
+-            self.last_victim_from = None
++            self.last_victim_policy = None
+ 
+ 
+ # Singleton policy instance
+-_policy = _ArcTinyLfuLrfu()
++_policy = _LeCaR_TinyLFU()
+ 
+ 
+ def evict(cache_snapshot, obj):
+     return _policy.evict(cache_snapshot, obj)
+ 
+ 
+ def update_after_hit(cache_snapshot, obj):
+     _policy.update_after_hit(cache_snapshot, obj)
+ 
+ 
+ def update_after_insert(cache_snapshot, obj):
+     _policy.update_after_insert(cache_snapshot, obj)
+ 
+ 
+ def update_after_evict(cache_snapshot, obj, evicted_obj):
+     _policy.update_after_evict(cache_snapshot, obj, evicted_obj)
+ 
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

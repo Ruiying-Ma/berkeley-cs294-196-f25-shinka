@@ -1,0 +1,323 @@
+<NAME>
+w_tinylfu_eviction
+</NAME>
+
+<DESCRIPTION>
+Implements the W-TinyLFU eviction policy.
+It maintains a small Window (1% of capacity) and a Main cache divided into Probation and Protected segments (SLRU).
+A frequency sketch (approximated by a dict with periodic halving) determines admission from Window to Main.
+If the Window is full, the eviction victim is chosen by comparing the frequency of the Window's LRU candidate with the Probation's LRU candidate. The one with lower frequency is evicted.
+This provides Scan Resistance (scans don't pollute Main) and recency/frequency balance.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+# Adaptive S3-FIFO Globals
+as3_small = dict()   # Small queue (FIFO) - Probation
+as3_main = dict()    # Main queue (FIFO) - Protected/Frequency
+as3_g_small = dict() # Ghost Small (Evicted from Small)
+as3_g_main = dict()  # Ghost Main (Evicted from Main)
+as3_hits = set()     # Hit bits
+as3_p = 0.0          # Adaptive target size for Small queue
+
+def evict(cache_snapshot, obj):
+    '''
+    Adaptive S3-FIFO Eviction:
+    - Uses two queues: Small and Main.
+    - Target size of Small is determined by 'as3_p'.
+    - Adapts 'as3_p' based on ghost hits (ARC-like logic).
+    - Eviction follows S3-FIFO policies (check Small first if oversize, second chance for hits).
+    '''
+    global as3_small, as3_main, as3_g_small, as3_g_main, as3_hits, as3_p
+
+    capacity = cache_snapshot.capacity
+
+    # Target size for small queue derived from adaptive p
+    target_small = int(as3_p)
+
+    while True:
+        # Determine eviction candidate source
+        # Priority: Small if it exceeds target size or if Main is empty.
+        check_small = False
+        if len(as3_small) > target_small:
+            check_small = True
+        elif not as3_main:
+            check_small = True
+
+        # Fallback logic if Small is chosen but empty (safety)
+        if check_small and not as3_small:
+            if as3_main:
+                check_small = False
+            else:
+                # Fallback to any item if both empty
+                return next(iter(cache_snapshot.cache))
+
+        if check_small:
+            # Candidate from Small
+            candidate = next(iter(as3_small))
+            if candidate in as3_hits:
+                # Hit in Small -> Promote to Main
+                as3_hits.discard(candidate)
+                del as3_small[candidate]
+                as3_main[candidate] = None
+            else:
+                # Evict from Small
+                return candidate
+        else:
+            # Candidate from Main
+            candidate = next(iter(as3_main))
+            if candidate in as3_hits:
+                # Hit in Main -> Reinsert at tail (Second Chance)
+                as3_hits.discard(candidate)
+                del as3_main[candidate]
+                as3_main[candidate] = None
+            else:
+                # Evict from Main
+                return candidate
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    On Cache Hit:
+    - Mark object as hit (for second chance / promotion).
+    '''
+    global as3_hits
+    as3_hits.add(obj.key)
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On Cache Insert (Miss):
+    - Adapt 'as3_p' if object was in a ghost list.
+    - Insert into Small or Main.
+    '''
+    global as3_small, as3_main, as3_g_small, as3_g_main, as3_hits, as3_p
+
+    # Reset state for new trace
+    if cache_snapshot.access_count <= 1:
+        as3_small.clear()
+        as3_main.clear()
+        as3_g_small.clear()
+        as3_g_main.clear()
+        as3_hits.clear()
+        # Initialize p to 10% of capacity
+        as3_p = max(1.0, cache_snapshot.capacity * 0.1)
+
+    key = obj.key
+    as3_hits.discard(key)
+
+    # Adaptation Logic
+    if key in as3_g_small:
+        # Hit in Ghost Small -> Small was too small. Increase p.
+        delta = 1.0
+        lg_s = len(as3_g_small)
+        lg_m = len(as3_g_main)
+        if lg_s < lg_m and lg_s > 0:
+            delta = float(lg_m) / lg_s
+
+        as3_p = min(float(cache_snapshot.capacity), as3_p + delta)
+
+        # Rescue: Remove from ghost and insert into Main
+        del as3_g_small[key]
+        as3_main[key] = None
+
+    elif key in as3_g_main:
+        # Hit in Ghost Main -> Main was too small. Decrease p (shrink Small).
+        delta = 1.0
+        lg_s = len(as3_g_small)
+        lg_m = len(as3_g_main)
+        if lg_m < lg_s and lg_m > 0:
+            delta = float(lg_s) / lg_m
+
+        as3_p = max(0.0, as3_p - delta)
+
+        # Rescue to Main
+        del as3_g_main[key]
+        as3_main[key] = None
+
+    else:
+        # New item -> Insert into Small
+        as3_small[key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    After Eviction:
+    - Move evicted item to corresponding ghost list.
+    - Enforce ghost capacity.
+    '''
+    global as3_small, as3_main, as3_g_small, as3_g_main, as3_hits
+
+    key = evicted_obj.key
+    as3_hits.discard(key)
+
+    # Identify source queue and move to ghost
+    if key in as3_small:
+        del as3_small[key]
+        as3_g_small[key] = None
+    elif key in as3_main:
+        del as3_main[key]
+        as3_g_main[key] = None
+
+    # Limit ghost size to capacity
+    limit = cache_snapshot.capacity
+    while len(as3_g_small) > limit:
+        as3_g_small.pop(next(iter(as3_g_small)))
+    while len(as3_g_main) > limit:
+        as3_g_main.pop(next(iter(as3_g_main)))
+=======
+# W-TinyLFU Globals
+wtlfu_window = dict()      # Admission window (LRU)
+wtlfu_probation = dict()   # Main cache probation (LRU)
+wtlfu_protected = dict()   # Main cache protected (LRU)
+wtlfu_freq = dict()        # Frequency counters
+wtlfu_count = 0            # Total access counter for reset
+
+def get_config(capacity):
+    # Dynamic configuration: Window 1%, Main 99% (80% Protected, 20% Probation)
+    w_cap = max(1, int(capacity * 0.01))
+    main_cap = capacity - w_cap
+    protected_cap = int(main_cap * 0.8)
+    return w_cap, protected_cap
+
+def init_globals(cache_snapshot):
+    global wtlfu_window, wtlfu_probation, wtlfu_protected, wtlfu_freq
+    global wtlfu_count
+
+    # Reset for new trace
+    if cache_snapshot.access_count <= 1:
+        wtlfu_window.clear()
+        wtlfu_probation.clear()
+        wtlfu_protected.clear()
+        wtlfu_freq.clear()
+        wtlfu_count = 0
+
+    # Sync if state is empty but cache is not (mid-trace recovery)
+    if not wtlfu_window and not wtlfu_probation and not wtlfu_protected and cache_snapshot.cache:
+        for k in cache_snapshot.cache:
+            wtlfu_probation[k] = None
+
+def evict(cache_snapshot, obj):
+    '''
+    W-TinyLFU Eviction:
+    - If Window <= Capacity, evict from Main (Probation) to admit to Window.
+    - If Window > Capacity, Duel:
+      Compare Window LRU freq vs Probation LRU freq.
+      Loser is evicted.
+    '''
+    global wtlfu_window, wtlfu_probation, wtlfu_protected, wtlfu_freq
+
+    init_globals(cache_snapshot)
+    w_cap, _ = get_config(cache_snapshot.capacity)
+
+    victim_window = next(iter(wtlfu_window)) if wtlfu_window else None
+    victim_probation = next(iter(wtlfu_probation)) if wtlfu_probation else None
+
+    # If Window is not full, we prefer to evict from Main to allow Window growth
+    # (Unless Main is empty, then we must evict from Window)
+    if len(wtlfu_window) <= w_cap:
+        if victim_probation:
+            return victim_probation
+        elif victim_window:
+            return victim_window
+        elif wtlfu_protected:
+            return next(iter(wtlfu_protected))
+
+    # Window is full. Duel.
+    if not victim_probation:
+        # If Probation is empty, check Protected (demote/evict) or Window
+        if wtlfu_protected:
+            return next(iter(wtlfu_protected))
+        return victim_window
+
+    # Frequency Duel
+    freq_w = wtlfu_freq.get(victim_window, 0)
+    freq_p = wtlfu_freq.get(victim_probation, 0)
+
+    if freq_w > freq_p:
+        # Window item wins, evict Probation item
+        return victim_probation
+    else:
+        # Probation item wins (or tie), evict Window item
+        return victim_window
+
+    return next(iter(cache_snapshot.cache))
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    Hit:
+    - Update Freq.
+    - Manage SLRU promotions (Probation -> Protected).
+    '''
+    global wtlfu_window, wtlfu_probation, wtlfu_protected, wtlfu_freq, wtlfu_count
+
+    key = obj.key
+    wtlfu_freq[key] = wtlfu_freq.get(key, 0) + 1
+    wtlfu_count += 1
+
+    # Periodic Reset
+    if wtlfu_count > cache_snapshot.capacity * 10:
+        for k in wtlfu_freq:
+            wtlfu_freq[k] //= 2
+        wtlfu_count = 0
+
+    if key in wtlfu_probation:
+        del wtlfu_probation[key]
+        wtlfu_protected[key] = None
+    elif key in wtlfu_protected:
+        del wtlfu_protected[key]
+        wtlfu_protected[key] = None
+    elif key in wtlfu_window:
+        del wtlfu_window[key]
+        wtlfu_window[key] = None
+
+    # Enforce Protected Capacity
+    _, protected_cap = get_config(cache_snapshot.capacity)
+    while len(wtlfu_protected) > protected_cap:
+        demoted = next(iter(wtlfu_protected))
+        del wtlfu_protected[demoted]
+        wtlfu_probation[demoted] = None
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Insert:
+    - Update Freq.
+    - Add to Window.
+    '''
+    global wtlfu_window, wtlfu_freq, wtlfu_count
+
+    init_globals(cache_snapshot)
+    key = obj.key
+    wtlfu_freq[key] = wtlfu_freq.get(key, 0) + 1
+    wtlfu_count += 1
+
+    if wtlfu_count > cache_snapshot.capacity * 10:
+        for k in wtlfu_freq:
+            wtlfu_freq[k] //= 2
+        wtlfu_count = 0
+
+    wtlfu_window[key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Evict:
+    - Clean up lists.
+    - Handle Window -> Probation flow if Window Candidate won the duel.
+    '''
+    global wtlfu_window, wtlfu_probation, wtlfu_protected
+
+    key = evicted_obj.key
+
+    if key in wtlfu_window:
+        del wtlfu_window[key]
+    elif key in wtlfu_probation:
+        del wtlfu_probation[key]
+    elif key in wtlfu_protected:
+        del wtlfu_protected[key]
+
+    # If Window is still overflowing (meaning we evicted from Main),
+    # move the Window LRU to Probation.
+    w_cap, _ = get_config(cache_snapshot.capacity)
+    while len(wtlfu_window) > w_cap:
+        candidate = next(iter(wtlfu_window))
+        del wtlfu_window[candidate]
+        wtlfu_probation[candidate] = None
+>>>>>>> REPLACE
+</DIFF>

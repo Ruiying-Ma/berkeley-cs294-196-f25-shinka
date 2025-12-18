@@ -1,0 +1,360 @@
+# EVOLVE-BLOCK-START
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+
+from collections import OrderedDict
+
+# Segmented LRU with TinyLFU-style bias and adaptive protected sizing.
+# - m_probation: LRU list for new/cold entries (T1)
+# - m_protected: LRU list for hot/promoted entries (T2)
+# - Count-Min Sketch (CMS) for frequency estimates, periodically aged
+# - m_p: smoothed protected ratio target via EMA, steered by hit-rate and scan detector
+
+m_probation = OrderedDict()
+m_protected = OrderedDict()
+
+# TinyLFU Count-Min Sketch parameters/state
+_SKETCH_DEPTH = 4
+m_sketch_w = 0
+m_sketch = []           # list of lists (depth x width)
+m_sketch_ops = 0        # number of updates since last aging
+m_sketch_age_threshold = 0
+
+# Adaptive control
+m_p = 0.5               # protected ratio target (0..1), EMA-smoothed
+m_miss_streak = 0       # consecutive misses
+_m_last_seen_access = -1  # detect new traces to reset metadata
+
+
+def _reset_if_new_run(cache_snapshot):
+    """Reset metadata when a new trace/cache run starts."""
+    global m_probation, m_protected, m_sketch, m_sketch_w, m_sketch_ops, m_sketch_age_threshold
+    global m_p, m_miss_streak, _m_last_seen_access
+    # New run if access counter restarts or at very beginning
+    if cache_snapshot.access_count <= 1 or _m_last_seen_access > cache_snapshot.access_count:
+        m_probation.clear()
+        m_protected.clear()
+        m_sketch_w = 0
+        m_sketch = []
+        m_sketch_ops = 0
+        m_sketch_age_threshold = 0
+        m_p = 0.5
+        m_miss_streak = 0
+    _m_last_seen_access = cache_snapshot.access_count
+
+
+def _ensure_sketch(cache_snapshot):
+    """Initialize the CMS sketch if needed, sizing it relative to capacity."""
+    global m_sketch_w, m_sketch, m_sketch_ops, m_sketch_age_threshold
+    if m_sketch_w:
+        return
+    cap = max(1, int(cache_snapshot.capacity))
+    # Width target between 128 and 16384, scaled by capacity
+    target = max(128, min(16384, cap * 16))
+    # Use power-of-two width for cheaper masking
+    w = 1
+    while w < target:
+        w <<= 1
+    m_sketch_w = w
+    m_sketch = [[0] * m_sketch_w for _ in range(_SKETCH_DEPTH)]
+    m_sketch_ops = 0
+    # Age conservatively: aging cost is O(depth*width); perform infrequently
+    m_sketch_age_threshold = max(m_sketch_w * 8, cap * 64)
+
+
+def _hash_idx(key, i):
+    """Compute index into sketch row i for key."""
+    # Use Python's hash with row index salt; mask for speed (width is power of two)
+    return (hash((key, i, 0x9E3779B97F4A7C15)) & (m_sketch_w - 1))
+
+
+def _sketch_add(cache_snapshot, key, delta=1):
+    """Add delta count for key in the sketch and maybe age."""
+    global m_sketch_ops
+    _ensure_sketch(cache_snapshot)
+    if not m_sketch_w:
+        return
+    for i in range(_SKETCH_DEPTH):
+        idx = _hash_idx(key, i)
+        # Cap growth implicitly via periodic aging
+        m_sketch[i][idx] += delta
+    m_sketch_ops += 1
+    if m_sketch_ops >= m_sketch_age_threshold:
+        # Age by halving counters to forget stale history
+        for i in range(_SKETCH_DEPTH):
+            row = m_sketch[i]
+            for j in range(m_sketch_w):
+                row[j] >>= 1
+        m_sketch_ops = 0
+
+
+def _sketch_est(cache_snapshot, key):
+    """Estimate frequency of key using the sketch (min across rows)."""
+    _ensure_sketch(cache_snapshot)
+    if not m_sketch_w:
+        return 0
+    est = None
+    for i in range(_SKETCH_DEPTH):
+        idx = _hash_idx(key, i)
+        v = m_sketch[i][idx]
+        if est is None or v < est:
+            est = v
+    return est if est is not None else 0
+
+
+def _prune_metadata(cache_snapshot):
+    """Keep metadata consistent with actual cache content."""
+    cache_keys = cache_snapshot.cache.keys()
+    for seg in (m_probation, m_protected):
+        to_del = [k for k in seg.keys() if k not in cache_keys]
+        for k in to_del:
+            seg.pop(k, None)
+
+
+def _seed_from_cache(cache_snapshot):
+    """If both segments are empty but cache has content, seed probation."""
+    if not m_probation and not m_protected and cache_snapshot.cache:
+        for k in cache_snapshot.cache.keys():
+            m_probation[k] = None
+
+
+def _protected_target_size(cache_snapshot):
+    """Adaptive protected target size via EMA of hit-rate with scan sensitivity."""
+    global m_p
+    cap = max(1, int(cache_snapshot.capacity))
+    # Base target driven by current hit-rate (favor protected when HR is higher)
+    hr = (cache_snapshot.hit_count / cache_snapshot.access_count) if cache_snapshot.access_count > 0 else 0.0
+    base = 0.2 + 0.6 * hr  # in [0.2, 0.8]
+    # Scan detector: long miss streak -> bias toward more probation space
+    if m_miss_streak > 2 * cap:
+        base = min(base, 0.3)
+    # Smooth with EMA to avoid oscillation
+    alpha = 0.25
+    m_p = (1 - alpha) * m_p + alpha * base
+    # Clamp and convert to item count
+    m_p = max(0.1, min(0.9, m_p))
+    target = int(round(cap * m_p))
+    if cap > 1:
+        target = max(1, min(cap - 1, target))
+    else:
+        target = 1
+    return target
+
+
+def _eviction_sample(cache_snapshot, seg, sample_k=8):
+    """Sample up to K LRU candidates from seg and return one with lowest freq."""
+    candid = []
+    it = iter(seg.keys())  # iteration yields from LRU to MRU
+    for _ in range(sample_k):
+        try:
+            candid.append(next(it))
+        except StopIteration:
+            break
+    if not candid:
+        # Fallback to pure LRU
+        for k in seg.keys():
+            return k
+        return None
+    # Choose lowest estimated frequency; tie-break by LRU order (first min)
+    best_k = candid[0]
+    best_f = _sketch_est(cache_snapshot, best_k)
+    for k in candid[1:]:
+        f = _sketch_est(cache_snapshot, k)
+        if f < best_f:
+            best_f = f
+            best_k = k
+            if best_f == 0:
+                break
+    return best_k
+
+
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    _reset_if_new_run(cache_snapshot)
+    _prune_metadata(cache_snapshot)
+    _ensure_sketch(cache_snapshot)
+    _seed_from_cache(cache_snapshot)
+
+    # TinyLFU-aware, two-way sampled choice with protected bias.
+    target_prot = _protected_target_size(cache_snapshot)
+    new_k = obj.key
+    new_f = _sketch_est(cache_snapshot, new_k)
+
+    cand_p = _eviction_sample(cache_snapshot, m_probation, sample_k=8) if m_probation else None
+    f_p = _sketch_est(cache_snapshot, cand_p) if cand_p is not None else None
+
+    cand_t = _eviction_sample(cache_snapshot, m_protected, sample_k=8) if m_protected else None
+    f_t = _sketch_est(cache_snapshot, cand_t) if cand_t is not None else None
+
+    # Decide victim.
+    if cand_p is None and cand_t is None:
+        # Fallback: choose any key from the cache
+        for k in cache_snapshot.cache.keys():
+            return k
+        return None
+    if cand_p is None:
+        return cand_t
+    if cand_t is None:
+        return cand_p
+
+    # Compute adjusted scores; lower is colder and more evictable.
+    score_p = f_p if f_p is not None else 0
+    score_t = (f_t if f_t is not None else 0) + 1  # bias to protect T2
+
+    # If protected is under target, heavily penalize evicting from it.
+    if len(m_protected) < target_prot:
+        score_t += 1_000_000
+
+    # Do not evict a protected candidate that is clearly hotter than the incoming object.
+    if f_t is not None and new_f + 1 < f_t:
+        score_t += 1_000_000
+
+    # Choose the colder candidate after adjustments.
+    if score_p <= score_t:
+        return cand_p
+    else:
+        return cand_t
+
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_miss_streak
+    _reset_if_new_run(cache_snapshot)
+    _prune_metadata(cache_snapshot)
+    _ensure_sketch(cache_snapshot)
+
+    k = obj.key
+    # Capture prior miss streak to adapt promotion aggressiveness
+    prev_miss = m_miss_streak
+    m_miss_streak = 0
+    # Learn frequency
+    _sketch_add(cache_snapshot, k, 1)
+
+    # Adaptive promotion threshold:
+    cap = max(1, int(cache_snapshot.capacity))
+    hr = (cache_snapshot.hit_count / cache_snapshot.access_count) if cache_snapshot.access_count > 0 else 0.0
+    promote_thr = 2
+    if hr >= 0.65:
+        promote_thr = 1
+    elif prev_miss > cap:
+        promote_thr = 3
+
+    est = _sketch_est(cache_snapshot, k)
+
+    if k in m_protected:
+        # Refresh recency in protected
+        m_protected.move_to_end(k, last=True)
+    elif k in m_probation:
+        # Promote only if sufficiently frequent; else refresh in probation
+        if est >= promote_thr:
+            m_probation.pop(k, None)
+            m_protected[k] = None
+        else:
+            m_probation.move_to_end(k, last=True)
+    else:
+        # Metadata miss but cache hit: re-admit conservatively/optimistically per threshold
+        if est >= promote_thr:
+            m_protected[k] = None
+        else:
+            m_probation[k] = None
+
+    # Keep protected near its target by demoting oldest if needed
+    target = _protected_target_size(cache_snapshot)
+    while len(m_protected) > target:
+        demote_k, _ = m_protected.popitem(last=False)  # LRU of protected
+        m_probation[demote_k] = None
+
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_miss_streak
+    _reset_if_new_run(cache_snapshot)
+    _prune_metadata(cache_snapshot)
+    _ensure_sketch(cache_snapshot)
+
+    k = obj.key
+    m_miss_streak += 1
+
+    # Learn a bit on admission (doorkeeper credit to sketch)
+    _sketch_add(cache_snapshot, k, 1)
+    est = _sketch_est(cache_snapshot, k)
+
+    # Adaptive early promotion for known-hot items; resist during scans
+    cap = max(1, int(cache_snapshot.capacity))
+    hr = (cache_snapshot.hit_count / cache_snapshot.access_count) if cache_snapshot.access_count > 0 else 0.0
+    hot_thr = 4
+    if hr >= 0.6:
+        hot_thr = 3
+    if m_miss_streak > cap:
+        hot_thr += 1
+
+    # Reposition in segments based on estimated hotness
+    m_protected.pop(k, None)
+    m_probation.pop(k, None)
+    if est >= hot_thr:
+        m_protected[k] = None
+    else:
+        m_probation[k] = None
+
+    # Ensure protected doesn't exceed its target (shouldn't change on insert,
+    # but keep the invariant in case of out-of-band changes)
+    target = _protected_target_size(cache_snapshot)
+    while len(m_protected) > target:
+        demote_k, _ = m_protected.popitem(last=False)
+        m_probation[demote_k] = None
+
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    _reset_if_new_run(cache_snapshot)
+    # Remove evicted object from segments; keep sketch counts to preserve long-term bias
+    evk = evicted_obj.key
+    m_probation.pop(evk, None)
+    m_protected.pop(evk, None)
+
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

@@ -1,0 +1,345 @@
+<NAME>
+frequency_counters
+</NAME>
+
+<DESCRIPTION>
+Replace the binary `m_accessed` set with a 3-bit frequency counter (`m_freq`).
+This allows the algorithm to distinguish between single-access items and highly frequent items.
+When an item is accessed, its frequency increments (capped at 3).
+During eviction (victim selection):
+- In Small queue: If frequency > 0, promote to Main and decrement frequency (consuming one 'credit' to survive/promote). If frequency == 0, evict.
+- In Main queue: If frequency > 0, reinsert at MRU and decrement frequency. If frequency == 0, evict.
+This "aging" mechanism retains hot items longer in the protected Main queue while still filtering cold items efficiently.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+# Global S3-FIFO State
+# S: Small queue (Probationary, initially 10% of cache)
+# M: Main queue (Protected, initially 90% of cache)
+# G: Ghost queue (History of evicted S items)
+m_small = OrderedDict()
+m_main = OrderedDict()
+m_ghost = OrderedDict()
+m_ghost_main = OrderedDict() # History of evicted M items
+m_accessed = set()
+m_last_access_count = 0
+m_s_ratio = 0.1
+
+def check_reset(cache_snapshot):
+    global m_small, m_main, m_ghost, m_ghost_main, m_accessed, m_last_access_count, m_s_ratio
+    # Check for trace reset or new trace based on timestamp regression
+    if cache_snapshot.access_count < m_last_access_count:
+        m_small.clear()
+        m_main.clear()
+        m_ghost.clear()
+        m_ghost_main.clear()
+        m_accessed.clear()
+        m_s_ratio = 0.1
+    m_last_access_count = cache_snapshot.access_count
+
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO eviction policy with Adaptive Sizing and Randomized Window.
+    '''
+    check_reset(cache_snapshot)
+    global m_small, m_main, m_accessed, m_s_ratio
+
+    import itertools
+
+    capacity = cache_snapshot.capacity
+    # Adaptive target size for S
+    target_s = max(1, int(capacity * m_s_ratio))
+
+    while True:
+        process_s = False
+        if len(m_small) > target_s:
+            process_s = True
+        elif len(m_main) == 0:
+            process_s = True
+
+        if process_s:
+            if not m_small:
+                if m_main:
+                    process_s = False
+                else:
+                    return next(iter(cache_snapshot.cache))
+
+            if process_s:
+                # Randomized Window Eviction: Check bottom K items
+                # Breaking strict FIFO helps with synchronized looping traces
+                k = 5
+                window = list(itertools.islice(m_small, k))
+                victim = None
+
+                # Find first unaccessed item in window
+                for key in window:
+                    if key not in m_accessed:
+                        victim = key
+                        break
+
+                if victim:
+                    return victim
+
+                # All K items accessed? Process head to make progress.
+                key = next(iter(m_small))
+                if key in m_accessed:
+                    m_accessed.remove(key)
+                    del m_small[key]
+                    m_main[key] = None
+                else:
+                    return key
+
+        if not process_s:
+            if not m_main:
+                continue
+
+            # Randomized Window for M
+            k = 5
+            window = list(itertools.islice(m_main, k))
+            victim = None
+
+            for key in window:
+                if key not in m_accessed:
+                    victim = key
+                    break
+
+            if victim:
+                return victim
+
+            # All K items accessed? Process head.
+            key = next(iter(m_main))
+            if key in m_accessed:
+                m_accessed.remove(key)
+                m_main.move_to_end(key)
+            else:
+                return key
+
+def update_after_hit(cache_snapshot, obj):
+    check_reset(cache_snapshot)
+    global m_accessed
+    # Lazy promotion: just mark as accessed.
+    # Do not move in lists to keep overhead low and preserve FIFO order for scanning.
+    m_accessed.add(obj.key)
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Handle new insertion with adaptive sizing logic.
+    '''
+    check_reset(cache_snapshot)
+    global m_small, m_main, m_ghost, m_ghost_main, m_accessed, m_s_ratio
+
+    key = obj.key
+    if key in m_accessed:
+        m_accessed.remove(key)
+
+    # Adaptation logic: Adjust S target based on ghost hits
+    delta = max(0.01, 1.0 / cache_snapshot.capacity) if cache_snapshot.capacity > 0 else 0.01
+
+    if key in m_ghost:
+        # Ghost S hit -> S was too small, increase S target
+        m_s_ratio = min(0.9, m_s_ratio + delta)
+        del m_ghost[key]
+        m_main[key] = None
+    elif key in m_ghost_main:
+        # Ghost M hit -> M was too small (S too big), decrease S target
+        m_s_ratio = max(0.01, m_s_ratio - delta)
+        del m_ghost_main[key]
+        m_main[key] = None
+    else:
+        # New Item: Insert into S
+        m_small[key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Clean up internal structures after eviction.
+    Add evicted items to respective ghost lists.
+    '''
+    check_reset(cache_snapshot)
+    global m_small, m_main, m_ghost, m_ghost_main, m_accessed
+
+    key = evicted_obj.key
+
+    if key in m_small:
+        del m_small[key]
+        m_ghost[key] = None
+    elif key in m_main:
+        del m_main[key]
+        m_ghost_main[key] = None
+
+    # Manage Ghost sizes
+    cap = cache_snapshot.capacity
+    while len(m_ghost) > cap:
+        m_ghost.popitem(last=False)
+    while len(m_ghost_main) > cap:
+        m_ghost_main.popitem(last=False)
+
+    if key in m_accessed:
+        m_accessed.remove(key)
+=======
+# Global S3-FIFO State
+# S: Small queue (Probationary, initially 10% of cache)
+# M: Main queue (Protected, initially 90% of cache)
+# G: Ghost queue (History of evicted S items)
+m_small = OrderedDict()
+m_main = OrderedDict()
+m_ghost = OrderedDict()
+m_ghost_main = OrderedDict() # History of evicted M items
+m_freq = {} # Frequency counters instead of binary set
+m_last_access_count = 0
+m_s_ratio = 0.1
+MAX_FREQ = 3
+
+def check_reset(cache_snapshot):
+    global m_small, m_main, m_ghost, m_ghost_main, m_freq, m_last_access_count, m_s_ratio
+    # Check for trace reset or new trace based on timestamp regression
+    if cache_snapshot.access_count < m_last_access_count:
+        m_small.clear()
+        m_main.clear()
+        m_ghost.clear()
+        m_ghost_main.clear()
+        m_freq.clear()
+        m_s_ratio = 0.1
+    m_last_access_count = cache_snapshot.access_count
+
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO eviction policy with Adaptive Sizing, Randomized Window and Frequency Counters.
+    '''
+    check_reset(cache_snapshot)
+    global m_small, m_main, m_freq, m_s_ratio
+
+    import itertools
+
+    capacity = cache_snapshot.capacity
+    # Adaptive target size for S
+    target_s = max(1, int(capacity * m_s_ratio))
+
+    while True:
+        process_s = False
+        if len(m_small) > target_s:
+            process_s = True
+        elif len(m_main) == 0:
+            process_s = True
+
+        if process_s:
+            if not m_small:
+                if m_main:
+                    process_s = False
+                else:
+                    return next(iter(cache_snapshot.cache))
+
+            if process_s:
+                # Randomized Window Eviction: Check bottom K items
+                k = 5
+                window = list(itertools.islice(m_small, k))
+                victim = None
+
+                # Find first item with 0 frequency in window
+                for key in window:
+                    if m_freq.get(key, 0) == 0:
+                        victim = key
+                        break
+
+                if victim:
+                    return victim
+
+                # All K items accessed? Process head.
+                key = next(iter(m_small))
+                freq = m_freq.get(key, 0)
+                if freq > 0:
+                    m_freq[key] = freq - 1
+                    del m_small[key]
+                    m_main[key] = None
+                else:
+                    return key
+
+        if not process_s:
+            if not m_main:
+                continue
+
+            # Randomized Window for M
+            k = 5
+            window = list(itertools.islice(m_main, k))
+            victim = None
+
+            for key in window:
+                if m_freq.get(key, 0) == 0:
+                    victim = key
+                    break
+
+            if victim:
+                return victim
+
+            # All K items accessed? Process head.
+            key = next(iter(m_main))
+            freq = m_freq.get(key, 0)
+            if freq > 0:
+                m_freq[key] = freq - 1
+                m_main.move_to_end(key)
+            else:
+                return key
+
+def update_after_hit(cache_snapshot, obj):
+    check_reset(cache_snapshot)
+    global m_freq
+    # Increment frequency, capped at MAX_FREQ
+    m_freq[obj.key] = min(MAX_FREQ, m_freq.get(obj.key, 0) + 1)
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Handle new insertion with adaptive sizing logic.
+    '''
+    check_reset(cache_snapshot)
+    global m_small, m_main, m_ghost, m_ghost_main, m_freq, m_s_ratio
+
+    key = obj.key
+    if key in m_freq:
+        # Reset freq on new insertion
+        del m_freq[key]
+
+    # Adaptation logic: Adjust S target based on ghost hits
+    delta = max(0.01, 1.0 / cache_snapshot.capacity) if cache_snapshot.capacity > 0 else 0.01
+
+    if key in m_ghost:
+        # Ghost S hit -> S was too small, increase S target
+        m_s_ratio = min(0.9, m_s_ratio + delta)
+        del m_ghost[key]
+        m_main[key] = None
+    elif key in m_ghost_main:
+        # Ghost M hit -> M was too small (S too big), decrease S target
+        m_s_ratio = max(0.01, m_s_ratio - delta)
+        del m_ghost_main[key]
+        m_main[key] = None
+    else:
+        # New Item: Insert into S
+        m_small[key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Clean up internal structures after eviction.
+    Add evicted items to respective ghost lists.
+    '''
+    check_reset(cache_snapshot)
+    global m_small, m_main, m_ghost, m_ghost_main, m_freq
+
+    key = evicted_obj.key
+
+    if key in m_small:
+        del m_small[key]
+        m_ghost[key] = None
+    elif key in m_main:
+        del m_main[key]
+        m_ghost_main[key] = None
+
+    # Manage Ghost sizes
+    cap = cache_snapshot.capacity
+    while len(m_ghost) > cap:
+        m_ghost.popitem(last=False)
+    while len(m_ghost_main) > cap:
+        m_ghost_main.popitem(last=False)
+
+    if key in m_freq:
+        del m_freq[key]
+>>>>>>> REPLACE
+</DIFF>

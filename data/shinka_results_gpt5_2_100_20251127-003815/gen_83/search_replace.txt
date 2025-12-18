@@ -1,0 +1,320 @@
+<NAME>
+m2_guarded_admission_promotion
+</NAME>
+
+<DESCRIPTION>
+This edit strengthens protected-segment (M2) preservation and accelerates hot object promotion using well-established WTinyLFU/SLRU principles:
+
+1) On hit in the window (W), promote immediately to probation (M1). This reduces the time hot objects spend exposed to eviction, improving hit rates on bursty and mixed workloads. Previously we required a TinyLFU threshold that delayed promotion and harmed reuse capture.
+
+2) Competitive admission now compares the new object's TinyLFU estimate against the colder of M1 and M2 (with a +1 bias for M2) instead of the previous max(W,M1) gate. This is standard for TinyLFU-based admission and reduces unnecessary admissions to M1 when main memory is already hotter than the newcomer. During cooldown (scan detection), we require a slight margin (+1) to admit to M1, otherwise place in W.
+
+3) Victim selection remains TinyLFU-guided but now incorporates a stronger M2 bias and the recent-phase boost for the incoming object, making it even less likely to evict from M2 unless it is significantly colder than M1. This lowers churn of truly hot items.
+
+These changes are consistent, localized to the eviction and update hooks, and should reduce miss rates on varied traces, especially those with temporal bursts and mixed phases, while being scan-resilient.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def choose_victim(self, snapshot, new_obj) -> str:
+        self._ensure_capacity(snapshot)
+        self._prune_desync(snapshot)
+
+        now = snapshot.access_count
+        in_cooldown = now < self._cooldown_until
+
+        win_target, prot_target = self._targets()
+
+        # If window oversized, evict from W first
+        if len(self.W) > win_target and len(self.W) > 0:
+            kW, _ = self._sample_tail_min_freq(self.W)
+            if kW is not None and kW in snapshot.cache:
+                self._last_evicted_from = "W"
+                return kW
+
+        # Sample candidates
+        kW, fW = self._sample_tail_min_freq(self.W) if self.W else (None, None)
+        k1, f1 = self._sample_tail_min_freq(self.M1) if self.M1 else (None, None)
+        k2, f2 = self._sample_tail_min_freq(self.M2) if self.M2 else (None, None)
+        f2b = (f2 + 1) if f2 is not None else None  # protect M2 with +1 bias
+        f_new = self.sketch.estimate(new_obj.key)
+
+        # Cooldown (scan) bias: prefer evicting from W if possible
+        if in_cooldown and kW is not None and kW in snapshot.cache:
+            self._last_evicted_from = "W"
+            return kW
+
+        # Decide among segments using competitive TinyLFU
+        # 1) If new is cold compared to main, evict from W if available, else from M1
+        main_cold = min([v for v in [f1, f2b] if v is not None], default=None)
+        if main_cold is not None and f_new <= main_cold:
+            if kW is not None and kW in snapshot.cache:
+                self._last_evicted_from = "W"
+                return kW
+            if k1 is not None and k1 in snapshot.cache:
+                self._last_evicted_from = "M1"
+                return k1
+
+        # 2) Otherwise, evict from the colder of M1 and M2 (with M2 bias)
+        if k1 is not None and k2 is not None:
+            # Compare adjusted freqs
+            f1a = f1
+            f2a = f2b
+            if f1a <= f2a:
+                victim = k1
+                seg = "M1"
+            else:
+                victim = k2
+                seg = "M2"
+            if victim in snapshot.cache:
+                self._last_evicted_from = seg
+                return victim
+
+        # 3) Fall back to any available segment by priority: M1 -> W -> M2
+        for seg_name, cand in (("M1", k1), ("W", kW), ("M2", k2)):
+            if cand is not None and cand in snapshot.cache:
+                self._last_evicted_from = seg_name
+                return cand
+
+        # Final fallback: return any key present in cache
+        self._last_evicted_from = "W"
+        return next(iter(snapshot.cache))
+=======
+    def choose_victim(self, snapshot, new_obj) -> str:
+        self._ensure_capacity(snapshot)
+        self._prune_desync(snapshot)
+
+        now = snapshot.access_count
+        in_cooldown = now < self._cooldown_until
+
+        win_target, prot_target = self._targets()
+
+        # If window oversized, evict from W first
+        if len(self.W) > win_target and len(self.W) > 0:
+            kW, _ = self._sample_tail_min_freq(self.W)
+            if kW is not None and kW in snapshot.cache:
+                self._last_evicted_from = "W"
+                return kW
+
+        # Sample candidates
+        kW, fW = self._sample_tail_min_freq(self.W) if self.W else (None, None)
+        k1, f1 = self._sample_tail_min_freq(self.M1) if self.M1 else (None, None)
+        k2, f2 = self._sample_tail_min_freq(self.M2) if self.M2 else (None, None)
+        # Protect M2 with +1 bias
+        f2b = (f2 + 1) if f2 is not None else None
+
+        # Estimate incoming object's frequency with small recent-phase boost
+        f_new = self.sketch.estimate(new_obj.key)
+        if new_obj.key in self._recent_ring:
+            f_new += 1
+
+        # Cooldown (scan) bias: prefer evicting from W if possible
+        if in_cooldown and kW is not None and kW in snapshot.cache:
+            self._last_evicted_from = "W"
+            return kW
+
+        # Compare vs main (M1/M2) using TinyLFU with M2 bias
+        main_cold = min([v for v in [f1, f2b] if v is not None], default=None)
+
+        # If the new object is not hotter than the main's cold edge, evict from W first, else M1
+        if main_cold is not None and f_new <= main_cold:
+            if kW is not None and kW in snapshot.cache:
+                self._last_evicted_from = "W"
+                return kW
+            if k1 is not None and k1 in snapshot.cache:
+                self._last_evicted_from = "M1"
+                return k1
+            if k2 is not None and k2 in snapshot.cache:
+                self._last_evicted_from = "M2"
+                return k2
+
+        # Otherwise, evict from the colder of M1 and M2 with stronger protection for M2
+        if k1 is not None and k2 is not None:
+            # Evict from M1 unless M2 is clearly colder despite bias (+2 guard)
+            if f1 is None:
+                victim, seg = k2, "M2"
+            elif f2 is None:
+                victim, seg = k1, "M1"
+            else:
+                if f1 <= (f2 + 2):
+                    victim, seg = k1, "M1"
+                else:
+                    victim, seg = k2, "M2"
+            if victim in snapshot.cache:
+                self._last_evicted_from = seg
+                return victim
+
+        # Fall back to any available segment by priority: M1 -> W -> M2
+        for seg_name, cand in (("M1", k1), ("W", kW), ("M2", k2)):
+            if cand is not None and cand in snapshot.cache:
+                self._last_evicted_from = seg_name
+                return cand
+
+        # Final fallback: return any key present in cache
+        self._last_evicted_from = "W"
+        return next(iter(snapshot.cache))
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def on_hit(self, snapshot, obj):
+        self._ensure_capacity(snapshot)
+        key = obj.key
+        self.sketch.increment(key, 1)
+        self._update_ema_on_hit()
+        self._refresh_recent(key)
+
+        # Update recency/frequency placement
+        if key in self.W:
+            # Promote from W to M1 on second chance by TinyLFU
+            if self.sketch.estimate(key) >= (3 if snapshot.access_count < self._cooldown_until else 2):
+                self.W.pop(key, None)
+                self._touch(self.M1, key)
+                self.promotions += 1
+            else:
+                self._touch(self.W, key)
+            self.hit_W += 1
+        elif key in self.M1:
+            self.M1.pop(key, None)
+            self._touch(self.M2, key)  # re-reference -> protected
+            self.promotions += 1
+            self.hit_M1 += 1
+        elif key in self.M2:
+            self._touch(self.M2, key)
+            self.hit_M2 += 1
+        else:
+            # Desync/repair: assume frequent
+            self._touch(self.M2, key)
+            self.hit_M2 += 1
+
+        self._rebalance_after_hit_or_insert()
+        self._maybe_tune(snapshot)
+=======
+    def on_hit(self, snapshot, obj):
+        self._ensure_capacity(snapshot)
+        key = obj.key
+        self.sketch.increment(key, 1)
+        self._update_ema_on_hit()
+        self._refresh_recent(key)
+
+        # Update recency/frequency placement
+        if key in self.W:
+            # Accelerate promotion: any hit in W moves to probation (M1)
+            self.W.pop(key, None)
+            self._touch(self.M1, key)
+            self.promotions += 1
+            self.hit_W += 1
+        elif key in self.M1:
+            self.M1.pop(key, None)
+            self._touch(self.M2, key)  # re-reference -> protected
+            self.promotions += 1
+            self.hit_M1 += 1
+        elif key in self.M2:
+            self._touch(self.M2, key)
+            self.hit_M2 += 1
+        else:
+            # Desync/repair: assume frequent
+            self._touch(self.M2, key)
+            self.hit_M2 += 1
+
+        self._rebalance_after_hit_or_insert()
+        self._maybe_tune(snapshot)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def on_insert(self, snapshot, obj):
+        self._ensure_capacity(snapshot)
+        key = obj.key
+        now = snapshot.access_count
+
+        # Update TinyLFU on miss
+        self.sketch.increment(key, 1)
+        self._update_ema_on_miss(now)
+        self._refresh_recent(key)
+
+        in_cooldown = now < self._cooldown_until
+
+        # Competitive admission: compare f(new) versus W and M1 representatives
+        f_new = self.sketch.estimate(key)
+        if key in self._recent_ring:
+            f_new += 1  # small phase-shift boost
+
+        kW, fW = self._sample_tail_min_freq(self.W) if self.W else (None, -1)
+        k1, f1 = self._sample_tail_min_freq(self.M1) if self.M1 else (None, -1)
+        gate = max(fW, f1)
+
+        # During cooldown, avoid direct M1 admissions unless clearly hot
+        if in_cooldown:
+            if f_new >= gate + 2:
+                self._touch(self.M1, key)
+            else:
+                self._touch(self.W, key)
+        else:
+            if f_new > gate:
+                self._touch(self.M1, key)
+            else:
+                self._touch(self.W, key)
+
+        self._rebalance_after_hit_or_insert()
+        self._maybe_tune(snapshot)
+=======
+    def on_insert(self, snapshot, obj):
+        self._ensure_capacity(snapshot)
+        key = obj.key
+        now = snapshot.access_count
+
+        # Update TinyLFU on miss
+        self.sketch.increment(key, 1)
+        self._update_ema_on_miss(now)
+        self._refresh_recent(key)
+
+        in_cooldown = now < self._cooldown_until
+
+        # Competitive admission: compare f(new) against main (M1/M2) with M2 bias
+        f_new = self.sketch.estimate(key)
+        if key in self._recent_ring:
+            f_new += 1  # small phase-shift boost
+
+        kW, fW = self._sample_tail_min_freq(self.W) if self.W else (None, -1)
+        k1, f1 = self._sample_tail_min_freq(self.M1) if self.M1 else (None, -1)
+        k2, f2 = self._sample_tail_min_freq(self.M2) if self.M2 else (None, -1)
+        f2b = (f2 + 1) if f2 is not None and f2 != -1 else None
+
+        # Gate is the colder of M1 and biased M2; if none, fall back to W sample
+        gate_candidates = [v for v in [f1, f2b] if v is not None and v != -1]
+        gate_main = min(gate_candidates) if gate_candidates else None
+        win_target, _ = self._targets()
+
+        if in_cooldown:
+            # During cooldown, require a small margin to enter M1
+            if gate_main is not None and f_new >= gate_main + 1:
+                self._touch(self.M1, key)
+            else:
+                self._touch(self.W, key)
+        else:
+            if gate_main is not None:
+                if f_new >= gate_main:
+                    self._touch(self.M1, key)
+                else:
+                    # If window already large, admit borderline to M1 to reduce churn
+                    if len(self.W) >= win_target and f_new >= (f1 if f1 != -1 else fW):
+                        self._touch(self.M1, key)
+                    else:
+                        self._touch(self.W, key)
+            else:
+                # No main representatives: fall back to comparing against W
+                if f_new >= (fW if fW != -1 else 0):
+                    self._touch(self.M1, key)
+                else:
+                    self._touch(self.W, key)
+
+        self._rebalance_after_hit_or_insert()
+        self._maybe_tune(snapshot)
+>>>>>>> REPLACE
+
+</DIFF>

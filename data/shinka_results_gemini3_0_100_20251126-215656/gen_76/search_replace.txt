@@ -1,0 +1,191 @@
+<NAME>
+s3_fifo_optimized
+</NAME>
+
+<DESCRIPTION>
+Optimized S3-FIFO with:
+1. Expanded probationary queue (Small) to 20% of capacity to reduce thrashing.
+2. Conditional Demotion from Main to Small: prevents overcrowding Small during scans/churn. If Small is full, Main items are evicted to Ghost directly.
+3. Expanded Ghost Registry (4x capacity) to better detect large loops.
+4. Tiered Promotion: Items promoted to Main (from Small or Ghost) get a "tenancy bonus" (frequency = 1) to survive at least two passes in Main, improving retention of working sets.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    """
+    S3-FIFO-D Eviction Policy.
+    - S (Small): FIFO Probation queue. 10% of cache.
+    - M (Main): FIFO Protected queue. 90% of cache.
+    - Demotion: Items evicted from M with 0 frequency are demoted to S.
+    """
+    global small_q, main_q, ghost_q, freq_map
+    _reset_state_if_needed(cache_snapshot)
+
+    # Calculate target size for Small queue (10% of capacity)
+    # Ensure at least 1 slot
+    capacity = cache_snapshot.capacity
+    s_capacity = max(int(capacity * 0.1), 1)
+
+    while True:
+        # Check Small Queue (S) if it's oversize or if Main is empty
+        # This prioritizes cleaning up S, or filling M if needed.
+        if len(small_q) > s_capacity or not main_q:
+            if not small_q:
+                # Both queues empty (shouldn't happen on eviction of full cache)
+                # Fallback to arbitrary eviction if state desync
+                if cache_snapshot.cache:
+                    return next(iter(cache_snapshot.cache))
+                return None
+
+            candidate, _ = small_q.popitem(last=False) # Pop head (FIFO)
+
+            freq = freq_map.get(candidate, 0)
+            if freq > 0:
+                # Promotion: S -> M
+                # Item proved usefulness. Move to Main.
+                # Reset frequency to require new proof in Main.
+                main_q[candidate] = None
+                freq_map[candidate] = 0
+                continue
+            else:
+                # Eviction: S -> Ghost
+                # No hits in probation. Evict.
+                ghost_q[candidate] = None
+                if candidate in freq_map:
+                    del freq_map[candidate]
+
+                # Manage Ghost Size
+                if len(ghost_q) > capacity * 2:
+                    ghost_q.popitem(last=False)
+
+                return candidate
+
+        else:
+            # Check Main Queue (M)
+            # Standard S3-FIFO checks M when S is within budget.
+            candidate, _ = main_q.popitem(last=False) # Pop head
+
+            freq = freq_map.get(candidate, 0)
+            if freq > 0:
+                # Re-insertion: Give second chance in M
+                # Decay frequency.
+                main_q[candidate] = None # Move to tail
+                freq_map[candidate] = freq - 1
+                continue
+            else:
+                # Demotion: M -> S
+                # Item was cold in M. Give one last chance in Probation (S).
+                # This is "Demotion" rather than direct eviction.
+                small_q[candidate] = None
+                freq_map[candidate] = 0
+                continue
+=======
+def evict(cache_snapshot, obj):
+    """
+    S3-FIFO-D Eviction Policy with optimizations.
+    - S (Small): FIFO Probation queue. 20% of cache.
+    - M (Main): FIFO Protected queue. 80% of cache.
+    - Conditional Demotion: M -> S only if S is not full.
+    - Tiered Promotion: Bonus frequency for promoted items.
+    """
+    global small_q, main_q, ghost_q, freq_map
+    _reset_state_if_needed(cache_snapshot)
+
+    # Calculate target size for Small queue (20% of capacity)
+    capacity = cache_snapshot.capacity
+    s_capacity = max(int(capacity * 0.2), 1)
+
+    while True:
+        # Check Small Queue (S) if it's oversize or if Main is empty
+        if len(small_q) > s_capacity or not main_q:
+            if not small_q:
+                # Fallback
+                if cache_snapshot.cache:
+                    return next(iter(cache_snapshot.cache))
+                return None
+
+            candidate, _ = small_q.popitem(last=False) # Pop head
+
+            freq = freq_map.get(candidate, 0)
+            if freq > 0:
+                # Promotion: S -> M
+                main_q[candidate] = None
+                # Tenancy Bonus: Give freq=1 to survive one quick scan in M
+                freq_map[candidate] = 1
+                continue
+            else:
+                # Eviction: S -> Ghost
+                ghost_q[candidate] = None
+                if candidate in freq_map:
+                    del freq_map[candidate]
+
+                # Manage Ghost Size (4x capacity)
+                if len(ghost_q) > capacity * 4:
+                    ghost_q.popitem(last=False)
+
+                return candidate
+
+        else:
+            # Check Main Queue (M)
+            candidate, _ = main_q.popitem(last=False) # Pop head
+
+            freq = freq_map.get(candidate, 0)
+            if freq > 0:
+                # Re-insertion in M with decay
+                main_q[candidate] = None
+                freq_map[candidate] = freq - 1
+                continue
+            else:
+                # Conditional Demotion
+                # Only demote to Small if Small is not full.
+                # Otherwise, evict directly to Ghost (prevents S pollution during scans).
+                if len(small_q) < s_capacity:
+                    small_q[candidate] = None
+                    freq_map[candidate] = 0
+                    continue
+                else:
+                    # Direct Eviction from M
+                    ghost_q[candidate] = None
+                    if candidate in freq_map:
+                        del freq_map[candidate]
+
+                    if len(ghost_q) > capacity * 4:
+                        ghost_q.popitem(last=False)
+
+                    return candidate
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    global small_q, main_q, ghost_q, freq_map
+    _reset_state_if_needed(cache_snapshot)
+
+    key = obj.key
+    if key in ghost_q:
+        # Ghost Hit: Promote to Main
+        # It was recently evicted, so it's a recall.
+        main_q[key] = None
+        freq_map[key] = 0
+        del ghost_q[key]
+    else:
+        # New Insert: Start in Small (Probation)
+        small_q[key] = None
+        freq_map[key] = 0
+=======
+def update_after_insert(cache_snapshot, obj):
+    global small_q, main_q, ghost_q, freq_map
+    _reset_state_if_needed(cache_snapshot)
+
+    key = obj.key
+    if key in ghost_q:
+        # Ghost Hit: Promote to Main
+        # Strong signal, give tenancy bonus (freq=1)
+        main_q[key] = None
+        freq_map[key] = 1
+        del ghost_q[key]
+    else:
+        # New Insert: Start in Small (Probation)
+        small_q[key] = None
+        freq_map[key] = 0
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,175 @@
+<NAME>
+hot_bypass_budget_and_stronger_scan_gating
+</NAME>
+
+<DESCRIPTION>
+I add a small, bounded hot bypass budget to allow a limited number of direct admissions into the protected main segment (M2) for very hot new items, improving early preservation of emerging hot objects without polluting M2 under churn. This follows TinyLFU-inspired admission but adds a scarcity-controlled fast path, a known enhancement for workloads with steep popularity skews where top items should be retained immediately.
+
+I also strengthen scan gating during cooldown by raising promotion thresholds on hits and misses, further protecting the protected segments during scans. Additionally, I ensure last_touch metadata is cleared on eviction and remove a duplicate recent_cap assignment.
+
+Concretely:
+- Add hot_bypass_budget, hot_bypass_max, and last_budget_reset fields.
+- Initialize and periodically reset the budget in _ensure_capacity and _maybe_tune based on capacity (≈2% of capacity, capped at 8 tokens).
+- In on_insert, consume a budget token to directly admit to M2 when f(new) is ≥ f(M2 tail)+2 (or ≥3 when M2 empty) and not in scan cooldown.
+- Increase promotion thresholds under scan cooldown on hit and insert.
+- Clean up last_touch on eviction to prevent stale recency affecting future decisions.
+
+These changes should improve hit rate on bursty and steep-skew traces while maintaining robustness on scans by limiting protected pollution and enabling fast capture of hot items.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    __slots__ = (
+        "W1", "W2", "M1", "M2", "capacity",
+        "win_frac", "w2_frac", "prot_frac",
+        "sketch", "_sample_k",
+        "last_touch", "recent", "recent_cap",
+        # adaptive stats
+        "hits_w", "hits_w2", "hits_main", "prom_m2", "dem_m2",
+        "last_tune_time", "tune_period",
+        # scan handling
+        "miss_streak", "scan_cooldown",
+    )
+=======
+    __slots__ = (
+        "W1", "W2", "M1", "M2", "capacity",
+        "win_frac", "w2_frac", "prot_frac",
+        "sketch", "_sample_k",
+        "last_touch", "recent", "recent_cap",
+        # adaptive stats
+        "hits_w", "hits_w2", "hits_main", "prom_m2", "dem_m2",
+        "last_tune_time", "tune_period",
+        # scan handling
+        "miss_streak", "scan_cooldown",
+        # hot bypass admission budget
+        "hot_bypass_budget", "hot_bypass_max", "last_budget_reset",
+    )
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        self.scan_cooldown = 0
+=======
+        self.scan_cooldown = 0
+        # hot bypass budget for direct M2 admissions
+        self.hot_bypass_budget = 0
+        self.hot_bypass_max = 0
+        self.last_budget_reset = 0
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            self.tune_period = max(256, cap * 4)
+            self.last_tune_time = 0
+            self.recent_cap = max(128, min(4096, cap))
+            self.recent_cap = max(128, min(4096, cap))
+            return
+=======
+            self.tune_period = max(256, cap * 4)
+            self.last_tune_time = 0
+            self.recent_cap = max(128, min(4096, cap))
+            # initialize hot bypass budget (~2% of capacity, capped)
+            self.hot_bypass_max = min(8, max(1, cap // 50))
+            self.hot_bypass_budget = self.hot_bypass_max
+            self.last_budget_reset = 0
+            return
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            self.tune_period = max(256, cap * 4)
+            self.last_tune_time = 0
+=======
+            self.tune_period = max(256, cap * 4)
+            self.last_tune_time = 0
+            self.recent_cap = max(128, min(4096, cap))
+            # reset hot bypass budget on capacity change
+            self.hot_bypass_max = min(8, max(1, cap // 50))
+            self.hot_bypass_budget = self.hot_bypass_max
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            # decay stats
+            self.hits_w >>= 1; self.hits_w2 >>= 1; self.hits_main >>= 1
+            self.prom_m2 >>= 1; self.dem_m2 >>= 1
+            self.last_tune_time = now
+=======
+            # refresh hot bypass budget each tune period
+            cap = self.capacity or 1
+            self.hot_bypass_max = min(8, max(1, cap // 50))
+            self.hot_bypass_budget = self.hot_bypass_max
+
+            # decay stats
+            self.hits_w >>= 1; self.hits_w2 >>= 1; self.hits_main >>= 1
+            self.prom_m2 >>= 1; self.dem_m2 >>= 1
+            self.last_tune_time = now
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            if self.scan_cooldown > 0 and f_est < 2:
+=======
+            if self.scan_cooldown > 0 and f_est < 3:
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            if self.scan_cooldown > 0 and f_est < 2:
+=======
+            if self.scan_cooldown > 0 and f_est < 3:
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        placed = False
+        if self.scan_cooldown > 0:
+            # Avoid polluting M2; allow M1 for clearly warm items
+            if f_new >= 4 or (cand_m1 is not None and f_new >= (f_m1 + bias)):
+                self._touch(self.M1, key, now)
+                placed = True
+        else:
+            if (cand_m2 is not None) and ((f_new >= (f_m2 + bias + 1)) or (key in self.recent and f_new >= f_m2)):
+                self._touch(self.M2, key, now)
+                placed = True
+            elif cand_m1 is not None and f_new >= (f_m1 + bias):
+                self._touch(self.M1, key, now)
+                placed = True
+=======
+        placed = False
+        if self.scan_cooldown > 0:
+            # Avoid polluting M2; allow M1 for clearly warm items
+            if f_new >= 5 or (cand_m1 is not None and f_new >= (f_m1 + bias + 1)):
+                self._touch(self.M1, key, now)
+                placed = True
+        else:
+            if (cand_m2 is not None) and ((f_new >= (f_m2 + bias + 1)) or (key in self.recent and f_new >= f_m2)):
+                self._touch(self.M2, key, now)
+                placed = True
+            elif self.hot_bypass_budget > 0 and ((cand_m2 is not None and f_new >= (f_m2 + 2)) or (cand_m2 is None and f_new >= 3)):
+                # Use a scarce budget to preserve very hot items early
+                self._touch(self.M2, key, now)
+                self.hot_bypass_budget -= 1
+                placed = True
+            elif cand_m1 is not None and f_new >= (f_m1 + bias):
+                self._touch(self.M1, key, now)
+                placed = True
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        self.recent.pop(k, None)
+        # last_touch may remain; leave it to be overwritten on reuse
+=======
+        self.recent.pop(k, None)
+        self.last_touch.pop(k, None)
+>>>>>>> REPLACE
+</DIFF>

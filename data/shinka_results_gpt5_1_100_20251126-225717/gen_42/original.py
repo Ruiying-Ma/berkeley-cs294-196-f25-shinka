@@ -1,0 +1,336 @@
+# EVOLVE-BLOCK-START
+"""Adaptive ARC-like cache eviction with SLRU segments and ghost history"""
+
+from collections import OrderedDict
+
+# Segment structures
+_T1_probation = OrderedDict()   # keys in cache, 1st-touch (recency-biased)
+_T2_protected = OrderedDict()   # keys in cache, 2nd+ touch (frequency-biased)
+
+# Ghost history (recently evicted keys) for adaptation
+_B1_ghost = OrderedDict()       # evicted from T1
+_B2_ghost = OrderedDict()       # evicted from T2
+
+# Adaptive target size for probation (ARC's p). Float to allow smooth adjust.
+_p_target = 0.0
+
+# Estimated capacity (number of objects). Initialize lazily.
+_cap_est = 0
+
+# Fallback LRU timestamps if metadata desync occurs
+m_key_timestamp = dict()
+
+# Lightweight per-key frequency counter (hit count)
+_freq = dict()  # key -> int
+# Frequency aging tick (decay to avoid stale bias)
+_last_age_tick = 0
+
+# Admission guard based on last victim "strength"
+_last_victim_strength = 0.0
+_VICTIM_GUARD_THRESH = 2.0  # if last victim was strong, down-seed next newcomer
+# Time-bounded guard window to resist scans after evicting strong protected
+_guard_until = 0
+
+# Eviction sampling (number of LRU candidates to compare by frequency)
+_T1_SAMPLE = 2
+_T2_SAMPLE = 3
+
+# Tunable parameters
+_P_INIT_RATIO = 0.3  # initial share for probation (T1)
+# On ghost hits, adjust p by this delta rule (ARC-like):
+# delta = ratio of other ghost to this ghost (float), clamped and then p is clamped to [0, cap]
+
+def _ensure_capacity(cache_snapshot):
+    """Initialize or update capacity estimate and clamp p."""
+    global _cap_est, _p_target
+    cap = getattr(cache_snapshot, "capacity", None)
+    # Some runners define capacity as number of objects; if absent, infer
+    if isinstance(cap, int) and cap > 0:
+        _cap_est = cap
+    else:
+        _cap_est = max(_cap_est, len(cache_snapshot.cache))
+    if _cap_est <= 0:
+        _cap_est = max(1, len(cache_snapshot.cache))
+    # Initialize p if never set (zero and empty metadata)
+    if _p_target == 0.0 and not _T1_probation and not _T2_protected and not _B1_ghost and not _B2_ghost:
+        _p_target = max(0.0, min(float(_cap_est), float(_cap_est) * _P_INIT_RATIO))
+    # Clamp p
+    if _p_target < 0.0:
+        _p_target = 0.0
+    if _p_target > float(_cap_est):
+        _p_target = float(_cap_est)
+
+def _ghost_trim():
+    """Limit ghost lists to capacity each (ARC-style bound)."""
+    global _B1_ghost, _B2_ghost
+    # Trim oldest entries beyond capacity
+    while len(_B1_ghost) > _cap_est:
+        _B1_ghost.popitem(last=False)
+    while len(_B2_ghost) > _cap_est:
+        _B2_ghost.popitem(last=False)
+
+def _maybe_age(cache_snapshot):
+    """Periodically age frequencies to avoid stale bias."""
+    global _last_age_tick, _freq
+    _ensure_capacity(cache_snapshot)
+    now = cache_snapshot.access_count
+    if now - _last_age_tick >= max(1, _cap_est):
+        for k in list(_freq.keys()):
+            newf = _freq.get(k, 0) // 2
+            if newf <= 0:
+                _freq.pop(k, None)
+            else:
+                _freq[k] = newf
+        _last_age_tick = now
+
+def _get_targets(cache_snapshot):
+    """Compute ARC targets from p: T1 target = round(p), T2 target = cap - T1 target."""
+    _ensure_capacity(cache_snapshot)
+    t1_target = int(round(_p_target))
+    t2_target = max(_cap_est - t1_target, 0)
+    return t1_target, t2_target
+
+def _demote_protected_if_needed(cache_snapshot, avoid_key=None):
+    """Ensure protected size does not exceed its ARC target by demoting LRU to T1."""
+    _, t2_target = _get_targets(cache_snapshot)
+    if t2_target <= 0:
+        return
+    # Demote until within target
+    while len(_T2_protected) > t2_target:
+        # Find the LRU that is not the avoid_key
+        chosen = None
+        for k in _T2_protected.keys():
+            if avoid_key is not None and k == avoid_key:
+                continue
+            chosen = k
+            break
+        if chosen is None:
+            break
+        _T2_protected.pop(chosen, None)
+        _T1_probation[chosen] = True  # demoted reinserted as MRU in T1
+
+def _fallback_choose(cache_snapshot):
+    """Fallback victim: global LRU by timestamp among cached keys."""
+    # Prefer the minimum timestamp; if unknown, pick arbitrary
+    keys = list(cache_snapshot.cache.keys())
+    if not keys:
+        return None
+    # Filter to known timestamps
+    known = [(k, m_key_timestamp.get(k, None)) for k in keys]
+    known_ts = [x for x in known if x[1] is not None]
+    if known_ts:
+        k = min(known_ts, key=lambda kv: kv[1])[0]
+        return k
+    return keys[0]
+
+def evict(cache_snapshot, obj):
+    '''
+    Choose victim key using adaptive ARC-like policy with small frequency-aware sampling.
+    REPLACE(x): if |T1|>=1 and ((x in B2 and |T1| == p) or |T1| > p) -> evict from T1 else from T2.
+    Within the chosen segment, pick the lowest-frequency among a few LRU candidates.
+    '''
+    _ensure_capacity(cache_snapshot)
+
+    t1_size = len(_T1_probation)
+    t2_size = len(_T2_protected)
+    x_in_b2 = (obj is not None) and (obj.key in _B2_ghost)
+    p_int = int(round(_p_target))
+    choose_t1 = (t1_size >= 1) and ((x_in_b2 and t1_size == p_int) or (t1_size > _p_target))
+
+    # Dynamic sampling based on segment pressure
+    _, t2_target = _get_targets(cache_snapshot)
+    t1_pressure = t1_size > (int(round(_p_target)) + max(1, _cap_est // 10))
+    t1_sample = 1 if t1_pressure else _T1_SAMPLE
+    t2_sample = 5 if t2_size > t2_target else _T2_SAMPLE
+
+    def _pick_from(od, sample_n):
+        # Sample the first few LRU keys that are present in cache and pick by (freq asc, timestamp asc)
+        if not od:
+            return None
+        candidates = []
+        for k in od.keys():
+            if k in cache_snapshot.cache:
+                candidates.append(k)
+                if len(candidates) >= sample_n:
+                    break
+        if not candidates:
+            return None
+        def score(k):
+            # Lower freq better; older (smaller timestamp) better
+            return (_freq.get(k, 0), m_key_timestamp.get(k, 0))
+        return min(candidates, key=score)
+
+    victim_key = None
+    if choose_t1 and t1_size > 0:
+        victim_key = _pick_from(_T1_probation, t1_sample)
+    if victim_key is None and t2_size > 0:
+        victim_key = _pick_from(_T2_protected, t2_sample)
+    if victim_key is None and t1_size > 0:
+        victim_key = _pick_from(_T1_probation, t1_sample)
+    if victim_key is None:
+        # Fallback to global LRU if metadata desync
+        victim_key = _fallback_choose(cache_snapshot)
+    return victim_key
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    Update metadata after cache hit.
+    - If hit in probation (T1), promote to protected (T2).
+    - If hit in protected, refresh recency.
+    - Maintain fallback timestamp map and per-key frequency.
+    '''
+    _ensure_capacity(cache_snapshot)
+    _maybe_age(cache_snapshot)
+    key = obj.key
+    # Update fallback LRU timestamp
+    m_key_timestamp[key] = cache_snapshot.access_count
+    # Increment frequency counter
+    _freq[key] = _freq.get(key, 0) + 1
+
+    # If the key exists in our segments, update positions
+    if key in _T2_protected:
+        # Refresh to MRU
+        _T2_protected.move_to_end(key, last=True)
+    elif key in _T1_probation:
+        # Promote from probation to protected
+        _T1_probation.pop(key, None)
+        _T2_protected[key] = True  # insert as MRU
+    else:
+        # Metadata miss: cache has it but we don't; treat as frequent and add to protected
+        _T2_protected[key] = True
+
+    # Enforce protected target by demoting its LRU if needed
+    _demote_protected_if_needed(cache_snapshot, avoid_key=key)
+
+    # Touch ghosts cleanup if any stale
+    if key in _B1_ghost:
+        _B1_ghost.pop(key, None)
+    if key in _B2_ghost:
+        _B2_ghost.pop(key, None)
+    _ghost_trim()
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Update metadata on insertion (cache miss path).
+    - If the key is in ghost lists, adjust p (ARC adaptation) and insert into protected.
+    - Otherwise insert into probation as MRU, unless guarded by a strong last victim (insert at LRU).
+    - Maintain fallback timestamp map and seed frequency.
+    '''
+    _ensure_capacity(cache_snapshot)
+    _maybe_age(cache_snapshot)
+    key = obj.key
+    now = cache_snapshot.access_count
+    m_key_timestamp[key] = now
+
+    in_b1 = key in _B1_ghost
+    in_b2 = key in _B2_ghost
+
+    if in_b1 or in_b2:
+        # ARC adaptation of p (smooth float-based steps)
+        global _p_target
+        if in_b1:
+            # Favor recency: increase p
+            inc = max(1.0, float(len(_B2_ghost)) / max(1.0, float(len(_B1_ghost))))
+            _p_target = min(float(_cap_est), _p_target + float(inc))
+            _B1_ghost.pop(key, None)
+        else:
+            # Favor frequency: decrease p
+            dec = max(1.0, float(len(_B1_ghost)) / max(1.0, float(len(_B2_ghost))))
+            _p_target = max(0.0, _p_target - float(dec))
+            _B2_ghost.pop(key, None)
+        # Insert into protected (seen before, effectively 2nd touch)
+        if key in _T1_probation:
+            _T1_probation.pop(key, None)
+        _T2_protected[key] = True
+        # Seed frequency as at least 2 for re-referenced keys
+        _freq[key] = max(_freq.get(key, 0) + 1, 2)
+
+        # Keep protected within its target by demoting its LRU if necessary
+        _demote_protected_if_needed(cache_snapshot, avoid_key=key)
+    else:
+        # New to cache and ghosts: insert into probation (T1)
+        if key in _T2_protected:
+            # Rare desync; ensure consistency (shouldn't happen on miss)
+            _T2_protected.move_to_end(key, last=True)
+        else:
+            _T1_probation[key] = True
+            # Admission guard: if last victim was strong OR we are within guard window, bias newcomer cold
+            if (_last_victim_strength >= _VICTIM_GUARD_THRESH) or (now <= _guard_until):
+                _T1_probation.move_to_end(key, last=False)
+        # Seed minimal frequency for new items
+        _freq[key] = _freq.get(key, 0)
+
+    # Avoid duplicates across structures
+    if key in _T1_probation and key in _T2_protected:
+        _T1_probation.pop(key, None)
+    if key in _B1_ghost:
+        _B1_ghost.pop(key, None)
+    if key in _B2_ghost:
+        _B2_ghost.pop(key, None)
+    _ghost_trim()
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Update metadata after eviction.
+    - Remove victim from its resident segment.
+    - Add to corresponding ghost list (B1 if from probation, B2 if from protected).
+    - Track last victim strength for admission guard and enable a short guard window if needed.
+    - Trim ghost lists to capacity and clean timestamps/frequency.
+    '''
+    _ensure_capacity(cache_snapshot)
+    victim_key = evicted_obj.key
+
+    was_t1 = victim_key in _T1_probation
+    was_t2 = victim_key in _T2_protected
+
+    # Track strength of the evicted item before removing counters
+    fval = _freq.get(victim_key, 0)
+    base_strength = float(fval)
+    if was_t2:
+        base_strength += 2.0  # extra credit for protected residency
+    global _last_victim_strength, _guard_until
+    _last_victim_strength = base_strength
+
+    # Remove from resident segments and add to ghosts
+    if was_t1:
+        _T1_probation.pop(victim_key, None)
+        _B1_ghost[victim_key] = True  # insert as MRU
+    elif was_t2:
+        _T2_protected.pop(victim_key, None)
+        _B2_ghost[victim_key] = True  # insert as MRU
+        # If we had to evict a strong protected item, enable a short guard window
+        if fval >= 2:
+            _guard_until = cache_snapshot.access_count + max(1, _cap_est // 2)
+    else:
+        # Unknown location; put in B1 by default
+        _B1_ghost[victim_key] = True
+
+    # Remove fallback timestamp and frequency for evicted key
+    if victim_key in m_key_timestamp:
+        m_key_timestamp.pop(victim_key, None)
+    if victim_key in _freq:
+        _freq.pop(victim_key, None)
+
+    # If inserting obj is accidentally in ghosts, let insert handle cleanup next
+    _ghost_trim()
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

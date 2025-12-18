@@ -1,0 +1,136 @@
+# EVOLVE-BLOCK-START
+from collections import OrderedDict
+
+# S3-FIFO Implementation with Extended Ghost Capacity
+# qs: Small Queue (FIFO, Probation)
+# qm: Main Queue (FIFO, Protected)
+# qg: Ghost Queue (FIFO, History)
+# freq: Frequency counter for objects in cache
+
+qs = OrderedDict()
+qm = OrderedDict()
+qg = OrderedDict()
+freq = {}
+last_acc = -1
+
+def _check_reset(snap):
+    global qs, qm, qg, freq, last_acc
+    if snap.access_count < last_acc:
+        qs.clear(); qm.clear(); qg.clear(); freq.clear()
+    
+    # Consistency check
+    if not snap.cache and (qs or qm):
+        qs.clear(); qm.clear(); qg.clear(); freq.clear()
+        
+    last_acc = snap.access_count
+
+def evict(cache_snapshot, obj):
+    global qs, qm, qg, freq
+    _check_reset(cache_snapshot)
+    
+    cap = cache_snapshot.capacity
+    s_target = max(1, int(cap * 0.1))
+    
+    # Safety loop limit to allow frequency decay to terminate
+    limit = len(cache_snapshot.cache) * 4
+    ops = 0
+    
+    while ops < limit:
+        ops += 1
+        
+        # 1. Check Small Queue (Probation)
+        # Evict from S if it exceeds target size or if Main is empty
+        if len(qs) > s_target or not qm:
+            if qs:
+                cand, _ = qs.popitem(last=False) # FIFO Eviction
+                f = freq.get(cand, 0)
+                if f > 0:
+                    # Promote to Main
+                    qm[cand] = None
+                    freq[cand] = 0 # Reset frequency
+                else:
+                    # Evict from Small -> Ghost
+                    qg[cand] = None
+                    # Expanded Ghost Capacity (5x) for large loop detection
+                    if len(qg) > cap * 5:
+                        qg.popitem(last=False)
+                    
+                    freq.pop(cand, None)
+                    return cand
+            else:
+                # Fallback if S is empty (should imply M is empty or logic requires M scan)
+                if qm:
+                    pass # Go to M check
+                else:
+                    break # Both empty
+        
+        # 2. Check Main Queue (Protected)
+        if qm:
+            cand, _ = qm.popitem(last=False) # LRU Eviction
+            f = freq.get(cand, 0)
+            if f > 0:
+                # Reinsert in Main with decay
+                qm[cand] = None
+                freq[cand] = f - 1
+            else:
+                # Demote to Small (Second Chance)
+                qs[cand] = None
+                freq[cand] = 0
+                # Continue loop; S likely grew, so next iter might check S
+
+    # Fallback
+    if cache_snapshot.cache:
+        return next(iter(cache_snapshot.cache))
+    return None
+
+def update_after_hit(cache_snapshot, obj):
+    global freq
+    _check_reset(cache_snapshot)
+    k = obj.key
+    # Increment frequency, capped at 3
+    freq[k] = min(freq.get(k, 0) + 1, 3)
+
+def update_after_insert(cache_snapshot, obj):
+    global qs, qm, qg, freq
+    _check_reset(cache_snapshot)
+    k = obj.key
+    
+    if k in qg:
+        # Ghost Hit: Promote directly to Main
+        qm[k] = None
+        freq[k] = 0
+        del qg[k]
+    else:
+        # New Insert: Place in Small
+        qs[k] = None
+        freq[k] = 0
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    global qs, qm, freq
+    _check_reset(cache_snapshot)
+    k = evicted_obj.key
+    # Ensure internal state is consistent
+    if k in qs: qs.pop(k)
+    if k in qm: qm.pop(k)
+    if k in freq: freq.pop(k)
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

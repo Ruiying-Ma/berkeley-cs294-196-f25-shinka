@@ -1,0 +1,206 @@
+<NAME>
+hot_bypass_recent_filter
+</NAME>
+
+<DESCRIPTION>
+I propose a targeted enhancement to the current W-TinyLFU + SLRU policy by adding a lightweight recent-seen filter and hot-item bypass on insert. The idea is to accelerate warm-up for very hot keys and keys that reappear shortly after eviction, without increasing scan pollution.
+
+Key changes:
+- Introduce a small recent-seen ring buffer (deque + set) sized to about 2×capacity (clamped to [64, 4096]) to cheaply remember recently accessed keys.
+- On every hit/insert, record the key in this recent filter.
+- On insert, if an item is estimated very hot by TinyLFU (est ≥ 5 normally, ≥ 6 during scan cooldown) or it appears in the recent filter, bypass the window and place it directly into the protected segment (M2). This reduces the time to stabilize the protected set and improves hits on phase-shifting/hot items.
+- Keep existing scan-aware bias and TinyLFU-gated W→M1 admission unchanged; retain frequency-aware demotions from M2 when it exceeds target.
+
+Why this helps:
+- Hot-item bypass reduces misses during warm-up and phase changes by allowing clearly hot items to get protection immediately instead of churning in the window.
+- The recent-seen filter captures temporal locality not fully recognized by the aging TinyLFU counters, improving admission decisions especially for quick re-references.
+- We keep the conservative bias during scans (higher thresholds and bias) to avoid polluting main with one-timers.
+
+The changes are minimal, cohesive, and consistent with existing logic: we add three fields to the policy state, initialize and size them with capacity, a small helper to record recency, record on hit/insert, and adjust on_insert to optionally bypass window. All other behavior remains intact, including eviction, demotion, and scan defenses.
+
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+from collections import OrderedDict
+=======
+from collections import OrderedDict, deque
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    __slots__ = (
+        "W", "M1", "M2", "capacity",
+        "win_frac", "prot_frac", "sketch", "_sample_k",
+        "hits_w", "hits_main", "last_tune_time", "tune_period",
+        "miss_streak", "scan_cooldown"
+    )
+=======
+    __slots__ = (
+        "W", "M1", "M2", "capacity",
+        "win_frac", "prot_frac", "sketch", "_sample_k",
+        "hits_w", "hits_main", "last_tune_time", "tune_period",
+        "miss_streak", "scan_cooldown",
+        "recent_ring", "recent_set", "recent_cap"
+    )
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Scan detection
+        self.miss_streak = 0
+        self.scan_cooldown = 0
+=======
+        # Scan detection
+        self.miss_streak = 0
+        self.scan_cooldown = 0
+        # Recent-seen filter for hot bypass
+        self.recent_ring = deque()
+        self.recent_set = set()
+        self.recent_cap = 0
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            # Set adaptive tuning period relative to capacity
+            self.tune_period = max(256, self.capacity * 4)
+            self.last_tune_time = 0
+            return
+=======
+            # Set adaptive tuning period relative to capacity
+            self.tune_period = max(256, self.capacity * 4)
+            self.last_tune_time = 0
+            # Size recent filter
+            self.recent_cap = max(64, min(4096, self.capacity * 2))
+            self.recent_ring.clear()
+            self.recent_set.clear()
+            return
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            try:
+                self.sketch.age_period = max(512, min(16384, self.capacity * 8))
+            except Exception:
+                pass
+            self.tune_period = max(256, self.capacity * 4)
+            self.last_tune_time = 0
+=======
+            try:
+                self.sketch.age_period = max(512, min(16384, self.capacity * 8))
+            except Exception:
+                pass
+            self.tune_period = max(256, self.capacity * 4)
+            self.last_tune_time = 0
+            # Resize recent filter
+            self.recent_cap = max(64, min(4096, self.capacity * 2))
+            self.recent_ring.clear()
+            self.recent_set.clear()
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def _touch(self, od: OrderedDict, key: str):
+        od[key] = None
+        od.move_to_end(key)
+
+    def _sample_lru_min_freq(self, od: OrderedDict) -> str:
+=======
+    def _touch(self, od: OrderedDict, key: str):
+        od[key] = None
+        od.move_to_end(key)
+
+    def _record_recent(self, key: str):
+        if self.recent_cap <= 0:
+            return
+        if key in self.recent_set:
+            return
+        self.recent_ring.append(key)
+        self.recent_set.add(key)
+        if len(self.recent_ring) > self.recent_cap:
+            old = self.recent_ring.popleft()
+            if old != key:
+                self.recent_set.discard(old)
+
+    def _sample_lru_min_freq(self, od: OrderedDict) -> str:
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        key = obj.key
+        self.sketch.increment(key, 1)
+
+        # Any hit resets the ongoing miss streak and cools down scan bias
+=======
+        key = obj.key
+        self.sketch.increment(key, 1)
+        self._record_recent(key)
+
+        # Any hit resets the ongoing miss streak and cools down scan bias
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Update scan detector: count consecutive misses
+        self.miss_streak += 1
+        if self.miss_streak > (self.capacity or 1):
+            # Enter/extend scan-biased cooldown
+            self.scan_cooldown = max(self.scan_cooldown, self.capacity or 1)
+        else:
+            # Gradually cool down if not clearly scanning
+            if self.scan_cooldown > 0:
+                self.scan_cooldown -= 1
+
+        # Ensure it's not tracked elsewhere
+        self.W.pop(key, None)
+        self.M1.pop(key, None)
+        self.M2.pop(key, None)
+
+        # Insert into window
+        self._touch(self.W, key)
+=======
+        # Update scan detector: count consecutive misses
+        self.miss_streak += 1
+        if self.miss_streak > (self.capacity or 1):
+            # Enter/extend scan-biased cooldown
+            self.scan_cooldown = max(self.scan_cooldown, self.capacity or 1)
+        else:
+            # Gradually cool down if not clearly scanning
+            if self.scan_cooldown > 0:
+                self.scan_cooldown -= 1
+
+        # Record recent for hot-bypass signal
+        self._record_recent(key)
+
+        # Ensure it's not tracked elsewhere
+        self.W.pop(key, None)
+        self.M1.pop(key, None)
+        self.M2.pop(key, None)
+
+        # Decide placement: hot bypass to protected if very hot or seen recently
+        thr_hot = 6 if self.scan_cooldown > 0 else 5
+        est = self.sketch.estimate(key)
+        is_recent = key in self.recent_set
+        if est >= thr_hot or is_recent:
+            # Directly place in protected
+            self._touch(self.M2, key)
+        else:
+            # Insert into window
+            self._touch(self.W, key)
+>>>>>>> REPLACE
+
+</DIFF>

@@ -1,0 +1,430 @@
+<NAME>
+arc_lrfu_with_ghosts_and_adaptive_split
+</NAME>
+
+<DESCRIPTION>
+I introduce ARC-style ghost lists (B1, B2) and an adaptive split between the probationary (recency) and protected (frequency) segments, while keeping the LRFU decayed-frequency scoring for victim selection and tie-breaking. This hybrid makes promotion/demotion and eviction decisions more stable across diverse workloads.
+
+Key changes:
+- Add B1/B2 ghost lists and maintain them with a bound |B1| + |B2| ≤ capacity.
+- Maintain an adaptive target size for T1 (probationary) via a smoothed parameter p updated on ghost re-references: B1 hits increase p (favor recency), B2 hits decrease p (favor frequency).
+- Eviction uses ARC’s replace logic: evict from probationary if its size exceeds the current target; otherwise from protected. Within a chosen segment, evict the key with the minimum decayed-frequency score (LRFU), preserving the algorithm’s frequency sensitivity.
+- On insert, detect ghost hits and adapt p accordingly; on evict, record the evicted key into the appropriate ghost list. On hits, maintain LRFU scoring and segmented LRU, demoting from protected only when it exceeds the dynamically computed target.
+- Add gentle smoothing (ADAPT_ALPHA) to reduce oscillation, increase robustness to scans, and improve cross-workload performance.
+
+This evolution blends ARC’s adaptivity and ghost-based learning with the current SLRU+LRFU core, improving miss rates in both recency- and frequency-dominated traces.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+from collections import OrderedDict
+
+# Configuration: half-life in number of accesses for score decay.
+# After DECAY_HALF_LIFE accesses without a hit, a key's score halves.
+DECAY_HALF_LIFE = 16
+DECAY_BASE = 2 ** (-1.0 / DECAY_HALF_LIFE)
+
+# Per-key metadata for cached objects
+_key_score = dict()      # key -> float decayed frequency score
+_key_last_time = dict()  # key -> int last access_count when we updated its score
+
+# Segmented LRU state
+_prob_od = OrderedDict()  # probationary: admitted on first insert
+_prot_od = OrderedDict()  # protected: promoted on second touch
+=======
+from collections import OrderedDict
+
+# Configuration: half-life in number of accesses for score decay.
+# After DECAY_HALF_LIFE accesses without a hit, a key's score halves.
+DECAY_HALF_LIFE = 16
+DECAY_BASE = 2 ** (-1.0 / DECAY_HALF_LIFE)
+# Smoothing factor for adaptive split tuning (ARC-inspired)
+ADAPT_ALPHA = 0.25
+
+# Per-key metadata for cached objects
+_key_score = dict()      # key -> float decayed frequency score
+_key_last_time = dict()  # key -> int last access_count when we updated its score
+
+# Segmented LRU state
+_prob_od = OrderedDict()  # probationary: admitted on first insert
+_prot_od = OrderedDict()  # protected: promoted on second touch
+
+# ARC-style ghost lists and adaptive T1 (probationary) target
+_ghost_b1 = OrderedDict()  # non-resident: recently evicted from probationary (T1)
+_ghost_b2 = OrderedDict()  # non-resident: recently evicted from protected (T2)
+_t1_target = None          # float desired size for probationary (T1)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def _target_protected_size(capacity: int) -> int:
+    """Fixed split: ~70% protected, clamped to [0, capacity]."""
+    if capacity <= 1:
+        return capacity  # degenerate caches keep single item in protected after promotion
+    tgt = int(round(capacity * 0.7))
+    if tgt < 1:
+        tgt = 1
+    if tgt > capacity:
+        tgt = capacity
+    return tgt
+=======
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def _ensure_targets(capacity: int):
+    """Initialize and clamp adaptive T1 target."""
+    global _t1_target
+    if _t1_target is None:
+        # Start with ~30% probationary by default
+        _t1_target = float(max(0, int(round(capacity * 0.3))))
+    else:
+        _t1_target = _clamp(float(_t1_target), 0.0, float(capacity))
+
+
+def _get_targets(capacity: int):
+    """Return integer targets (t1_target, t2_target) that sum to <= capacity."""
+    _ensure_targets(capacity)
+    t1 = int(round(_t1_target))
+    if t1 < 0:
+        t1 = 0
+    if t1 > capacity:
+        t1 = capacity
+    t2 = max(0, capacity - t1)
+    return t1, t2
+
+
+def _target_protected_size(capacity: int) -> int:
+    """Adaptive protected (T2) target = capacity - T1_target."""
+    _, t2 = _get_targets(capacity)
+    return t2
+
+
+def _trim_ghosts(capacity: int):
+    """Bound |B1| + |B2| ≤ capacity, using ARC policy."""
+    _ensure_targets(capacity)
+    t1_int, _ = _get_targets(capacity)
+    while (len(_ghost_b1) + len(_ghost_b2)) > capacity:
+        if len(_ghost_b1) > t1_int:
+            # Remove LRU from B1
+            try:
+                _ghost_b1.popitem(last=False)
+            except KeyError:
+                break
+        else:
+            # Remove LRU from B2
+            try:
+                _ghost_b2.popitem(last=False)
+            except KeyError:
+                break
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def _self_heal_segments(cache_snapshot):
+    """Ensure segment membership matches current cache contents (robust to resets)."""
+    now = cache_snapshot.access_count
+    cache_keys = set(cache_snapshot.cache.keys())
+    # Remove any leftovers not in cache
+    for k in list(_prob_od.keys()):
+        if k not in cache_keys:
+            _prob_od.pop(k, None)
+    for k in list(_prot_od.keys()):
+        if k not in cache_keys:
+            _prot_od.pop(k, None)
+    # Add any missing cached keys into probationary
+    known = set(_prob_od.keys()) | set(_prot_od.keys())
+    missing = cache_keys - known
+    if missing:
+        for k in missing:
+            _prob_od[k] = None
+            _ensure_meta(k, now)
+=======
+def _self_heal_segments(cache_snapshot):
+    """Ensure segment membership matches current cache contents (robust to resets)."""
+    now = cache_snapshot.access_count
+    capacity = cache_snapshot.capacity
+    _ensure_targets(capacity)
+
+    cache_keys = set(cache_snapshot.cache.keys())
+    # Remove any leftovers not in cache
+    for k in list(_prob_od.keys()):
+        if k not in cache_keys:
+            _prob_od.pop(k, None)
+    for k in list(_prot_od.keys()):
+        if k not in cache_keys:
+            _prot_od.pop(k, None)
+    # Add any missing cached keys into probationary
+    known = set(_prob_od.keys()) | set(_prot_od.keys())
+    missing = cache_keys - known
+    if missing:
+        for k in missing:
+            _prob_od[k] = None
+            _ensure_meta(k, now)
+    # Ghosts: drop any entries that re-entered the cache
+    for k in list(_ghost_b1.keys()):
+        if k in cache_keys:
+            _ghost_b1.pop(k, None)
+    for k in list(_ghost_b2.keys()):
+        if k in cache_keys:
+            _ghost_b2.pop(k, None)
+    # Keep ghost lists within bound
+    _trim_ghosts(capacity)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    now = cache_snapshot.access_count
+    _self_heal_segments(cache_snapshot)
+
+    # Prefer evicting from probationary; if empty, evict from protected.
+    if _prob_od:
+        victim = _min_key_by_score(list(_prob_od.keys()), now)
+        return victim
+    if _prot_od:
+        victim = _min_key_by_score(list(_prot_od.keys()), now)
+        return victim
+
+    # Fallback: compute across entire cache (should be rare)
+    return _min_key_by_score(list(cache_snapshot.cache.keys()), now)
+=======
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    now = cache_snapshot.access_count
+    _self_heal_segments(cache_snapshot)
+
+    # ARC-style replace: evict from probationary (T1) if it is above its target, else from protected (T2).
+    t1_target_int, _ = _get_targets(cache_snapshot.capacity)
+
+    if _prob_od and (len(_prob_od) > t1_target_int or not _prot_od):
+        return _min_key_by_score(list(_prob_od.keys()), now)
+    if _prot_od:
+        return _min_key_by_score(list(_prot_od.keys()), now)
+
+    # Fallback: compute across entire cache (should be rare)
+    return _min_key_by_score(list(cache_snapshot.cache.keys()), now)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    now = cache_snapshot.access_count
+    _self_heal_segments(cache_snapshot)
+
+    # LRFU score update with exponential decay
+    _ensure_meta(obj.key, now)
+    s, _ = _decay_and_get_score(obj.key, now)
+    _key_score[obj.key] = s + 1.0  # frequency boost already decayed to 'now'
+
+    # SLRU segment updates
+    if obj.key in _prot_od:
+        # Touch MRU in protected
+        _prot_od.move_to_end(obj.key, last=True)
+    elif obj.key in _prob_od:
+        # Promote to protected
+        _prob_od.pop(obj.key, None)
+        _prot_od[obj.key] = None
+        # Demote from protected if it exceeds target
+        tgt = _target_protected_size(cache_snapshot.capacity)
+        if len(_prot_od) > tgt:
+            demote_key = _min_key_by_score(list(_prot_od.keys()), now)
+            if demote_key is not None:
+                _prot_od.pop(demote_key, None)
+                _prob_od[demote_key] = None
+    else:
+        # Defensive: cache hit but not tracked; treat as protected touch
+        _prot_od[obj.key] = None
+        tgt = _target_protected_size(cache_snapshot.capacity)
+        if len(_prot_od) > tgt:
+            demote_key = _min_key_by_score(list(_prot_od.keys()), now)
+            if demote_key is not None:
+                _prot_od.pop(demote_key, None)
+                _prob_od[demote_key] = None
+=======
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    now = cache_snapshot.access_count
+    _self_heal_segments(cache_snapshot)
+
+    # LRFU score update with exponential decay
+    _ensure_meta(obj.key, now)
+    s, _ = _decay_and_get_score(obj.key, now)
+    _key_score[obj.key] = s + 1.0  # frequency boost already decayed to 'now'
+
+    # Remove any ghost record since it's resident now
+    _ghost_b1.pop(obj.key, None)
+    _ghost_b2.pop(obj.key, None)
+
+    # SLRU segment updates
+    if obj.key in _prot_od:
+        # Touch MRU in protected
+        _prot_od.move_to_end(obj.key, last=True)
+    elif obj.key in _prob_od:
+        # Promote to protected
+        _prob_od.pop(obj.key, None)
+        _prot_od[obj.key] = None
+        # Demote from protected if it exceeds adaptive target
+        tgt = _target_protected_size(cache_snapshot.capacity)
+        if len(_prot_od) > tgt:
+            demote_key = _min_key_by_score(list(_prot_od.keys()), now)
+            if demote_key is not None:
+                _prot_od.pop(demote_key, None)
+                _prob_od[demote_key] = None
+    else:
+        # Defensive: cache hit but not tracked; treat as protected touch
+        _prot_od[obj.key] = None
+        tgt = _target_protected_size(cache_snapshot.capacity)
+        if len(_prot_od) > tgt:
+            demote_key = _min_key_by_score(list(_prot_od.keys()), now)
+            if demote_key is not None:
+                _prot_od.pop(demote_key, None)
+                _prob_od[demote_key] = None
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    now = cache_snapshot.access_count
+    # Initialize metadata with modest score to reduce scan pollution
+    _key_last_time[obj.key] = now
+    _key_score[obj.key] = 0.5
+
+    # Insert into probationary MRU
+    _prob_od.pop(obj.key, None)
+    _prot_od.pop(obj.key, None)
+    _prob_od[obj.key] = None
+=======
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    now = cache_snapshot.access_count
+    capacity = cache_snapshot.capacity
+    _ensure_targets(capacity)
+
+    # ARC-style adaptation on ghost re-reference (miss followed by insert)
+    in_b1 = obj.key in _ghost_b1
+    in_b2 = obj.key in _ghost_b2
+    if in_b1 or in_b2:
+        global _t1_target
+        # Compute damped delta as in ARC (smoothed by ADAPT_ALPHA)
+        if in_b1:
+            # Favor recency: increase T1 target
+            delta = 1.0
+            if len(_ghost_b1) > 0:
+                delta = max(1.0, len(_ghost_b2) / float(len(_ghost_b1)))
+            _t1_target = _clamp(float(_t1_target) + ADAPT_ALPHA * delta, 0.0, float(capacity))
+        elif in_b2:
+            # Favor frequency: decrease T1 target
+            delta = 1.0
+            if len(_ghost_b2) > 0:
+                delta = max(1.0, len(_ghost_b1) / float(len(_ghost_b2)))
+            _t1_target = _clamp(float(_t1_target) - ADAPT_ALPHA * delta, 0.0, float(capacity))
+    # Remove any ghost entry for this key and trim ghosts
+    _ghost_b1.pop(obj.key, None)
+    _ghost_b2.pop(obj.key, None)
+    _trim_ghosts(capacity)
+
+    # Initialize metadata with modest score to reduce scan pollution
+    _key_last_time[obj.key] = now
+    _key_score[obj.key] = 0.5
+
+    # Insert into probationary MRU
+    _prob_od.pop(obj.key, None)
+    _prot_od.pop(obj.key, None)
+    _prob_od[obj.key] = None
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    # Purge from segments and metadata
+    _prob_od.pop(evicted_obj.key, None)
+    _prot_od.pop(evicted_obj.key, None)
+    _key_score.pop(evicted_obj.key, None)
+    _key_last_time.pop(evicted_obj.key, None)
+=======
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    capacity = cache_snapshot.capacity
+    # Determine source segment before removing
+    from_prob = evicted_obj.key in _prob_od
+    from_prot = evicted_obj.key in _prot_od
+
+    # Purge from segments and metadata
+    _prob_od.pop(evicted_obj.key, None)
+    _prot_od.pop(evicted_obj.key, None)
+    _key_score.pop(evicted_obj.key, None)
+    _key_last_time.pop(evicted_obj.key, None)
+
+    # Record into ghost lists (ARC): B1 if from probationary else B2
+    _ghost_b1.pop(evicted_obj.key, None)
+    _ghost_b2.pop(evicted_obj.key, None)
+    if from_prob or (not from_prot):
+        _ghost_b1[evicted_obj.key] = None
+    else:
+        _ghost_b2[evicted_obj.key] = None
+    _trim_ghosts(capacity)
+>>>>>>> REPLACE
+</DIFF>

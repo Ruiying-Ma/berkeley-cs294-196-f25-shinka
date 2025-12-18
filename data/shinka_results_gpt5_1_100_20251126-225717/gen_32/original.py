@@ -1,0 +1,241 @@
+# EVOLVE-BLOCK-START
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+
+from collections import OrderedDict
+
+# Legacy timestamp dictionary kept for compatibility; used as a general access ledger.
+m_key_timestamp = dict()
+
+# Segmented LRU metadata: probation and protected segments (key -> last access time)
+_probation = dict()
+_protected = dict()
+
+# ARC-style ghost histories (recently evicted):
+_B1_ghost = OrderedDict()  # evicted from probation
+_B2_ghost = OrderedDict()  # evicted from protected
+
+# Adaptive target for probation share (ARC's p) and capacity estimate
+_p_target = 0.0
+_cap_est = 0
+
+def _ensure_capacity(cache_snapshot):
+    """Initialize/refresh capacity estimate and clamp p within [0, cap]."""
+    global _cap_est, _p_target
+    cap = getattr(cache_snapshot, "capacity", None)
+    if isinstance(cap, int) and cap > 0:
+        _cap_est = cap
+    if _cap_est <= 0:
+        _cap_est = max(1, len(cache_snapshot.cache))
+    # Initialize p only once when metadata is empty
+    if _p_target == 0.0 and not _probation and not _protected and not _B1_ghost and not _B2_ghost:
+        # Start with modest probation share
+        _p_target = min(float(_cap_est), max(0.0, float(_cap_est) * 0.33))
+    # Clamp p
+    if _p_target < 0.0:
+        _p_target = 0.0
+    if _p_target > float(_cap_est):
+        _p_target = float(_cap_est)
+
+def _ghost_trim():
+    """Bound ghost lists by capacity."""
+    while len(_B1_ghost) > _cap_est:
+        _B1_ghost.popitem(last=False)
+    while len(_B2_ghost) > _cap_est:
+        _B2_ghost.popitem(last=False)
+
+def _get_caps(cache_snapshot):
+    """Compute static target sizes for probation and protected segments (legacy helper)."""
+    total_cap = max(int(getattr(cache_snapshot, "capacity", 1)), 1)
+    # Favor protected segment to keep repeatedly used items
+    prot_cap = max(int(total_cap * 0.66), 1 if total_cap > 1 else 0)
+    prob_cap = max(total_cap - prot_cap, 1)
+    return prob_cap, prot_cap
+
+def _get_targets(cache_snapshot):
+    """Compute ARC targets from p: T1 target = round(p), T2 target = cap - T1 target."""
+    _ensure_capacity(cache_snapshot)
+    t1_target = int(round(_p_target))
+    t2_target = max(_cap_est - t1_target, 0)
+    return t1_target, t2_target
+
+def _lru_key_in(seg_dict, cache_snapshot):
+    """Return the LRU key from seg_dict that is currently in the cache."""
+    min_key = None
+    min_ts = None
+    # Iterate only over keys that are in the current cache snapshot
+    cache_keys = cache_snapshot.cache.keys()
+    for k, ts in seg_dict.items():
+        if k in cache_keys:
+            if (min_ts is None) or (ts < min_ts):
+                min_ts = ts
+                min_key = k
+    return min_key
+
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    _ensure_capacity(cache_snapshot)
+
+    # ARC REPLACE(x): if |T1|>=1 and ((x in B2 and |T1| == p) or |T1| > p) -> evict from T1 else from T2
+    t1_size = len(_probation)
+    x_in_b2 = (obj is not None) and (obj.key in _B2_ghost)
+    p_int = int(round(_p_target))
+    choose_t1 = (t1_size >= 1) and ((x_in_b2 and t1_size == p_int) or (t1_size > _p_target))
+
+    candid_obj_key = None
+    if choose_t1:
+        candid_obj_key = _lru_key_in(_probation, cache_snapshot)
+    if candid_obj_key is None:
+        candid_obj_key = _lru_key_in(_protected, cache_snapshot)
+    if candid_obj_key is None:
+        # Last-resort fallback: pick any key from the cache (should rarely happen).
+        for k in cache_snapshot.cache:
+            candid_obj_key = k
+            break
+    return candid_obj_key
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_key_timestamp, _probation, _protected
+    _ensure_capacity(cache_snapshot)
+    current_ts = cache_snapshot.access_count
+    k = obj.key
+
+    # Maintain a general timestamp ledger for robustness.
+    m_key_timestamp[k] = current_ts
+
+    if k in _probation:
+        # Promote to protected on second touch.
+        _probation.pop(k, None)
+        _protected[k] = current_ts
+    elif k in _protected:
+        # Refresh recency within protected.
+        _protected[k] = current_ts
+    else:
+        # Metadata miss: treat as a re-reference and place in protected.
+        _protected[k] = current_ts
+
+    # Respect ARC target for protected by demoting its LRU if needed.
+    _, t2_target = _get_targets(cache_snapshot)
+    if len(_protected) > t2_target:
+        demote_key = _lru_key_in(_protected, cache_snapshot)
+        if demote_key is not None and demote_key != k:
+            demote_ts = _protected.pop(demote_key)
+            _probation[demote_key] = demote_ts
+
+    # If present in ghosts, clear and bound ghost history
+    if k in _B1_ghost:
+        _B1_ghost.pop(k, None)
+    if k in _B2_ghost:
+        _B2_ghost.pop(k, None)
+    _ghost_trim()
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp, _probation, _protected, _p_target
+    _ensure_capacity(cache_snapshot)
+    current_ts = cache_snapshot.access_count
+    k = obj.key
+
+    # Record in general ledger
+    m_key_timestamp[k] = current_ts
+
+    in_b1 = k in _B1_ghost
+    in_b2 = k in _B2_ghost
+
+    if in_b1 or in_b2:
+        # ARC adaptation of p and re-admit into protected
+        if in_b1:
+            inc = max(1.0, float(len(_B2_ghost)) / max(1.0, float(len(_B1_ghost))))
+            _p_target = min(float(_cap_est), _p_target + inc)
+            _B1_ghost.pop(k, None)
+        else:
+            dec = max(1.0, float(len(_B1_ghost)) / max(1.0, float(len(_B2_ghost))))
+            _p_target = max(0.0, _p_target - dec)
+            _B2_ghost.pop(k, None)
+        _protected[k] = current_ts
+
+        # Keep protected within its target by demoting its LRU if necessary
+        _, t2_target = _get_targets(cache_snapshot)
+        if len(_protected) > t2_target:
+            demote_key = _lru_key_in(_protected, cache_snapshot)
+            if demote_key is not None and demote_key != k:
+                demote_ts = _protected.pop(demote_key)
+                _probation[demote_key] = demote_ts
+    else:
+        # New to cache and ghosts: insert into probation
+        _probation[k] = current_ts
+
+    _ghost_trim()
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp, _probation, _protected
+    _ensure_capacity(cache_snapshot)
+    # Remove evicted key from segments and add to appropriate ghost history.
+    if evicted_obj is not None:
+        k = evicted_obj.key
+        was_t1 = k in _probation
+        was_t2 = k in _protected
+
+        _probation.pop(k, None)
+        _protected.pop(k, None)
+        m_key_timestamp.pop(k, None)
+
+        if was_t1:
+            _B1_ghost[k] = True  # insert as MRU in ghost
+        elif was_t2:
+            _B2_ghost[k] = True
+        else:
+            # Unknown residency; default to B1
+            _B1_ghost[k] = True
+
+        _ghost_trim()
+    # Do not add obj here; it will be handled in update_after_insert.
+
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

@@ -1,0 +1,210 @@
+<NAME>
+implement_s3_fifo
+</NAME>
+
+<DESCRIPTION>
+I propose replacing the Segmented LRU (SLRU) algorithm with S3-FIFO (Simple, Scalable, Static FIFO). S3-FIFO is a state-of-the-art eviction algorithm that often outperforms LRU and SLRU by using three queues: a Small FIFO queue (S) for new insertions (filtering out one-hit wonders), a Main FIFO queue (M) for popular items, and a Ghost queue (G) to track history of evicted items from S.
+
+The logic:
+1.  **Insertion**: New items enter `S`. If the item is in `G` (meaning it was evicted from `S` recently), it is promoted to `M`.
+2.  **Eviction**:
+    -   If `S` is larger than 10% of capacity, we inspect the tail of `S`. If accessed recently, it's moved to `M`. Otherwise, it's evicted and added to `G`.
+    -   Otherwise, we inspect the tail of `M`. If accessed recently, it's reinserted to `M` (giving it a second chance). Otherwise, it's evicted.
+3.  **Hits**: Only update a frequency counter (capped at 3). Movement happens lazily during eviction.
+
+This approach is scan-resistant (scans flush through `S` without affecting `M`) and handles looping patterns better via the Ghost queue.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+# Segmented LRU (SLRU) Metadata
+# slru_probation: dict for probationary segment (ordered by access/insertion)
+# slru_protected: dict for protected segment (ordered by access)
+slru_probation = {}
+slru_protected = {}
+
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    SLRU Strategy: Evict from Probation (LRU) first. If empty, evict from Protected (LRU).
+    '''
+    global slru_probation, slru_protected
+
+    # Check consistency: if global state is misaligned with cache_snapshot (e.g. due to restart), clean up
+    # However, iterating to clean up is costly. We assume consistent environment or handle missing keys gracefully.
+
+    # Priority 1: Evict from Probation
+    if slru_probation:
+        # The dictionary preserves insertion order.
+        # Since we re-insert on access (in update_after_hit/insert),
+        # the first item is the Least Recently Used/Inserted.
+        return next(iter(slru_probation))
+
+    # Priority 2: Evict from Protected
+    if slru_protected:
+        return next(iter(slru_protected))
+
+    # Fallback if both empty (should imply cache is empty, but evict called means full?)
+    if cache_snapshot.cache:
+        return next(iter(cache_snapshot.cache))
+    return None
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    SLRU Update on Hit:
+    - If in Probation: Promote to Protected. Enforce Protected capacity.
+    - If in Protected: Update LRU (move to MRU).
+    '''
+    global slru_probation, slru_protected
+
+    key = obj.key
+    if key in slru_probation:
+        # Remove from Probation
+        slru_probation.pop(key)
+        # Add to Protected (MRU)
+        slru_protected[key] = None
+
+        # Enforce Protected Capacity (e.g., 80% of total capacity)
+        # Using 80% is a common heuristic for SLRU
+        protected_limit = int(cache_snapshot.capacity * 0.8)
+        if len(slru_protected) > protected_limit:
+            # Demote LRU of Protected to Probation (MRU)
+            demoted_key = next(iter(slru_protected))
+            slru_protected.pop(demoted_key)
+            slru_probation[demoted_key] = None
+
+    elif key in slru_protected:
+        # Move to MRU in Protected
+        slru_protected.pop(key)
+        slru_protected[key] = None
+
+    else:
+        # Consistency recovery: if hit but not in our records, treat as inserted in probation?
+        # Or maybe it was just inserted?
+        # For safety, add to probation if not present.
+        slru_probation[key] = None
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    SLRU Update on Insert:
+    - New objects go to Probation (MRU).
+    '''
+    global slru_probation, slru_protected
+    slru_probation[obj.key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    SLRU Update on Evict:
+    - Remove evicted object from metadata.
+    '''
+    global slru_probation, slru_protected
+    key = evicted_obj.key
+    if key in slru_probation:
+        slru_probation.pop(key)
+    elif key in slru_protected:
+        slru_protected.pop(key)
+=======
+# S3-FIFO Metadata
+# s3_small: FIFO queue for the small segment (probation)
+# s3_main: FIFO queue for the main segment (protected)
+# s3_ghost: Ghost cache for tracking eviction from small
+# s3_freq: Frequency counter for objects (max 3)
+s3_small = {}
+s3_main = {}
+s3_ghost = {}
+s3_freq = {}
+
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO Eviction Policy:
+    - Keeps a small FIFO queue (S) for new items and a large FIFO queue (M) for popular items.
+    - Uses a Ghost queue (G) to track evicted items from S.
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+
+    capacity = cache_snapshot.capacity
+    # Target size for Small queue (10% of capacity)
+    s_capacity = max(1, int(capacity * 0.1))
+
+    # Lazy cleanup of ghost
+    while len(s3_ghost) > capacity:
+        s3_ghost.pop(next(iter(s3_ghost)))
+
+    while True:
+        # Decision: Evict from Small or Main?
+        # If Small is larger than target, evict from Small.
+        # Also if Main is empty, we must evict from Small.
+        if len(s3_small) >= s_capacity or not s3_main:
+            if not s3_small:
+                # Should not happen if cache is full and Main is empty
+                return None
+
+            candidate = next(iter(s3_small))
+            freq = s3_freq.get(candidate, 0)
+
+            if freq > 0:
+                # Second Chance: Move to Main
+                s3_small.pop(candidate)
+                s3_main[candidate] = None
+                s3_freq[candidate] = 0
+                continue
+            else:
+                # Victim found in Small
+                return candidate
+
+        else:
+            # Evict from Main
+            candidate = next(iter(s3_main))
+            freq = s3_freq.get(candidate, 0)
+
+            if freq > 0:
+                # Second Chance: Reinsert to Main tail
+                s3_main.pop(candidate)
+                s3_main[candidate] = None
+                s3_freq[candidate] = 0
+                continue
+            else:
+                # Victim found in Main
+                return candidate
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    S3-FIFO Update on Hit:
+    - Increment frequency (cap at 3).
+    '''
+    global s3_freq
+    s3_freq[obj.key] = min(s3_freq.get(obj.key, 0) + 1, 3)
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    S3-FIFO Update on Insert:
+    - If in Ghost, insert to Main. Else insert to Small.
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+    key = obj.key
+    s3_freq[key] = 0
+
+    if key in s3_ghost:
+        s3_main[key] = None
+        s3_ghost.pop(key)
+    else:
+        s3_small[key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    S3-FIFO Update on Evict:
+    - Remove from queues. If evicted from Small, add to Ghost.
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+    key = evicted_obj.key
+
+    if key in s3_small:
+        s3_small.pop(key)
+        s3_ghost[key] = None
+    elif key in s3_main:
+        s3_main.pop(key)
+
+    if key in s3_freq:
+        s3_freq.pop(key)
+>>>>>>> REPLACE
+</DIFF>

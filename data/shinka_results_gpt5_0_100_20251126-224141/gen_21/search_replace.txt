@@ -1,0 +1,303 @@
+<NAME>
+arc_ghost_proportional_and_invariant_fixes
+</NAME>
+
+<DESCRIPTION>
+I propose strengthening the ARC mechanics to reduce miss rate by making ghosts more informative and enforcing stricter invariants:
+
+1) Proportional ghost trimming: Maintain |B1| + |B2| ≤ 2C with trimming biased to keep |B1| roughly proportional to p and |B2| to C-p. This preserves a balanced history that better steers p for mixed workloads and scans.
+
+2) Disjointness and resync hygiene: Ensure B1/B2 never contain resident keys by removing any ghost entries that become (or are) resident. This keeps sets consistent, preventing misleading ghost hits and drift that degrades REPLACE decisions.
+
+3) Robust eviction path: Before taking a non-ARC fallback, try to resync and re-run REPLACE; this reduces reliance on fallbacks caused by rare metadata drift.
+
+4) Ghost-consistent eviction bookkeeping: When moving evicted residents into B1/B2, always remove them from the opposite ghost list to keep sets disjoint; if membership is unknown, prefer keeping it in the ghost it’s already in.
+
+These targeted changes align with canonical ARC practices and the provided recommendations, improving stability and adaptation across diverse traces without altering the core ARC flow.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def trim_ghosts(cls):
+        # Keep total ghosts ≤ 2×capacity; evict from the larger first
+        total = len(cls.B1) + len(cls.B2)
+        limit = 2 * (cls.capacity if cls.capacity is not None else 1)
+        while total > limit:
+            if len(cls.B1) >= len(cls.B2):
+                cls.pop_lru(cls.B1)
+            else:
+                cls.pop_lru(cls.B2)
+            total = len(cls.B1) + len(cls.B2)
+=======
+    def trim_ghosts(cls):
+        # Keep total ghosts ≤ 2×capacity; bias trimming to proportional targets:
+        # |B1| ≈ 2C * (p/C) and |B2| ≈ 2C * ((C-p)/C)
+        total = len(cls.B1) + len(cls.B2)
+        C = (cls.capacity if cls.capacity is not None else 1)
+        limit = 2 * C
+        # Compute proportional targets
+        if C <= 0:
+            target_b1 = 0
+        else:
+            target_b1 = int(round(limit * (cls.p / float(C))))
+            target_b1 = max(0, min(limit, target_b1))
+        target_b2 = max(0, limit - target_b1)
+        while total > limit:
+            over_b1 = len(cls.B1) - target_b1
+            over_b2 = len(cls.B2) - target_b2
+            # Evict from the list exceeding its target more; break ties by the larger list
+            if over_b1 > 0 and (over_b1 >= over_b2 or over_b2 <= 0):
+                cls.pop_lru(cls.B1)
+            elif over_b2 > 0:
+                cls.pop_lru(cls.B2)
+            else:
+                # Neither exceeds target specifically; evict from the larger
+                if len(cls.B1) >= len(cls.B2):
+                    cls.pop_lru(cls.B1)
+                else:
+                    cls.pop_lru(cls.B2)
+            total = len(cls.B1) + len(cls.B2)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def resync(cls, cache_snapshot):
+        # Ensure resident metadata tracks actual cache content
+        cache_keys = set(cache_snapshot.cache.keys())
+        for k in list(cls.T1.keys()):
+            if k not in cache_keys:
+                cls.T1.pop(k, None)
+        for k in list(cls.T2.keys()):
+            if k not in cache_keys:
+                cls.T2.pop(k, None)
+        # Any cached keys not tracked: assume recent (T1)
+        for k in cache_keys:
+            if k not in cls.T1 and k not in cls.T2:
+                cls.T1[k] = True
+        cls.trim_ghosts()
+=======
+    def resync(cls, cache_snapshot):
+        # Ensure resident metadata tracks actual cache content
+        cache_keys = set(cache_snapshot.cache.keys())
+        for k in list(cls.T1.keys()):
+            if k not in cache_keys:
+                cls.T1.pop(k, None)
+        for k in list(cls.T2.keys()):
+            if k not in cache_keys:
+                cls.T2.pop(k, None)
+        # Any cached keys not tracked: assume recent (T1)
+        for k in cache_keys:
+            if k not in cls.T1 and k not in cls.T2:
+                cls.T1[k] = True
+        # Keep ghosts disjoint from residents
+        for k in list(cls.B1.keys()):
+            if k in cls.T1 or k in cls.T2:
+                cls.B1.pop(k, None)
+        for k in list(cls.B2.keys()):
+            if k in cls.T1 or k in cls.T2:
+                cls.B2.pop(k, None)
+        cls.trim_ghosts()
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    ARCPlus.ensure_capacity(cache_snapshot)
+    # Keep metadata consistent and apply p-decay
+    if (len(ARCPlus.T1) + len(ARCPlus.T2)) != len(cache_snapshot.cache):
+        ARCPlus.resync(cache_snapshot)
+    ARCPlus.decay_p_if_idle(cache_snapshot)
+
+    candidate = ARCPlus.choose_victim(obj.key)
+    if candidate is not None:
+        return candidate
+    # Fallback path
+    return ARCPlus.fallback_victim(cache_snapshot)
+=======
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    ARCPlus.ensure_capacity(cache_snapshot)
+    # Keep metadata consistent and apply p-decay
+    if (len(ARCPlus.T1) + len(ARCPlus.T2)) != len(cache_snapshot.cache):
+        ARCPlus.resync(cache_snapshot)
+    ARCPlus.decay_p_if_idle(cache_snapshot)
+
+    candidate = ARCPlus.choose_victim(obj.key)
+    if candidate is not None:
+        return candidate
+    # Try to repair metadata and retry ARC replacement before falling back
+    ARCPlus.resync(cache_snapshot)
+    candidate = ARCPlus.choose_victim(obj.key)
+    if candidate is not None:
+        return candidate
+    # Fallback path
+    return ARCPlus.fallback_victim(cache_snapshot)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def on_hit(cls, cache_snapshot, key):
+        # Immediate promotion to T2 (standard ARC)
+        if key in cls.T1:
+            cls.T1.pop(key, None)
+            cls.move_to_mru(cls.T2, key)
+        elif key in cls.T2:
+            cls.move_to_mru(cls.T2, key)
+        else:
+            # Drift: still a hit; place in T2 to reflect reuse
+            cls.move_to_mru(cls.T2, key)
+        # Update timestamp
+        cls.ts[key] = cache_snapshot.access_count
+=======
+    def on_hit(cls, cache_snapshot, key):
+        # Immediate promotion to T2 (standard ARC)
+        if key in cls.T1:
+            cls.T1.pop(key, None)
+            cls.move_to_mru(cls.T2, key)
+        elif key in cls.T2:
+            cls.move_to_mru(cls.T2, key)
+        else:
+            # Drift: still a hit; place in T2 to reflect reuse
+            cls.move_to_mru(cls.T2, key)
+        # Resident keys must not exist in ghosts
+        cls.B1.pop(key, None)
+        cls.B2.pop(key, None)
+        # Update timestamp
+        cls.ts[key] = cache_snapshot.access_count
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def on_insert(cls, cache_snapshot, key):
+        # Adjust ARC target p using ghost hints (damped), then admit
+        step_cap = max(1, cls.capacity // 8)  # cap adjustment magnitude
+        if key in cls.B1:
+            # Favor recency: increase p
+            inc = max(1, len(cls.B2) // max(1, len(cls.B1)))
+            cls.p = min(cls.capacity, cls.p + min(inc, step_cap))
+            cls.last_ghost_hit_access = cache_snapshot.access_count
+            cls.cold_streak = 0
+            cls.B1.pop(key, None)
+            # On return, insert to T2 (has shown reuse)
+            cls.move_to_mru(cls.T2, key)
+        elif key in cls.B2:
+            # Favor frequency: decrease p
+            dec = max(1, len(cls.B1) // max(1, len(cls.B2)))
+            cls.p = max(0, cls.p - min(dec, step_cap))
+            cls.last_ghost_hit_access = cache_snapshot.access_count
+            cls.cold_streak = 0
+            cls.B2.pop(key, None)
+            cls.move_to_mru(cls.T2, key)
+        else:
+            # Brand-new: insert into T1 (probationary)
+            cls.move_to_mru(cls.T1, key)
+            cls.cold_streak += 1
+            # Scan clamp: prolonged cold stream -> push p down
+            if cls.cold_streak > cls.capacity:
+                cls.p = max(0, cls.p - max(1, cls.capacity // 4))
+
+        cls.ts[key] = cache_snapshot.access_count
+        cls.trim_ghosts()
+        # Light consistency guard
+        if (len(cls.T1) + len(cls.T2)) != len(cache_snapshot.cache):
+            cls.resync(cache_snapshot)
+=======
+    def on_insert(cls, cache_snapshot, key):
+        # Adjust ARC target p using ghost hints (damped), then admit
+        step_cap = max(1, cls.capacity // 8)  # cap adjustment magnitude
+        if key in cls.B1:
+            # Favor recency: increase p
+            inc = max(1, len(cls.B2) // max(1, len(cls.B1)))
+            cls.p = min(cls.capacity, cls.p + min(inc, step_cap))
+            cls.last_ghost_hit_access = cache_snapshot.access_count
+            cls.cold_streak = 0
+            cls.B1.pop(key, None)
+            cls.B2.pop(key, None)  # keep ghosts disjoint
+            # On return, insert to T2 (has shown reuse)
+            cls.move_to_mru(cls.T2, key)
+        elif key in cls.B2:
+            # Favor frequency: decrease p
+            dec = max(1, len(cls.B1) // max(1, len(cls.B2)))
+            cls.p = max(0, cls.p - min(dec, step_cap))
+            cls.last_ghost_hit_access = cache_snapshot.access_count
+            cls.cold_streak = 0
+            cls.B2.pop(key, None)
+            cls.B1.pop(key, None)  # keep ghosts disjoint
+            cls.move_to_mru(cls.T2, key)
+        else:
+            # Brand-new: insert into T1 (probationary)
+            cls.move_to_mru(cls.T1, key)
+            cls.cold_streak += 1
+            # Scan clamp: prolonged cold stream -> push p down
+            if cls.cold_streak > cls.capacity:
+                cls.p = max(0, cls.p - max(1, cls.capacity // 4))
+            # Ensure ghosts are disjoint from residents
+            cls.B1.pop(key, None)
+            cls.B2.pop(key, None)
+
+        cls.ts[key] = cache_snapshot.access_count
+        cls.trim_ghosts()
+        # Light consistency guard
+        if (len(cls.T1) + len(cls.T2)) != len(cache_snapshot.cache):
+            cls.resync(cache_snapshot)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def on_evict(cls, cache_snapshot, evicted_key):
+        # Move evicted resident to corresponding ghost list
+        if evicted_key in cls.T1:
+            cls.T1.pop(evicted_key, None)
+            cls.move_to_mru(cls.B1, evicted_key)
+        elif evicted_key in cls.T2:
+            cls.T2.pop(evicted_key, None)
+            cls.move_to_mru(cls.B2, evicted_key)
+        else:
+            # Unknown membership: default to B1
+            cls.move_to_mru(cls.B1, evicted_key)
+        cls.ts.pop(evicted_key, None)
+        cls.trim_ghosts()
+=======
+    def on_evict(cls, cache_snapshot, evicted_key):
+        # Move evicted resident to corresponding ghost list
+        if evicted_key in cls.T1:
+            cls.T1.pop(evicted_key, None)
+            cls.move_to_mru(cls.B1, evicted_key)
+            # Maintain disjoint ghosts
+            cls.B2.pop(evicted_key, None)
+        elif evicted_key in cls.T2:
+            cls.T2.pop(evicted_key, None)
+            cls.move_to_mru(cls.B2, evicted_key)
+            cls.B1.pop(evicted_key, None)
+        else:
+            # Unknown membership: prefer existing ghost membership if any
+            if evicted_key in cls.B2:
+                cls.move_to_mru(cls.B2, evicted_key)
+                cls.B1.pop(evicted_key, None)
+            else:
+                cls.move_to_mru(cls.B1, evicted_key)
+                cls.B2.pop(evicted_key, None)
+        cls.ts.pop(evicted_key, None)
+        cls.trim_ghosts()
+>>>>>>> REPLACE
+</DIFF>

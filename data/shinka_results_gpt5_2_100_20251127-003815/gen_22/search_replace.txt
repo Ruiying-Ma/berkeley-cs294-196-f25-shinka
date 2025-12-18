@@ -1,0 +1,141 @@
+<NAME>
+arc_tlfu_victim_rule_refine
+</NAME>
+
+<DESCRIPTION>
+I revert and refine the victim selection rule to the canonical ARC+TinyLFU competitive admission heuristic, which empirically performs better on mixed workloads. Instead of evicting from the segment with the colder sampled candidate (min of f(T1_tail) vs f(T2_tail)), we:
+
+- Keep ARC bias: if |T1| > p, evict from T1. This preserves recency protection and scan resilience.
+- Maintain scan-mode preference to evict from T1 to shield T2.
+- Otherwise, use TinyLFU competitive decision comparing f(new) vs f(candidate_T2): if f(new) ≤ f(candidate_T2), evict from T1; else evict from T2. This aligns with W-TinyLFU’s admission rationale and avoids ejecting a hot resident solely because T2’s tail looks slightly colder than T1’s tail.
+
+This change reduces over-eviction of protected items and improves stability across bursty phases, typically lifting hit rates in mid-band traces without harming scan robustness thanks to the existing scan-mode and ghost hygiene mechanisms.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def choose_victim(self, cache_snapshot, new_obj) -> str:
+        """
+        ARC + TinyLFU victim selection:
+        - If T1 exceeds target p, evict from T1 (sampled LRU-min-freq).
+        - If new key is in B2 and |T1| == p, evict from T1 (ARC rule).
+        - During detected scan mode, prefer evicting from T1 to protect T2.
+        - Else choose between T1 and T2 by comparing TinyLFU(new) vs TinyLFU(candidate_T2).
+        """
+        self._ensure_capacity(cache_snapshot.capacity)
+        self._prune_stale_residents(cache_snapshot)
+
+        cand_T1 = self._sample_lru_min_freq(self.T1) if len(self.T1) > 0 else None
+        cand_T2 = self._sample_lru_min_freq(self.T2) if len(self.T2) > 0 else None
+
+        in_B2 = (new_obj.key in self.B2)
+
+        # Scan-mode bias: for the next ~capacity accesses, evict from T1 when possible
+        now = cache_snapshot.access_count
+        if now < getattr(self, "_scan_mode_until", 0) and cand_T1 is not None:
+            self._last_evicted_from = 'T1'
+            return cand_T1
+
+        # ARC rule: if T1 is larger than target, or (new in B2 and |T1|==p), evict from T1
+        if cand_T1 is not None and (len(self.T1) > self.p or (in_B2 and len(self.T1) == int(self.p))):
+            self._last_evicted_from = 'T1'
+            return cand_T1
+
+        # If only one segment is non-empty, evict from it
+        if cand_T1 is None and cand_T2 is not None:
+            self._last_evicted_from = 'T2'
+            return cand_T2
+        if cand_T2 is None and cand_T1 is not None:
+            self._last_evicted_from = 'T1'
+            return cand_T1
+
+        # Both candidates exist: pick the colder candidate first; if close, use TinyLFU(new) vs T2
+        if cand_T1 is not None and cand_T2 is not None:
+            f_t1 = self.sketch.estimate(cand_T1)
+            f_t2 = self.sketch.estimate(cand_T2)
+            if f_t1 < f_t2:
+                self._last_evicted_from = 'T1'
+                return cand_T1
+            elif f_t2 < f_t1:
+                self._last_evicted_from = 'T2'
+                return cand_T2
+            # Tie or too close: competitive admission via TinyLFU(new) vs T2-candidate
+            f_new = self.sketch.estimate(new_obj.key)
+            if f_new <= f_t2:
+                self._last_evicted_from = 'T1'
+                return cand_T1
+            else:
+                self._last_evicted_from = 'T2'
+                return cand_T2
+
+        # Fallbacks
+        if len(self.T2) > 0:
+            self._last_evicted_from = 'T2'
+            return self._sample_lru_min_freq(self.T2)
+        if len(self.T1) > 0:
+            self._last_evicted_from = 'T1'
+            return self._sample_lru_min_freq(self.T1)
+
+        # Final resort: pick any key from the actual cache
+        self._last_evicted_from = 'T1'
+        return next(iter(cache_snapshot.cache))
+=======
+    def choose_victim(self, cache_snapshot, new_obj) -> str:
+        """
+        ARC + TinyLFU victim selection:
+        - If T1 exceeds target p, evict from T1 (sampled LRU-min-freq).
+        - If new key is in B2 and |T1| == p, evict from T1 (ARC rule).
+        - During detected scan mode, prefer evicting from T1 to protect T2.
+        - Else, competitive decision: compare TinyLFU(new) vs TinyLFU(candidate_T2).
+        """
+        self._ensure_capacity(cache_snapshot.capacity)
+        self._prune_stale_residents(cache_snapshot)
+
+        cand_T1 = self._sample_lru_min_freq(self.T1) if len(self.T1) > 0 else None
+        cand_T2 = self._sample_lru_min_freq(self.T2) if len(self.T2) > 0 else None
+
+        in_B2 = (new_obj.key in self.B2)
+
+        # Scan-mode bias: for the next ~capacity accesses, evict from T1 when possible
+        now = cache_snapshot.access_count
+        if now < getattr(self, "_scan_mode_until", 0) and cand_T1 is not None:
+            self._last_evicted_from = 'T1'
+            return cand_T1
+
+        # ARC rule: if T1 is larger than target, or (new in B2 and |T1|==p), evict from T1
+        if cand_T1 is not None and (len(self.T1) > self.p or (in_B2 and len(self.T1) == int(self.p))):
+            self._last_evicted_from = 'T1'
+            return cand_T1
+
+        # If only one segment is non-empty, evict from it
+        if cand_T1 is None and cand_T2 is not None:
+            self._last_evicted_from = 'T2'
+            return cand_T2
+        if cand_T2 is None and cand_T1 is not None:
+            self._last_evicted_from = 'T1'
+            return cand_T1
+
+        # Both candidates exist: competitive admission via TinyLFU(new) vs T2-candidate
+        if cand_T1 is not None and cand_T2 is not None:
+            f_new = self.sketch.estimate(new_obj.key)
+            f_t2 = self.sketch.estimate(cand_T2)
+            if f_new <= f_t2:
+                self._last_evicted_from = 'T1'
+                return cand_T1
+            else:
+                self._last_evicted_from = 'T2'
+                return cand_T2
+
+        # Fallbacks
+        if len(self.T2) > 0:
+            self._last_evicted_from = 'T2'
+            return self._sample_lru_min_freq(self.T2)
+        if len(self.T1) > 0:
+            self._last_evicted_from = 'T1'
+            return self._sample_lru_min_freq(self.T1)
+
+        # Final resort: pick any key from the actual cache
+        self._last_evicted_from = 'T1'
+        return next(iter(cache_snapshot.cache))
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,391 @@
+# EVOLVE-BLOCK-START
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+
+from collections import OrderedDict
+import random
+
+# Segmented LRU (SLRU)-inspired:
+# - m_probation (W1): first-touch (LRU)
+# - m_protected (W2): multi-touch/hot (LRU)
+# - m_b1 (B1): ghost list of keys evicted from probation (LRU)
+# - m_b2 (B2): ghost list of keys evicted from protected (LRU)
+# - m_freq: lightweight frequency table (with aging)
+m_probation = OrderedDict()
+m_protected = OrderedDict()
+m_b1 = OrderedDict()
+m_b2 = OrderedDict()
+m_freq = dict()
+
+# Recent phase ring to bias against evicting very recent items
+m_recent = OrderedDict()
+
+# Adaptive knobs/state
+m_prot_frac = 0.75  # target fraction of protected relative to current cache size
+_m_last_seen_access = -1  # detect new traces to reset metadata
+m_hits_prob = 0
+m_hits_prot = 0
+m_promotions = 0
+m_demotions = 0
+m_ops = 0
+
+# Sampling and frequency aging
+m_sample_k = 8
+m_sample_band_factor = 4  # sample from the first 4k LRU entries
+_age_ops = 0
+_age_period = 1024
+m_miss_streak = 0
+
+
+def _reset_if_new_run(cache_snapshot):
+    """Reset metadata when a new trace/cache run starts."""
+    global m_probation, m_protected, m_b1, m_b2, m_freq, m_prot_frac, _m_last_seen_access
+    global m_hits_prob, m_hits_prot, m_promotions, m_demotions, m_ops
+    global m_recent, m_sample_k, m_sample_band_factor, _age_ops, _age_period, m_miss_streak
+
+    # New run if access counter restarts or at very beginning
+    if cache_snapshot.access_count <= 1 or _m_last_seen_access > cache_snapshot.access_count:
+        m_probation.clear()
+        m_protected.clear()
+        m_b1.clear()
+        m_b2.clear()
+        m_freq.clear()
+        m_recent.clear()
+        m_prot_frac = 0.75
+        m_hits_prob = 0
+        m_hits_prot = 0
+        m_promotions = 0
+        m_demotions = 0
+        m_ops = 0
+        _age_ops = 0
+        m_miss_streak = 0
+
+    # keep parameters responsive to capacity
+    cap = max(int(cache_snapshot.capacity), 1)
+    _age_period = max(512, cap * 8)
+    m_sample_k = max(5, min(16, (cap // 8) or 5))
+    m_sample_band_factor = 4
+    _m_last_seen_access = cache_snapshot.access_count
+
+
+def _prune_metadata(cache_snapshot):
+    """Keep metadata consistent with actual cache content."""
+    cache_keys = cache_snapshot.cache.keys()
+    for seg in (m_probation, m_protected):
+        to_del = [k for k in seg.keys() if k not in cache_keys]
+        for k in to_del:
+            seg.pop(k, None)
+    # also prune recent ring to bound memory and remove stale
+    to_del = [k for k in m_recent.keys() if k not in cache_keys]
+    for k in to_del:
+        m_recent.pop(k, None)
+
+
+def _recent_ring_add(cache_snapshot, key):
+    """Track recently accessed keys with a bounded ring."""
+    cap = max(int(cache_snapshot.capacity), 1)
+    ring_cap = max(64, min(1024, cap))
+    if key in m_recent:
+        m_recent.move_to_end(key, last=True)
+    else:
+        m_recent[key] = None
+    # bound ring
+    while len(m_recent) > ring_cap:
+        m_recent.popitem(last=False)
+
+
+def _protected_target_size(cache_snapshot):
+    """Adaptive target protected size based on current cache occupancy and prot_frac."""
+    live = max(1, len(cache_snapshot.cache))
+    target = int(max(1, min(live - 1, live * m_prot_frac)))
+    return target
+
+
+def _maybe_age_freq(cache_snapshot):
+    """Periodically halve frequency counters to forget stale history; speed up decay under scans."""
+    global _age_ops, _age_period, m_freq
+    _age_ops += 1
+
+    # adapt age_period during heavy miss streaks
+    cap = max(int(cache_snapshot.capacity), 1)
+    scan_thr = max(16, cap // 2)
+    age_period = _age_period
+    if m_miss_streak >= scan_thr:
+        age_period = max(256, cap * 4)
+
+    if _age_ops % max(1, age_period) == 0:
+        for k in list(m_freq.keys()):
+            v = m_freq.get(k, 0) >> 1
+            if v <= 0:
+                m_freq.pop(k, None)
+            else:
+                m_freq[k] = v
+
+
+def _sample_lowfreq(od: OrderedDict) -> str:
+    """Randomized sampling from the LRU tail band. Pick lowest-frequency candidate."""
+    if not od:
+        return None
+    k = min(m_sample_k, len(od))
+    band = min(len(od), m_sample_band_factor * k)
+    # Preselect random indices in the LRU band [0, band-1]
+    if band <= 0:
+        # fallback
+        return next(iter(od))
+    idxs = set(random.sample(range(band), k)) if band >= k else set(range(band))
+
+    best_k = None
+    best_tuple = None
+    # Single pass through the band
+    for i, key in enumerate(od.keys()):
+        if i >= band:
+            break
+        if i not in idxs:
+            continue
+        f = m_freq.get(key, 0)
+        # Bias against evicting very recent globally (recent ring)
+        not_recent_flag = 0 if key not in m_recent else 1
+        # Compose score: lower is colder; primary by low freq, then prefer not recently seen
+        score = (f, not_recent_flag)
+        if best_tuple is None or score < best_tuple:
+            best_tuple = score
+            best_k = key
+    return best_k if best_k is not None else next(iter(od))
+
+
+def _enforce_protected_target(cache_snapshot):
+    """Demote LRU of protected to probation until protected meets its target."""
+    global m_demotions
+    target = _protected_target_size(cache_snapshot)
+    while len(m_protected) > target:
+        demote_k, _ = m_protected.popitem(last=False)  # LRU of protected
+        # place demoted key at MRU of probation to avoid immediate eviction
+        m_probation[demote_k] = None
+        m_probation.move_to_end(demote_k, last=True)
+        m_demotions += 1
+
+
+def _maybe_tune(cache_snapshot):
+    """Periodically tune protected fraction based on segment hit share and scan detection."""
+    global m_hits_prob, m_hits_prot, m_promotions, m_demotions, m_prot_frac, m_ops
+    m_ops += 1
+    cap = max(int(cache_snapshot.capacity), 1)
+    tune_period = max(512, cap * 16)
+    if m_ops % tune_period != 0:
+        return
+
+    # Adjust prot_frac based on hit-shares and motion between segments
+    # Baseline: encourage protection if protected hits dominate
+    if m_hits_prot > (m_hits_prob * 1.2) and m_promotions >= m_demotions:
+        m_prot_frac = min(0.90, m_prot_frac + 0.05)
+    elif m_hits_prob > (m_hits_prot * 1.2) or m_demotions > m_promotions:
+        m_prot_frac = max(0.60, m_prot_frac - 0.05)
+
+    # Scan guard: temporarily trim protected under scans
+    scan_thr = max(16, cap // 2)
+    if m_miss_streak >= scan_thr:
+        m_prot_frac = max(0.60, m_prot_frac - 0.05)
+
+    # reset counters
+    m_hits_prob = 0
+    m_hits_prot = 0
+    m_promotions = 0
+    m_demotions = 0
+
+
+def _ensure_seeded(cache_snapshot):
+    """Seed metadata with current cache keys if empty."""
+    if not m_probation and not m_protected and cache_snapshot.cache:
+        for k0 in cache_snapshot.cache.keys():
+            m_probation[k0] = None
+
+
+def evict(cache_snapshot, obj):
+    '''
+    Choose the eviction victim. Prefer evicting from probation (W1). Use randomized
+    tail sampling with a TinyLFU-like frequency score and a small recent bias.
+    '''
+    global m_probation, m_protected
+    _reset_if_new_run(cache_snapshot)
+    _prune_metadata(cache_snapshot)
+    _ensure_seeded(cache_snapshot)
+
+    # Scan-aware: if heavy miss streak, avoid touching protected unless probation empty
+    victim_key = None
+    if m_probation:
+        victim_key = _sample_lowfreq(m_probation)
+    elif m_protected:
+        victim_key = _sample_lowfreq(m_protected)
+    else:
+        # Fallback: choose any key from the cache
+        victim_key = next(iter(cache_snapshot.cache))
+    return victim_key
+
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    Update metadata on hit.
+    - Increment lightweight frequency.
+    - Promote W1->W2 on second touch (with scan-aware gating).
+    - Maintain recency order within segments.
+    - Track segment hit shares and tune periodically.
+    '''
+    global m_probation, m_protected, m_hits_prob, m_hits_prot, m_promotions, m_miss_streak
+    _reset_if_new_run(cache_snapshot)
+    _prune_metadata(cache_snapshot)
+    _maybe_age_freq(cache_snapshot)
+
+    k = obj.key
+    # Bump lightweight frequency
+    m_freq[k] = m_freq.get(k, 0) + 1
+
+    # Any hit breaks a miss streak (scan relief)
+    m_miss_streak = 0
+
+    # Record in recent ring
+    _recent_ring_add(cache_snapshot, k)
+
+    in_prot = k in m_protected
+    in_prob = k in m_probation
+
+    if in_prot:
+        m_hits_prot += 1
+        # Refresh recency in protected
+        m_protected.move_to_end(k, last=True)
+    elif in_prob:
+        m_hits_prob += 1
+        # Scan-aware promotion gating
+        cap = max(int(cache_snapshot.capacity), 1)
+        scan_thr = max(16, cap // 2)
+        f = m_freq.get(k, 0)
+        promote = False
+        if m_miss_streak >= scan_thr:
+            # During scan: require stronger evidence
+            promote = f >= 3
+        else:
+            promote = f >= 2
+        if promote:
+            m_probation.pop(k, None)
+            m_protected[k] = None
+            m_promotions += 1
+        else:
+            # Refresh recency in probation
+            m_probation.move_to_end(k, last=True)
+    else:
+        # Metadata miss but cache hit: conservatively treat as probation to avoid over-protection
+        m_probation[k] = None
+
+    # Keep protected within target by demoting LRU when necessary
+    _enforce_protected_target(cache_snapshot)
+    _maybe_tune(cache_snapshot)
+
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Update metadata after insert.
+    - New entries go to probation by default.
+    - If recently evicted from protected (ghost B2) and not under scan, admit to protected.
+    - Increment frequency; track recent ring; scan detection via miss_streak.
+    '''
+    global m_probation, m_protected, m_b1, m_b2, m_miss_streak, m_promotions
+    _reset_if_new_run(cache_snapshot)
+    _prune_metadata(cache_snapshot)
+    _maybe_age_freq(cache_snapshot)
+
+    k = obj.key
+    # Remove any stale placements
+    m_protected.pop(k, None)
+    m_probation.pop(k, None)
+
+    # Scan-aware early admission policy
+    cap = max(int(cache_snapshot.capacity), 1)
+    scan_thr = max(16, cap // 2)
+    under_scan = (m_miss_streak >= scan_thr)
+
+    if (k in m_b2) and not under_scan:
+        # Was hot before, bring back to protected
+        m_b2.pop(k, None)
+        m_protected[k] = None
+        m_promotions += 1
+    else:
+        # Default admission to probation
+        # If was in B1 (evicted from probation) keep in probation; remove ghost marker
+        m_b1.pop(k, None) if k in m_b1 else None
+        m_probation[k] = None
+
+    # Frequency credit and miss streak for scan detection
+    m_freq[k] = m_freq.get(k, 0) + 1
+    m_miss_streak += 1
+
+    # Record in recent ring
+    _recent_ring_add(cache_snapshot, k)
+
+    # Keep protected within target by demoting LRU when necessary
+    _enforce_protected_target(cache_snapshot)
+
+    # Bound combined ghost sizes to capacity
+    cap = max(int(cache_snapshot.capacity), 1)
+    while (len(m_b1) + len(m_b2)) > cap:
+        if len(m_b1) > len(m_b2):
+            m_b1.popitem(last=False)
+        else:
+            m_b2.popitem(last=False)
+
+    _maybe_tune(cache_snapshot)
+
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Update metadata after eviction.
+    - Move evicted object into appropriate ghost list (B1 if from probation, else B2).
+    - Bound ghost lists.
+    '''
+    global m_probation, m_protected, m_b1, m_b2
+    _reset_if_new_run(cache_snapshot)
+    _prune_metadata(cache_snapshot)
+
+    k = evicted_obj.key
+    if k in m_probation:
+        m_probation.pop(k, None)
+        m_b1.pop(k, None)
+        m_b1[k] = None  # MRU of B1
+    elif k in m_protected:
+        m_protected.pop(k, None)
+        m_b2.pop(k, None)
+        m_b2[k] = None  # MRU of B2
+    else:
+        # Unknown segment; conservatively put into B1
+        m_b1.pop(k, None)
+        m_b1[k] = None
+
+    # Also drop from recent ring (no longer in cache)
+    m_recent.pop(k, None)
+
+    # Bound combined ghost sizes to capacity
+    cap = max(int(cache_snapshot.capacity), 1)
+    while (len(m_b1) + len(m_b2)) > cap:
+        if len(m_b1) > len(m_b2):
+            m_b1.popitem(last=False)
+        else:
+            m_b2.popitem(last=False)
+
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

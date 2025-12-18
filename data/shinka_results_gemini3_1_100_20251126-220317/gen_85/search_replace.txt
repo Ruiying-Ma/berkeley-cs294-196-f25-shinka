@@ -1,0 +1,179 @@
+<NAME>
+segment_aware_duel_and_dk_reset
+</NAME>
+
+<DESCRIPTION>
+This change implements two optimizations to improve the cache hit rate:
+1.  **Segment-Aware Eviction Duel**: In the `evict` function, the tie-breaking logic during the duel between the Window candidate and the Main candidate is refined. If the Main candidate is from the Probation segment (recent admission), ties in frequency now favor the Window candidate (evicting Main) to encourage turnover of unproven items. If the Main candidate is from the Protected segment (long-term resident), ties favor the Main candidate (evicting Window) to preserve the core working set.
+2.  **Size-Based Doorkeeper Reset**: In `update_after_hit` and `update_after_insert`, the Doorkeeper (approximate set) reset mechanism is decoupled from the frequency aging timer. Instead, the Doorkeeper is cleared when its size exceeds 2x the cache capacity. This ensures the filter remains effective and memory-bounded regardless of the access pattern or aging frequency.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Main Candidate: Probation LRU, else Protected LRU
+    candidate_m = None
+    if probation:
+        candidate_m = next(iter(probation))
+    elif protected:
+        candidate_m = next(iter(protected))
+
+    victim = None
+
+    # 1. If Window needs space (is below target), grow it by evicting Main
+    # (Unless Main is empty, then evict Window)
+    if len(window) < w_cap and candidate_m:
+        victim = candidate_m
+    elif not candidate_m:
+        victim = candidate_w
+    elif not candidate_w:
+        victim = candidate_m
+    else:
+        # 2. Window is full. Duel.
+        # Compare frequency
+        fw = freq.get(candidate_w, 0)
+        fm = freq.get(candidate_m, 0)
+
+        # Tie-breaker: Prefer Main (Incumbent) -> Evict Window
+        # This provides scan and loop resistance
+        if fw > fm:
+            victim = candidate_m
+        else:
+            victim = candidate_w
+
+    return victim
+=======
+    # Main Candidate: Probation LRU, else Protected LRU
+    candidate_m = None
+    is_probation = False
+    if probation:
+        candidate_m = next(iter(probation))
+        is_probation = True
+    elif protected:
+        candidate_m = next(iter(protected))
+
+    victim = None
+
+    # 1. If Window needs space (is below target), grow it by evicting Main
+    # (Unless Main is empty, then evict Window)
+    if len(window) < w_cap and candidate_m:
+        victim = candidate_m
+    elif not candidate_m:
+        victim = candidate_w
+    elif not candidate_w:
+        victim = candidate_m
+    else:
+        # 2. Window is full. Duel.
+        # Compare frequency
+        fw = freq.get(candidate_w, 0)
+        fm = freq.get(candidate_m, 0)
+
+        # Tie-breaker: Prefer Main (Incumbent) -> Evict Window
+        # Segment-Aware Duel
+        evict_main = False
+        if is_probation:
+            # If victim is in Probation, ties favor Window (evict Main)
+            if fw >= fm:
+                evict_main = True
+        else:
+            # If victim is in Protected, ties favor Main (evict Window)
+            if fw > fm:
+                evict_main = True
+
+        if evict_main:
+            victim = candidate_m
+        else:
+            victim = candidate_w
+
+    return victim
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Frequency with Doorkeeper and Cap
+    if key in freq:
+        freq[key] = min(freq[key] + 1, 15)
+    elif key in dk:
+        freq[key] = 1
+        dk.remove(key)
+    else:
+        dk.add(key)
+
+    algo_state['freq_count'] += 1
+    # Accelerated Aging (5x capacity instead of 10x)
+    if algo_state['freq_count'] >= cache_snapshot.capacity * 5:
+        to_remove = []
+        dk.clear()
+        for k in freq:
+            freq[k] //= 2
+            if freq[k] == 0: to_remove.append(k)
+        for k in to_remove: del freq[k]
+        algo_state['freq_count'] = 0
+=======
+    # Frequency with Doorkeeper and Cap
+    if key in freq:
+        freq[key] = min(freq[key] + 1, 15)
+    elif key in dk:
+        freq[key] = 1
+        dk.remove(key)
+    else:
+        dk.add(key)
+
+    # Doorkeeper size management
+    if len(dk) > cache_snapshot.capacity * 2:
+        dk.clear()
+
+    algo_state['freq_count'] += 1
+    # Accelerated Aging (5x capacity instead of 10x)
+    if algo_state['freq_count'] >= cache_snapshot.capacity * 5:
+        to_remove = []
+        # Doorkeeper reset decoupled from aging
+        for k in freq:
+            freq[k] //= 2
+            if freq[k] == 0: to_remove.append(k)
+        for k in to_remove: del freq[k]
+        algo_state['freq_count'] = 0
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Frequency with Doorkeeper and Cap
+    if key in freq:
+        freq[key] = min(freq[key] + 1, 15)
+    elif key in dk:
+        freq[key] = 1
+        dk.remove(key)
+    else:
+        dk.add(key)
+
+    algo_state['freq_count'] += 1
+    # Accelerated Aging
+    if algo_state['freq_count'] >= cache_snapshot.capacity * 5:
+        to_remove = []
+        dk.clear()
+        for k in freq:
+            freq[k] //= 2
+            if freq[k] == 0: to_remove.append(k)
+        for k in to_remove: del freq[k]
+        algo_state['freq_count'] = 0
+=======
+    # Frequency with Doorkeeper and Cap
+    if key in freq:
+        freq[key] = min(freq[key] + 1, 15)
+    elif key in dk:
+        freq[key] = 1
+        dk.remove(key)
+    else:
+        dk.add(key)
+
+    # Doorkeeper size management
+    if len(dk) > cache_snapshot.capacity * 2:
+        dk.clear()
+
+    algo_state['freq_count'] += 1
+    # Accelerated Aging
+    if algo_state['freq_count'] >= cache_snapshot.capacity * 5:
+        to_remove = []
+        # Doorkeeper reset decoupled from aging
+        for k in freq:
+            freq[k] //= 2
+            if freq[k] == 0: to_remove.append(k)
+        for k in to_remove: del freq[k]
+        algo_state['freq_count'] = 0
+>>>>>>> REPLACE
+</DIFF>

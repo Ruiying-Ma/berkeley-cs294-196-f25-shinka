@@ -1,0 +1,143 @@
+<NAME>
+config_update
+</NAME>
+
+<DESCRIPTION>
+Add `ghost_target` to `s3_config` in `_reset_state` to support an extended ghost registry (3x capacity). This allows the algorithm to track history for items that loop or return after intervals larger than the cache size but within a reasonable window, improving hit rates on traces like Trace 14.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Aging interval (once per capacity accesses)
+        s3_config['aging_interval'] = cap
+
+def _age_freqs():
+=======
+        # Aging interval (once per capacity accesses)
+        s3_config['aging_interval'] = cap
+        # Ghost registry size target (3x capacity)
+        s3_config['ghost_target'] = cap * 3
+
+def _age_freqs():
+>>>>>>> REPLACE
+</DIFF>
+
+<NAME>
+evict_second_chance
+</NAME>
+
+<DESCRIPTION>
+Modify `evict` to implement a frequency-aware Second Chance mechanism for the Main queue. Instead of strictly evicting the LRU victim, we check if it has a positive frequency. If so, we move it to the MRU position and decrement its frequency, giving "hot" items a chance to survive transient pressure. We limit this to 4 checks to bound worst-case performance.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # 2. If Small is safe, evict from Main (LRU)
+    if s3_main:
+        return next(iter(s3_main))
+
+    # Fallback (should be covered)
+=======
+    # 2. If Small is safe, evict from Main (LRU with Second Chance)
+    if s3_main:
+        # Check up to 4 candidates from LRU end
+        for _ in range(4):
+            candidate = next(iter(s3_main))
+            # Give second chance if it has accumulated frequency
+            if s3_freq.get(candidate, 0) > 0:
+                s3_main.move_to_end(candidate) # Move to MRU
+                s3_freq[candidate] = max(0, s3_freq.get(candidate, 0) - 1) # Decay
+            else:
+                return candidate
+        # Fallback to LRU if all candidates were protected or limit reached
+        return next(iter(s3_main))
+
+    # Fallback (should be covered)
+>>>>>>> REPLACE
+</DIFF>
+
+<NAME>
+update_hit_freq
+</NAME>
+
+<DESCRIPTION>
+Update `update_after_hit` to increment frequency for ALL hits, including those in the Main queue. This ensures that the Second Chance mechanism in `evict` has accurate frequency data to decide whether to protect an item.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    if key in s3_main:
+        s3_main.move_to_end(key)
+    elif key in s3_small:
+        s3_freq[key] = s3_freq.get(key, 0) + 1
+=======
+    # Update frequency for all hits to enable frequency-based retention in Main
+    s3_freq[key] = s3_freq.get(key, 0) + 1
+
+    if key in s3_main:
+        s3_main.move_to_end(key)
+>>>>>>> REPLACE
+</DIFF>
+
+<NAME>
+update_insert_decay
+</NAME>
+
+<DESCRIPTION>
+Modify `update_after_insert` to decay the frequency restored from the Ghost registry (halving it) and only promote to Main if the decayed frequency is positive. This "Decayed Frequency Restoration" prevents items that were barely popular in the past from clogging the Main queue, effectively filtering weak signals while rescuing strong ones.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    if key in s3_ghost:
+        # Restore frequency
+        restored_freq = s3_ghost.pop(key)
+        s3_freq[key] = restored_freq
+        # Promote to Main immediately
+        s3_main[key] = 1
+        s3_main.move_to_end(key)
+    else:
+        # New Item -> Small
+        s3_small[key] = 1
+        s3_freq[key] = 0
+=======
+    if key in s3_ghost:
+        # Restore frequency with decay to filter weak history
+        restored_freq = s3_ghost.pop(key)
+        new_freq = restored_freq // 2
+        s3_freq[key] = new_freq
+
+        # Conditional Promotion: only promote if signal is strong enough
+        if new_freq > 0:
+            s3_main[key] = 1
+            s3_main.move_to_end(key)
+        else:
+            # Re-insert into Small (probation)
+            s3_small[key] = 1
+    else:
+        # New Item -> Small
+        s3_small[key] = 1
+        s3_freq[key] = 0
+>>>>>>> REPLACE
+</DIFF>
+
+<NAME>
+update_evict_ghost_limit
+</NAME>
+
+<DESCRIPTION>
+Update `update_after_evict` to use the extended `ghost_target` (3x capacity) instead of the hardcoded capacity. This ensures the Ghost registry actually retains the extended history needed to detect larger loops.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Maintain Ghost size
+    if len(s3_ghost) > capacity:
+        s3_ghost.popitem(last=False) # Remove oldest ghost
+=======
+    # Maintain Ghost size
+    target = s3_config.get('ghost_target', capacity)
+    if len(s3_ghost) > target:
+        s3_ghost.popitem(last=False) # Remove oldest ghost
+>>>>>>> REPLACE
+</DIFF>

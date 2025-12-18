@@ -1,0 +1,183 @@
+<NAME>
+probation_lfu_size_decay
+</NAME>
+
+<DESCRIPTION>
+Implement a cache eviction policy inspired by S3-FIFO and LFU-DA.
+1. **Probation**: New items start with frequency 0. This creates a virtual "probation" queue where items are evicted via LRU if not accessed again. This improves scan resistance.
+2. **Size-Awareness**: The score includes object size. `Score = Freq / (Age * Size)`. Large items are penalized and need higher frequency/recency to stay.
+3. **Frequency Decay**: On eviction, frequency is halved. This prevents history pollution while retaining some memory (Ghost Cache).
+4. **Promotion**: Re-insertion of a previously known item (Ghost) increments its frequency, effectively promoting it if it was in probation or restoring some status if it was protected.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    Uses Hyperbolic Caching: Score = Frequency / (CurrentTime - LastAccessTime).
+    Evicts the object with the lowest score.
+    '''
+    current_time = cache_snapshot.access_count
+
+    # Find key with minimum hyperbolic score
+    # We compare f1/a1 < f2/a2 <=> f1*a2 < f2*a1 to avoid division and floats
+
+    min_key = None
+    min_freq = -1
+    min_age = -1
+
+    for key in cache_snapshot.cache:
+        # Safety check, though keys in cache should be in m_key_timestamp
+        if key not in m_key_timestamp: continue
+
+        freq = m_key_frequency.get(key, 1)
+        last_access = m_key_timestamp[key]
+        age = current_time - last_access
+        if age <= 0: age = 1
+
+        if min_key is None:
+            min_key = key
+            min_freq = freq
+            min_age = age
+        else:
+            # Compare current (freq, age) with min (min_freq, min_age)
+            # freq / age < min_freq / min_age  <=> freq * min_age < min_freq * age
+            val1 = freq * min_age
+            val2 = min_freq * age
+
+            if val1 < val2:
+                min_key = key
+                min_freq = freq
+                min_age = age
+            elif val1 == val2:
+                # Tie-breaker: LRU (oldest timestamp => largest age)
+                if age > min_age:
+                    min_key = key
+                    min_freq = freq
+                    min_age = age
+
+    return min_key
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    Update metadata after hit: update timestamp and increment frequency.
+    '''
+    global m_key_timestamp, m_key_frequency
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+    m_key_frequency[obj.key] = m_key_frequency.get(obj.key, 0) + 1
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Update metadata after insert: set timestamp, init or increment frequency (Ghost).
+    '''
+    global m_key_timestamp, m_key_frequency
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+    # Keep frequency history if available (Ghost Cache behavior)
+    if obj.key in m_key_frequency:
+        m_key_frequency[obj.key] += 1
+    else:
+        m_key_frequency[obj.key] = 1
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Update metadata after evict: remove timestamp, keep frequency.
+    '''
+    global m_key_timestamp
+    if evicted_obj.key in m_key_timestamp:
+        m_key_timestamp.pop(evicted_obj.key)
+    # We purposefully do NOT remove from m_key_frequency to retain history
+=======
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    Score = Frequency / (Age * Size).
+    Evicts the object with the lowest score.
+    Tie-breaker: LRU (Oldest).
+    '''
+    current_time = cache_snapshot.access_count
+
+    # We want to minimize (freq / (age * size))
+    # Comparison: f1/(a1*s1) < f2/(a2*s2) <=> f1 * (a2*s2) < f2 * (a1*s1)
+
+    min_key = None
+    min_num = -1   # Stores freq
+    min_denom = -1 # Stores age * size
+    min_age = -1   # For tie-breaking
+
+    for key, item in cache_snapshot.cache.items():
+        if key not in m_key_timestamp: continue
+
+        freq = m_key_frequency.get(key, 0) # Default 0
+        last_access = m_key_timestamp[key]
+        age = current_time - last_access
+        if age <= 0: age = 1
+
+        size = item.size
+        if size <= 0: size = 1
+
+        curr_num = freq
+        curr_denom = age * size
+
+        if min_key is None:
+            min_key = key
+            min_num = curr_num
+            min_denom = curr_denom
+            min_age = age
+        else:
+            # Compare curr < min
+            # curr_num / curr_denom < min_num / min_denom
+            val1 = curr_num * min_denom
+            val2 = min_num * curr_denom
+
+            if val1 < val2:
+                min_key = key
+                min_num = curr_num
+                min_denom = curr_denom
+                min_age = age
+            elif val1 == val2:
+                # Tie-breaker: LRU (oldest timestamp => largest age)
+                if age > min_age:
+                    min_key = key
+                    min_num = curr_num
+                    min_denom = curr_denom
+                    min_age = age
+
+    return min_key
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    Update metadata after hit: update timestamp and increment frequency.
+    '''
+    global m_key_timestamp, m_key_frequency
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+    m_key_frequency[obj.key] = m_key_frequency.get(obj.key, 0) + 1
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Update metadata after insert: set timestamp.
+    If ghost history exists, increment it (Promotion/Recovery).
+    If new, start at 0 (Probation).
+    '''
+    global m_key_timestamp, m_key_frequency
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+
+    if obj.key in m_key_frequency:
+        m_key_frequency[obj.key] += 1
+    else:
+        m_key_frequency[obj.key] = 0
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Update metadata after evict: remove timestamp.
+    Decay frequency in ghost history to prevent infinite accumulation.
+    '''
+    global m_key_timestamp, m_key_frequency
+    if evicted_obj.key in m_key_timestamp:
+        m_key_timestamp.pop(evicted_obj.key)
+
+    # Decay frequency
+    if evicted_obj.key in m_key_frequency:
+        m_key_frequency[evicted_obj.key] //= 2
+>>>>>>> REPLACE
+</DIFF>

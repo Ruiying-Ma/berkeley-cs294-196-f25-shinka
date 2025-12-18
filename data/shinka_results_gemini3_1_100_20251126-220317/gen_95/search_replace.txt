@@ -1,0 +1,138 @@
+<NAME>
+update_docstring
+</NAME>
+
+<DESCRIPTION>
+Updates the module docstring to reflect the changes in eviction logic (Segment-Aware Duel).
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+"""
+Optimized W-TinyLFU with Size-Aware SLRU and Doorkeeper
+Combines robust state management with size-aware eviction logic.
+- 1% Window (Byte-based).
+- SLRU Main Cache (Probation/Protected) with 80% Protected limit.
+- Frequency Sketch with 4-bit counters (max 15) and Aging.
+- Doorkeeper to filter one-hit wonders.
+- Biased Duel and Spare Main logic to protect valuable items.
+"""
+=======
+"""
+Optimized W-TinyLFU with Segment-Aware SLRU and Doorkeeper
+Combines robust state management with size-aware eviction logic.
+- 1% Window (Byte-based).
+- SLRU Main Cache (Probation/Protected) with 80% Protected limit.
+- Frequency Sketch with 4-bit counters (max 15) and Aging.
+- Doorkeeper to filter one-hit wonders.
+- Segment-Aware Duel: Adjusts eviction bias based on whether the Main victim is in Probation (easier to evict) or Protected (harder to evict).
+"""
+>>>>>>> REPLACE
+</DIFF>
+
+<NAME>
+tinylfu_segment_aware
+</NAME>
+
+<DESCRIPTION>
+Refines the eviction policy by introducing segment-aware logic.
+1. Growth Phase: Instead of blindly sparing Main items with freq > 0, we now compare frequencies. Main is evicted to grow Window unless the Main victim is strictly more frequent than the Window victim.
+2. Steady State: Dueling logic now distinguishes between Probation and Protected victims.
+   - Probation victims: Evicted if Window victim is at least as frequent (`fw >= fm`). This facilitates turnover and promotion of new promising items.
+   - Protected victims: Retain the biased duel (`fw > fm + 1`), ensuring established heavy hitters are not easily displaced by transient noise.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    state = get_state(cache_snapshot)
+    state.check_trace_reset(cache_snapshot.access_count)
+
+    # Dynamic Parameters
+    capacity = cache_snapshot.capacity
+    w_cap = max(1, int(capacity * 0.01))
+
+    # Candidates
+    cand_w = next(iter(state.window)) if state.window else None
+
+    cand_m = None
+    if state.probation:
+        cand_m = next(iter(state.probation))
+    elif state.protected:
+        cand_m = next(iter(state.protected))
+
+    # 1. Window Growth Phase
+    if state.window_size < w_cap:
+        if cand_m:
+            if state.get_freq(cand_m) > 0:
+                # Spare Main if valuable
+                if cand_w: return cand_w
+                else: return cand_m
+            else:
+                return cand_m
+        else:
+            return cand_w
+
+    # 2. Steady State: Duel
+    if not cand_w: return cand_m
+    if not cand_m: return cand_w
+
+    fw = state.get_freq(cand_w)
+    fm = state.get_freq(cand_m)
+
+    # Biased Duel
+    if fw > fm + 1:
+        return cand_m
+    else:
+        return cand_w
+=======
+def evict(cache_snapshot, obj):
+    state = get_state(cache_snapshot)
+    state.check_trace_reset(cache_snapshot.access_count)
+
+    # Dynamic Parameters
+    capacity = cache_snapshot.capacity
+    w_cap = max(1, int(capacity * 0.01))
+
+    # Candidates
+    cand_w = next(iter(state.window)) if state.window else None
+
+    cand_m = None
+    is_probation = False
+    if state.probation:
+        cand_m = next(iter(state.probation))
+        is_probation = True
+    elif state.protected:
+        cand_m = next(iter(state.protected))
+
+    # Handle empty cases
+    if not cand_w: return cand_m
+    if not cand_m: return cand_w
+
+    fw = state.get_freq(cand_w)
+    fm = state.get_freq(cand_m)
+
+    # 1. Window Growth Phase
+    # Prefer evicting Main to grow Window, unless Main is strictly better
+    if state.window_size < w_cap:
+        if fm > fw:
+            return cand_w
+        return cand_m
+
+    # 2. Steady State: Segment-aware Duel
+    if is_probation:
+        # In Probation, if Window item is at least as good, evict Probation item.
+        # This facilitates promotion of new good items.
+        if fw >= fm:
+            return cand_m
+        else:
+            return cand_w
+    else:
+        # In Protected, Main item is an incumbent heavy hitter.
+        # Require Window item to be significantly better.
+        if fw > fm + 1:
+            return cand_m
+        else:
+            return cand_w
+>>>>>>> REPLACE
+</DIFF>

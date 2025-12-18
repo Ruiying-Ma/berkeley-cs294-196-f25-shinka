@@ -1,0 +1,154 @@
+<NAME>
+improved_hyperbolic_size_aware
+</NAME>
+
+<DESCRIPTION>
+I propose two modifications to improve the cache eviction algorithm:
+
+1.  **Initialize Frequency to 1:** In `update_after_insert`, the frequency for new items is now initialized to 1 instead of 0. Previously, new items started with a score of 0, making them immediate candidates for eviction regardless of their potential. By starting at 1, new items are given a "probationary" protection, allowing them a chance to accumulate hits. This is crucial for handling working set changes and preventing scan-induced thrashing.
+2.  **Soften Size Penalty:** In `evict`, the scoring formula is adjusted from `Frequency / (Age * Size)` to `Frequency / (Age * sqrt(Size))`. The linear size penalty in the original code was too aggressive, likely causing large but frequently accessed objects to be evicted prematurely. Using the square root of the size provides a more balanced trade-off between object hit rate and byte efficiency. The implementation uses integer arithmetic by squaring the comparison terms (`F^2 / (A^2 * S)`), avoiding floating-point overhead while maintaining precision.
+
+These changes aim to improve the algorithm's robustness across diverse traces by protecting new items and being less punitive towards large objects.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    Score = Frequency / (Age * Size).
+    Evicts the object with the lowest score.
+    Tie-breaker: LRU (Oldest).
+    '''
+    current_time = cache_snapshot.access_count
+
+    # We want to minimize (freq / (age * size))
+    # Comparison: f1/(a1*s1) < f2/(a2*s2) <=> f1 * (a2*s2) < f2 * (a1*s1)
+
+    min_key = None
+    min_num = -1   # Stores freq
+    min_denom = -1 # Stores age * size
+    min_age = -1   # For tie-breaking
+
+    for key, item in cache_snapshot.cache.items():
+        if key not in m_key_timestamp: continue
+
+        freq = m_key_frequency.get(key, 0) # Default 0
+        last_access = m_key_timestamp[key]
+        age = current_time - last_access
+        if age <= 0: age = 1
+
+        size = item.size
+        if size <= 0: size = 1
+
+        curr_num = freq
+        curr_denom = age * size
+
+        if min_key is None:
+            min_key = key
+            min_num = curr_num
+            min_denom = curr_denom
+            min_age = age
+        else:
+            # Compare curr < min
+            # curr_num / curr_denom < min_num / min_denom
+            val1 = curr_num * min_denom
+            val2 = min_num * curr_denom
+
+            if val1 < val2:
+                min_key = key
+                min_num = curr_num
+                min_denom = curr_denom
+                min_age = age
+            elif val1 == val2:
+                # Tie-breaker: LRU (oldest timestamp => largest age)
+                if age > min_age:
+                    min_key = key
+                    min_num = curr_num
+                    min_denom = curr_denom
+                    min_age = age
+
+    return min_key
+=======
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    Score = Frequency / (Age * sqrt(Size)).
+    Evicts the object with the lowest score.
+    Tie-breaker: LRU (Oldest).
+    '''
+    current_time = cache_snapshot.access_count
+
+    # We want to minimize (freq / (age * sqrt(size)))
+    # Comparison: F1/(A1*sqrt(S1)) < F2/(A2*sqrt(S2))
+    # Square both sides: F1^2 / (A1^2 * S1) < F2^2 / (A2^2 * S2)
+    # Cross-multiply: F1^2 * A2^2 * S2 < F2^2 * A1^2 * S1
+
+    min_key = None
+    min_freq = -1
+    min_age = -1
+    min_size = -1
+
+    for key, item in cache_snapshot.cache.items():
+        if key not in m_key_timestamp: continue
+
+        freq = m_key_frequency.get(key, 0)
+        last_access = m_key_timestamp[key]
+        age = current_time - last_access
+        if age <= 0: age = 1
+
+        size = item.size
+        if size <= 0: size = 1
+
+        if min_key is None:
+            min_key = key
+            min_freq = freq
+            min_age = age
+            min_size = size
+        else:
+            # Compare curr < min
+            # (curr_freq^2 * min_age^2 * min_size) < (min_freq^2 * curr_age^2 * curr_size)
+
+            lhs = (freq * freq) * (min_age * min_age) * min_size
+            rhs = (min_freq * min_freq) * (age * age) * size
+
+            if lhs < rhs:
+                min_key = key
+                min_freq = freq
+                min_age = age
+                min_size = size
+            elif lhs == rhs:
+                # Tie-breaker: LRU (oldest timestamp => largest age)
+                if age > min_age:
+                    min_key = key
+                    min_freq = freq
+                    min_age = age
+                    min_size = size
+
+    return min_key
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Update metadata after insert: set timestamp.
+    If ghost history exists, increment it (Promotion/Recovery).
+    If new, start at 0 (Probation).
+    '''
+    global m_key_timestamp, m_key_frequency
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+
+    if obj.key in m_key_frequency:
+        m_key_frequency[obj.key] += 1
+    else:
+        m_key_frequency[obj.key] = 0
+=======
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Update metadata after insert: set timestamp.
+    Init frequency to 1 (or increment ghost) to give new items a chance.
+    '''
+    global m_key_timestamp, m_key_frequency
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+    m_key_frequency[obj.key] = m_key_frequency.get(obj.key, 0) + 1
+>>>>>>> REPLACE
+</DIFF>

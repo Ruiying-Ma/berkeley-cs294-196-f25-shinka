@@ -1,0 +1,137 @@
+# EVOLVE-BLOCK-START
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+
+# ARC Globals
+m_t1 = dict() # Recency (L1)
+m_t2 = dict() # Frequency (L2)
+m_b1 = dict() # Ghost Recency
+m_b2 = dict() # Ghost Frequency
+p = 0         # Adaptive parameter
+
+def evict(cache_snapshot, obj):
+    '''
+    ARC Eviction Logic with Randomization:
+    - Adapt p based on hits in ghost lists (B1, B2).
+    - Decide whether to evict from T1 or T2 based on p and T1 size.
+    - Use Random Eviction to robustly handle loops and large working sets.
+    '''
+    global p
+    import random
+
+    capacity = cache_snapshot.capacity
+
+    # Adaptation: If the incoming object (miss) is in a ghost list
+    if obj.key in m_b1:
+        delta = 1
+        if len(m_b1) < len(m_b2):
+             delta = len(m_b2) / len(m_b1)
+        p = min(capacity, p + delta)
+    elif obj.key in m_b2:
+        delta = 1
+        if len(m_b2) < len(m_b1):
+             delta = len(m_b1) / len(m_b2)
+        p = max(0, p - delta)
+
+    # Decision: Select victim
+    evict_t1 = False
+    if len(m_t1) > 0:
+        if len(m_t1) > p:
+            evict_t1 = True
+        elif obj.key in m_b2 and len(m_t1) == int(p):
+            evict_t1 = True
+        elif len(m_t2) == 0:
+            evict_t1 = True
+
+    if evict_t1:
+        return random.choice(list(m_t1.keys()))
+    else:
+        return random.choice(list(m_t2.keys()))
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    On Cache Hit:
+    - If obj in T1, move to T2 (MRU).
+    - If obj in T2, move to MRU of T2.
+    '''
+    global m_t1, m_t2
+
+    if obj.key in m_t1:
+        del m_t1[obj.key]
+        m_t2[obj.key] = None
+    elif obj.key in m_t2:
+        del m_t2[obj.key]
+        m_t2[obj.key] = None
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On Cache Insert (Miss):
+    - Place obj in T1 or T2.
+    '''
+    global m_t1, m_t2, m_b1, m_b2, p
+
+    # Reset state at start of new trace (access_count starts at 1 usually for first miss)
+    if cache_snapshot.access_count <= 1:
+        m_t1.clear()
+        m_t2.clear()
+        m_b1.clear()
+        m_b2.clear()
+        p = 0
+
+    # Check if it was a ghost
+    is_ghost = False
+    if obj.key in m_b1:
+        del m_b1[obj.key]
+        is_ghost = True
+    if obj.key in m_b2:
+        del m_b2[obj.key]
+        is_ghost = True
+
+    if is_ghost:
+        # History hit -> promote to frequency list
+        m_t2[obj.key] = None
+    else:
+        # New item -> probation list
+        m_t1[obj.key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    After Eviction:
+    - Update ghost lists.
+    '''
+    global m_t1, m_t2, m_b1, m_b2
+
+    if evicted_obj.key in m_t1:
+        del m_t1[evicted_obj.key]
+        m_b1[evicted_obj.key] = None
+    elif evicted_obj.key in m_t2:
+        del m_t2[evicted_obj.key]
+        m_b2[evicted_obj.key] = None
+
+    # Constrain ghost list sizes to capacity
+    capacity = cache_snapshot.capacity
+    while len(m_b1) > capacity:
+        m_b1.pop(next(iter(m_b1)))
+    while len(m_b2) > capacity:
+        m_b2.pop(next(iter(m_b2)))
+
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

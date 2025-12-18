@@ -1,0 +1,670 @@
+<NAME>
+arc_tinylfu_fresh_tiers_and_shielding
+</NAME>
+
+<DESCRIPTION>
+I introduce three synergistic improvements to the ARC + TinyLFU hybrid to reduce miss rates across varied workloads:
+
+1) Freshness-tiered ghost re-admission and fast-promotion grace: On ghost hits, compute a continuous freshness weight w from eviction age over a dynamic window, then:
+- w ≥ 0.66: re-admit directly to T2 and seed frequency proportionally.
+- 0.33 ≤ w < 0.66: admit to T1 MRU but set a fast-promotion grace window so the next hit promotes immediately to T2.
+- w < 0.33: standard T1 handling. This accelerates useful reuse without polluting protected.
+
+2) Protected demotion shielding and scan-aware p dynamics: Add a no-demote window for freshly promoted or ghost-reinserted hot items, so T2 demotion avoids them for a short period. Enhance _adjust_p with sign-sensitive momentum (halve on sign flip) and scan-aware scaling (dampen increases, amplify decreases) to react faster during scans. Also track a decaying ratio of B2 vs B1 ghost hits and gate cross-segment eviction to avoid draining T2 during phase changes with poor locality.
+
+3) Hit-path fast lane: If a key in T1 has a fast-promotion flag valid, promote immediately to T2 on hit and apply the no-demote shield. This stabilizes genuinely hot keys recovering from eviction.
+
+Additionally, age maintenance trims state dictionaries and decays ghost-hit counters periodically. The evict path respects the ghost-hit ratio to prefer T1 eviction under poor locality. Together, these changes reduce thrash during scans, accelerate recovery of hot sets, and protect T2 from premature demotion—improving the overall hit rate.
+
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+# Tunables
+_P_INIT_RATIO = 0.30             # initial share for T1
+_FREQ_MAX = 7                    # 3-bit saturating counter
+_FRESH_WINDOW_RATIO = 0.5        # ghost freshness window = 0.5 * cap
+_SCAN_TRIGGER_INS = 0.7          # insert EWMA threshold
+_SCAN_TRIGGER_HIT = 0.15         # hit EWMA threshold
+_SCAN_WINDOW_MULT = 1.0          # scan window length ~= cap accesses
+=======
+# Tunables
+_P_INIT_RATIO = 0.30             # initial share for T1
+_FREQ_MAX = 7                    # 3-bit saturating counter
+_FRESH_WINDOW_RATIO = 0.5        # ghost freshness window = 0.5 * cap
+_SCAN_TRIGGER_INS = 0.7          # insert EWMA threshold
+_SCAN_TRIGGER_HIT = 0.15         # hit EWMA threshold
+_SCAN_WINDOW_MULT = 1.0          # scan window length ~= cap accesses
+
+# Promotion/demotion shielding and fast-lane
+_NO_DEMOTE_WINDOW_RATIO = 0.5    # shield T2 items from demotion for ~0.5 * cap accesses
+_fast_promote_until = {}         # key -> access_count until which T1 hit promotes immediately
+_no_demote_until = {}            # key -> access_count until which protected demotion is skipped
+
+# Ghost hit counters for cross-segment gating (decayed)
+_ghost_hits_b1 = 0.0
+_ghost_hits_b2 = 0.0
+
+# Momentum sign tracking
+_p_last_sign = 0
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def _maybe_age(cache_snapshot):
+    """Periodically age frequency counters and advance the decayed epoch."""
+    global _last_age_tick, _epoch_df, _last_epoch_tick_df
+    _ensure_capacity(cache_snapshot)
+    now = cache_snapshot.access_count
+    # Age simple saturating counters
+    if now - _last_age_tick >= max(1, _cap_est):
+        for k in list(_freq.keys()):
+            newf = _freq.get(k, 0) // 2
+            if newf <= 0:
+                _freq.pop(k, None)
+            else:
+                _freq[k] = newf
+        _last_age_tick = now
+    # Advance decayed-frequency epoch
+    if now - _last_epoch_tick_df >= _DECAY_WINDOW:
+        _epoch_df += 1
+        _last_epoch_tick_df = now
+=======
+def _maybe_age(cache_snapshot):
+    """Periodically age frequency counters and advance the decayed epoch."""
+    global _last_age_tick, _epoch_df, _last_epoch_tick_df, _ghost_hits_b1, _ghost_hits_b2
+    _ensure_capacity(cache_snapshot)
+    now = cache_snapshot.access_count
+    # Age simple saturating counters and decay ghost-hit aggregates; also prune expired shields
+    if now - _last_age_tick >= max(1, _cap_est):
+        for k in list(_freq.keys()):
+            newf = _freq.get(k, 0) // 2
+            if newf <= 0:
+                _freq.pop(k, None)
+            else:
+                _freq[k] = newf
+        # Decay ghost hit weights
+        _ghost_hits_b1 *= 0.5
+        _ghost_hits_b2 *= 0.5
+        # Prune expired fast-promote and no-demote entries
+        for k in list(_fast_promote_until.keys()):
+            if _fast_promote_until.get(k, 0) <= now:
+                _fast_promote_until.pop(k, None)
+        for k in list(_no_demote_until.keys()):
+            if _no_demote_until.get(k, 0) <= now:
+                _no_demote_until.pop(k, None)
+        _last_age_tick = now
+    # Advance decayed-frequency epoch
+    if now - _last_epoch_tick_df >= _DECAY_WINDOW:
+        _epoch_df += 1
+        _last_epoch_tick_df = now
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def _adjust_p(sign, step, now, freshness_scale=1.0):
+    """Momentum-based adjustment of ARC's p with clamping."""
+    global _p_target, _p_momentum, _p_last_update_tick
+    bounded = min(max(1.0, float(step) * float(freshness_scale)), max(1.0, 0.25 * float(_cap_est)))
+    _p_momentum = 0.5 * _p_momentum + float(sign) * bounded
+    _p_target += _p_momentum
+    if _p_target < 0.0:
+        _p_target = 0.0
+        _p_momentum = 0.0
+    if _p_target > float(_cap_est):
+        _p_target = float(_cap_est)
+        _p_momentum = 0.0
+    _p_last_update_tick = now
+=======
+def _adjust_p(sign, step, now, freshness_scale=1.0):
+    """Momentum-based adjustment of ARC's p with clamping and scan-aware scaling."""
+    global _p_target, _p_momentum, _p_last_update_tick, _p_last_sign
+    # Halve momentum on sign flip to stabilize
+    if sign != 0 and _p_last_sign != 0 and (sign * _p_last_sign < 0):
+        _p_momentum *= 0.5
+    # Base step with freshness
+    base = max(1.0, float(step) * float(freshness_scale))
+    # Scan-aware scaling: damp increases, amplify decreases
+    if now <= _scan_until:
+        if sign > 0:
+            base *= 0.5
+        elif sign < 0:
+            base *= 1.2
+    bounded = min(base, max(1.0, 0.25 * float(_cap_est)))
+    _p_momentum = 0.5 * _p_momentum + float(sign) * bounded
+    _p_target += _p_momentum
+    if _p_target < 0.0:
+        _p_target = 0.0
+        _p_momentum = 0.0
+    if _p_target > float(_cap_est):
+        _p_target = float(_cap_est)
+        _p_momentum = 0.0
+    _p_last_update_tick = now
+    _p_last_sign = sign
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def _demote_protected_if_needed(cache_snapshot, avoid_key=None):
+    """Keep T2 size within ARC target by demoting LRU entries to T1 MRU."""
+    _ensure_capacity(cache_snapshot)
+    t1_target = int(round(_p_target))
+    t2_target = max(_cap_est - t1_target, 0)
+    while len(_T2_protected) > t2_target:
+        # LRU of T2
+        lru = None
+        for k in _lru_iter(_T2_protected):
+            if k != avoid_key and k in cache_snapshot.cache:
+                lru = k
+                break
+        if lru is None:
+            break        # nothing to demote
+        _T2_protected.pop(lru, None)
+        _T1_probation[lru] = True  # demoted MRU in T1
+=======
+def _demote_protected_if_needed(cache_snapshot, avoid_key=None):
+    """Keep T2 size within ARC target by demoting LRU entries to T1 MRU, honoring no-demote shields."""
+    _ensure_capacity(cache_snapshot)
+    t1_target = int(round(_p_target))
+    t2_target = max(_cap_est - t1_target, 0)
+    now = cache_snapshot.access_count
+    while len(_T2_protected) > t2_target:
+        # Find first LRU key not avoided and not shielded
+        lru = None
+        for k in _lru_iter(_T2_protected):
+            if k == avoid_key or k not in cache_snapshot.cache:
+                continue
+            if _no_demote_until.get(k, 0) > now:
+                continue
+            lru = k
+            break
+        if lru is None:
+            break        # nothing to demote without violating shields
+        _T2_protected.pop(lru, None)
+        _T1_probation[lru] = True  # demoted MRU in T1
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    Evict using ARC replace with decayed-frequency, admission guard, and scan bias:
+    - Prefer T1 when |T1| > p or when upcoming key is in B2 and |T1| == p.
+    - During scan window, always prefer T1 if non-empty.
+    - Within the chosen segment, sample a few LRU entries and pick (hotter_flag, decayed_score asc, timestamp asc).
+    '''
+    _ensure_capacity(cache_snapshot)
+    _maybe_age(cache_snapshot)
+
+    t1_size = len(_T1_probation)
+    t2_size = len(_T2_protected)
+    x_in_b2 = (obj is not None) and (obj.key in _B2_ghost)
+    choose_t1 = (t1_size >= 1) and ((x_in_b2 and t1_size == int(round(_p_target))) or (t1_size > _p_target))
+
+    # Scan bias: keep evictions in probation when scanning
+    if cache_snapshot.access_count <= _scan_until and t1_size > 0:
+        choose_t1 = True
+
+    # Adaptive sampling sizes based on pressure and scan
+    cap = max(1, _cap_est)
+    t1_pressure = (t1_size > _p_target + 0.1 * cap) or (cache_snapshot.access_count <= _scan_until)
+    t2_pressure = (t2_size > (cap - int(round(_p_target)))) or False
+
+    T1_SAMPLE = 1 if t1_pressure else 3
+    if cache_snapshot.access_count <= _scan_until:
+        T1_SAMPLE = 1
+    T2_SAMPLE = 5 if t2_pressure else 3
+    if _hit_ewma < 0.2:
+        T2_SAMPLE = max(2, T2_SAMPLE - 1)
+
+    incoming_key = obj.key if obj is not None else None
+
+    victim_key = None
+    if choose_t1 and t1_size > 0:
+        victim_key = _pick_with_guard(_T1_probation, T1_SAMPLE, cache_snapshot, incoming_key)
+    if victim_key is None and t2_size > 0:
+        victim_key = _pick_with_guard(_T2_protected, T2_SAMPLE, cache_snapshot, incoming_key)
+    if victim_key is None and t1_size > 0:
+        victim_key = _pick_with_guard(_T1_probation, T1_SAMPLE, cache_snapshot, incoming_key)
+    if victim_key is None:
+        victim_key = _fallback_choose(cache_snapshot)
+    return victim_key
+=======
+def evict(cache_snapshot, obj):
+    '''
+    Evict using ARC replace with decayed-frequency, admission guard, and scan/ghost-ratio bias:
+    - Prefer T1 when |T1| > p or when upcoming key is in B2 and |T1| == p.
+    - During scan window, always prefer T1 if non-empty.
+    - If recent B2 ghost hits outnumber B1 and hit EWMA is poor, gate T2 evictions (prefer T1 when possible).
+    - Within the chosen segment, sample a few LRU entries and pick (hotter_flag, decayed_score asc, timestamp asc).
+    '''
+    _ensure_capacity(cache_snapshot)
+    _maybe_age(cache_snapshot)
+
+    t1_size = len(_T1_probation)
+    t2_size = len(_T2_protected)
+    x_in_b2 = (obj is not None) and (obj.key in _B2_ghost)
+    choose_t1 = (t1_size >= 1) and ((x_in_b2 and t1_size == int(round(_p_target))) or (t1_size > _p_target))
+
+    # Scan bias: keep evictions in probation when scanning
+    now = cache_snapshot.access_count
+    if now <= _scan_until and t1_size > 0:
+        choose_t1 = True
+
+    # Ghost-ratio gating: avoid draining T2 when recent B2 ghost hits dominate under poor locality
+    if (not choose_t1) and t1_size > 0 and (_hit_ewma < 0.2) and (_ghost_hits_b2 > 1.2 * _ghost_hits_b1):
+        choose_t1 = True
+
+    # Adaptive sampling sizes based on pressure and scan
+    cap = max(1, _cap_est)
+    t1_pressure = (t1_size > _p_target + 0.1 * cap) or (now <= _scan_until)
+    t2_pressure = (t2_size > (cap - int(round(_p_target)))) or False
+
+    T1_SAMPLE = 1 if t1_pressure else 3
+    if now <= _scan_until:
+        T1_SAMPLE = 1
+    T2_SAMPLE = 5 if t2_pressure else 3
+    if _hit_ewma < 0.2:
+        T2_SAMPLE = max(2, T2_SAMPLE - 1)
+
+    incoming_key = obj.key if obj is not None else None
+
+    victim_key = None
+    if choose_t1 and t1_size > 0:
+        victim_key = _pick_with_guard(_T1_probation, T1_SAMPLE, cache_snapshot, incoming_key)
+    if victim_key is None and t2_size > 0:
+        victim_key = _pick_with_guard(_T2_protected, T2_SAMPLE, cache_snapshot, incoming_key)
+    if victim_key is None and t1_size > 0:
+        victim_key = _pick_with_guard(_T1_probation, T1_SAMPLE, cache_snapshot, incoming_key)
+    if victim_key is None:
+        victim_key = _fallback_choose(cache_snapshot)
+    return victim_key
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def update_after_hit(cache_snapshot, obj):
+    '''
+    On hit:
+    - Update EWMA and age counters.
+    - Increment decayed frequency and saturating counter.
+    - In scan mode: require two touches in T1 before promotion (epoch-gated).
+    - Otherwise: first hit in T1 promotes to T2 if already touched once, or clearly hot by decayed score, or recent B2 ghost.
+    - Keep T2 within its ARC target via demotion.
+    - Remove any ghost entries for this key.
+    '''
+    _ensure_capacity(cache_snapshot)
+    _maybe_age(cache_snapshot)
+    _update_activity(True, cache_snapshot)
+
+    key = obj.key
+    now = cache_snapshot.access_count
+    m_key_timestamp[key] = now
+    _freq[key] = min(_FREQ_MAX, _freq.get(key, 0) + 1)
+    _inc_decayed(key)
+
+    in_scan = now <= _scan_until
+    fresh_window = max(1, int(_FRESH_WINDOW_RATIO * _cap_est))
+
+    if key in _T2_protected:
+        _T2_protected.move_to_end(key, last=True)
+        _touched_once.pop(key, None)
+    elif key in _T1_probation:
+        last_epoch = _touched_once.get(key)
+        promote = False
+        if in_scan:
+            if last_epoch is not None and (_epoch_df - last_epoch) <= 1:
+                promote = True
+            else:
+                _touched_once[key] = _epoch_df
+        else:
+            hot_freq = (_decayed_score(key) >= 2)
+            ev_ts = _B2_ghost.get(key, None)
+            recent_b2 = (isinstance(ev_ts, int) and (now - ev_ts) <= fresh_window)
+            if (last_epoch is not None) or hot_freq or recent_b2:
+                promote = True
+            else:
+                _touched_once[key] = _epoch_df
+
+        if promote:
+            _touched_once.pop(key, None)
+            _T1_probation.pop(key, None)
+            _T2_protected[key] = True  # MRU in T2
+        else:
+            _T1_probation.move_to_end(key, last=True)
+    else:
+        # Metadata miss: treat as hot and place in T2
+        _T2_protected[key] = True
+        _touched_once.pop(key, None)
+
+    _demote_protected_if_needed(cache_snapshot, avoid_key=key)
+
+    # Ghost cleanup
+    if key in _B1_ghost:
+        _B1_ghost.pop(key, None)
+    if key in _B2_ghost:
+        _B2_ghost.pop(key, None)
+    _ghost_trim()
+=======
+def update_after_hit(cache_snapshot, obj):
+    '''
+    On hit:
+    - Update EWMA and age counters.
+    - Increment decayed frequency and saturating counter.
+    - In scan mode: require two touches in T1 before promotion (epoch-gated).
+    - Otherwise: first hit in T1 promotes to T2 if already touched once, or clearly hot by decayed score, or recent B2 ghost.
+    - Fast-promotion grace: if key has a grace window active, promote immediately.
+    - Apply no-demote shielding on promotions/hits in T2.
+    - Keep T2 within its ARC target via demotion.
+    - Remove any ghost entries for this key.
+    '''
+    _ensure_capacity(cache_snapshot)
+    _maybe_age(cache_snapshot)
+    _update_activity(True, cache_snapshot)
+
+    key = obj.key
+    now = cache_snapshot.access_count
+    m_key_timestamp[key] = now
+    _freq[key] = min(_FREQ_MAX, _freq.get(key, 0) + 1)
+    _inc_decayed(key)
+
+    in_scan = now <= _scan_until
+    fresh_window = max(1, int(_FRESH_WINDOW_RATIO * _cap_est))
+
+    if key in _T2_protected:
+        _T2_protected.move_to_end(key, last=True)
+        _touched_once.pop(key, None)
+        # Extend no-demote shield on active T2 hits
+        _no_demote_until[key] = max(_no_demote_until.get(key, 0), now + max(1, int(_NO_DEMOTE_WINDOW_RATIO * _cap_est)))
+    elif key in _T1_probation:
+        last_epoch = _touched_once.get(key)
+        promote = False
+        # Fast-promotion grace takes precedence
+        if now <= _fast_promote_until.get(key, 0):
+            promote = True
+            _fast_promote_until.pop(key, None)
+        elif in_scan:
+            if last_epoch is not None and (_epoch_df - last_epoch) <= 1:
+                promote = True
+            else:
+                _touched_once[key] = _epoch_df
+        else:
+            hot_freq = (_decayed_score(key) >= 2)
+            ev_ts = _B2_ghost.get(key, None)
+            recent_b2 = (isinstance(ev_ts, int) and (now - ev_ts) <= fresh_window)
+            if (last_epoch is not None) or hot_freq or recent_b2:
+                promote = True
+            else:
+                _touched_once[key] = _epoch_df
+
+        if promote:
+            _touched_once.pop(key, None)
+            _T1_probation.pop(key, None)
+            _T2_protected[key] = True  # MRU in T2
+            _no_demote_until[key] = now + max(1, int(_NO_DEMOTE_WINDOW_RATIO * _cap_est))
+        else:
+            _T1_probation.move_to_end(key, last=True)
+    else:
+        # Metadata miss: treat as hot and place in T2
+        _T2_protected[key] = True
+        _touched_once.pop(key, None)
+        _no_demote_until[key] = now + max(1, int(_NO_DEMOTE_WINDOW_RATIO * _cap_est))
+
+    _demote_protected_if_needed(cache_snapshot, avoid_key=key)
+
+    # Ghost cleanup
+    if key in _B1_ghost:
+        _B1_ghost.pop(key, None)
+    if key in _B2_ghost:
+        _B2_ghost.pop(key, None)
+    _ghost_trim()
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On miss and insert:
+    - Update EWMA, age counters, and decayed frequency.
+    - If key in ghosts: momentum-adjust p; fresh ghosts re-admit to T2 (seed decayed freq), stale to T1.
+    - Else: insert to T1; during guard/scan, place at T1 LRU and gently lower p in scan to bias T1 evictions.
+    '''
+    _ensure_capacity(cache_snapshot)
+    _maybe_age(cache_snapshot)
+    _update_activity(False, cache_snapshot)
+
+    key = obj.key
+    now = cache_snapshot.access_count
+    m_key_timestamp[key] = now
+    _inc_decayed(key)  # count the access producing this insert
+
+    in_b1 = key in _B1_ghost
+    in_b2 = key in _B2_ghost
+
+    fresh_window = max(1, int(_FRESH_WINDOW_RATIO * _cap_est))
+
+    if in_b1 or in_b2:
+        if in_b1:
+            step = max(1.0, float(len(_B2_ghost)) / max(1.0, float(len(_B1_ghost))))
+            ev_ts = _B1_ghost.get(key, None)
+            age = (now - ev_ts) if isinstance(ev_ts, int) else (fresh_window + 1)
+            fresh = age <= fresh_window
+            _adjust_p(+1, step, now, freshness_scale=(1.2 if fresh else 1.0))
+            _B1_ghost.pop(key, None)
+            if fresh:
+                _T2_protected[key] = True
+                # Seed some frequency to stabilize against immediate eviction
+                _freq[key] = min(_FREQ_MAX, _freq.get(key, 0) + 2)
+                _inc_decayed(key)
+                _demote_protected_if_needed(cache_snapshot, avoid_key=key)
+            else:
+                _T1_probation[key] = True
+        else:
+            step = max(1.0, float(len(_B1_ghost)) / max(1.0, float(len(_B2_ghost))))
+            ev_ts = _B2_ghost.get(key, None)
+            age = (now - ev_ts) if isinstance(ev_ts, int) else (fresh_window + 1)
+            fresh = age <= fresh_window
+            _adjust_p(-1, step, now, freshness_scale=(1.2 if fresh else 1.0))
+            _B2_ghost.pop(key, None)
+            if fresh:
+                _T2_protected[key] = True
+                _freq[key] = min(_FREQ_MAX, _freq.get(key, 0) + 2)
+                _inc_decayed(key)
+                _demote_protected_if_needed(cache_snapshot, avoid_key=key)
+            else:
+                _T1_probation[key] = True
+    else:
+        # New key: insert into T1
+        _T1_probation[key] = True
+        # Guard and scan handling: bias newcomer colder
+        if (_last_victim_strength >= _VICTIM_GUARD_THRESH) or (now <= _scan_until):
+            _T1_probation.move_to_end(key, last=False)
+            # During scan, gently lower p to keep pressure in T1
+            if now <= _scan_until:
+                _adjust_p(-1, max(1.0, 0.1 * float(_cap_est)), now)
+
+    # Avoid duplicates across structures
+    if key in _T1_probation and key in _T2_protected:
+        _T1_probation.pop(key, None)
+    if key in _B1_ghost:
+        _B1_ghost.pop(key, None)
+    if key in _B2_ghost:
+        _B2_ghost.pop(key, None)
+    _ghost_trim()
+=======
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On miss and insert:
+    - Update EWMA, age counters, and decayed frequency.
+    - If key in ghosts: momentum-adjust p with freshness weighting; freshness-tiered re-admission with fast-promotion grace.
+    - Else: insert to T1; during guard/scan, place at T1 LRU and gently lower p in scan to bias T1 evictions.
+    '''
+    _ensure_capacity(cache_snapshot)
+    _maybe_age(cache_snapshot)
+    _update_activity(False, cache_snapshot)
+
+    key = obj.key
+    now = cache_snapshot.access_count
+    m_key_timestamp[key] = now
+    _inc_decayed(key)  # count the access producing this insert
+
+    in_b1 = key in _B1_ghost
+    in_b2 = key in _B2_ghost
+
+    fresh_window = max(1, int(_FRESH_WINDOW_RATIO * _cap_est))
+
+    if in_b1 or in_b2:
+        if in_b1:
+            _ghost_hits_b1 += 1.0
+            step = max(1.0, float(len(_B2_ghost)) / max(1.0, float(len(_B1_ghost))))
+            ev_ts = _B1_ghost.get(key, None)
+            age = (now - ev_ts) if isinstance(ev_ts, int) else (fresh_window + 1)
+            w = max(0.0, 1.0 - (float(age) / float(fresh_window)))
+            _adjust_p(+1, step, now, freshness_scale=(1.0 + 2.0 * w))
+            _B1_ghost.pop(key, None)
+            if w >= 0.66:
+                _T2_protected[key] = True
+                # Seed frequency proportional to freshness
+                seed = 1 + int(round(4.0 * w))
+                _freq[key] = min(_FREQ_MAX, max(_freq.get(key, 0), seed))
+                _inc_decayed(key)
+                _no_demote_until[key] = now + max(1, int(_NO_DEMOTE_WINDOW_RATIO * _cap_est))
+                _demote_protected_if_needed(cache_snapshot, avoid_key=key)
+            elif w >= 0.33:
+                _T1_probation[key] = True
+                _T1_probation.move_to_end(key, last=True)  # MRU
+                _fast_promote_until[key] = now + fresh_window
+            else:
+                _T1_probation[key] = True
+        else:
+            _ghost_hits_b2 += 1.0
+            step = max(1.0, float(len(_B1_ghost)) / max(1.0, float(len(_B2_ghost))))
+            ev_ts = _B2_ghost.get(key, None)
+            age = (now - ev_ts) if isinstance(ev_ts, int) else (fresh_window + 1)
+            w = max(0.0, 1.0 - (float(age) / float(fresh_window)))
+            _adjust_p(-1, step, now, freshness_scale=(1.0 + 2.0 * w))
+            _B2_ghost.pop(key, None)
+            if w >= 0.66:
+                _T2_protected[key] = True
+                seed = 1 + int(round(4.0 * w))
+                _freq[key] = min(_FREQ_MAX, max(_freq.get(key, 0), seed))
+                _inc_decayed(key)
+                _no_demote_until[key] = now + max(1, int(_NO_DEMOTE_WINDOW_RATIO * _cap_est))
+                _demote_protected_if_needed(cache_snapshot, avoid_key=key)
+            elif w >= 0.33:
+                _T1_probation[key] = True
+                _T1_probation.move_to_end(key, last=True)
+                _fast_promote_until[key] = now + fresh_window
+            else:
+                _T1_probation[key] = True
+    else:
+        # New key: insert into T1
+        _T1_probation[key] = True
+        # Guard and scan handling: bias newcomer colder
+        if (_last_victim_strength >= _VICTIM_GUARD_THRESH) or (now <= _scan_until):
+            _T1_probation.move_to_end(key, last=False)
+            # During scan, gently lower p to keep pressure in T1
+            if now <= _scan_until:
+                _adjust_p(-1, max(1.0, 0.1 * float(_cap_est)), now)
+
+    # Avoid duplicates across structures
+    if key in _T1_probation and key in _T2_protected:
+        _T1_probation.pop(key, None)
+    if key in _B1_ghost:
+        _B1_ghost.pop(key, None)
+    if key in _B2_ghost:
+        _B2_ghost.pop(key, None)
+    _ghost_trim()
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    After eviction:
+    - Remove from resident segment and put into the appropriate ghost with timestamp.
+    - Track victim strength (decayed) and set a short admission guard when a strong T2 victim is evicted.
+    - Clean frequency, timestamp, and two-touch entries.
+    '''
+    _ensure_capacity(cache_snapshot)
+    key = evicted_obj.key
+    now = cache_snapshot.access_count
+
+    was_t1 = key in _T1_probation
+    was_t2 = key in _T2_protected
+
+    fval_dec = _decayed_score(key)
+    strength = float(fval_dec) + (2.0 if was_t2 else 0.0)
+    global _last_victim_strength, _guard_until
+    _last_victim_strength = strength
+
+    if was_t1:
+        _T1_probation.pop(key, None)
+        _B1_ghost[key] = now
+    elif was_t2:
+        _T2_protected.pop(key, None)
+        _B2_ghost[key] = now
+        if fval_dec >= 2:
+            _guard_until = now + max(1, _cap_est // 2)
+    else:
+        # Unknown residency; default to B1 ghost
+        _B1_ghost[key] = now
+
+    # Clean per-key state
+    m_key_timestamp.pop(key, None)
+    _freq.pop(key, None)
+    _refcnt.pop(key, None)
+    _touched_once.pop(key, None)
+
+    _ghost_trim()
+=======
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    After eviction:
+    - Remove from resident segment and put into the appropriate ghost with timestamp.
+    - Track victim strength (decayed) and set a short admission guard when a strong T2 victim is evicted.
+    - Clean frequency, timestamp, two-touch, and shielding/fast-promotion entries.
+    '''
+    _ensure_capacity(cache_snapshot)
+    key = evicted_obj.key
+    now = cache_snapshot.access_count
+
+    was_t1 = key in _T1_probation
+    was_t2 = key in _T2_protected
+
+    fval_dec = _decayed_score(key)
+    strength = float(fval_dec) + (2.0 if was_t2 else 0.0)
+    global _last_victim_strength, _guard_until
+    _last_victim_strength = strength
+
+    if was_t1:
+        _T1_probation.pop(key, None)
+        _B1_ghost[key] = now
+    elif was_t2:
+        _T2_protected.pop(key, None)
+        _B2_ghost[key] = now
+        if fval_dec >= 2:
+            _guard_until = now + max(1, _cap_est // 2)
+    else:
+        # Unknown residency; default to B1 ghost
+        _B1_ghost[key] = now
+
+    # Clean per-key state
+    m_key_timestamp.pop(key, None)
+    _freq.pop(key, None)
+    _refcnt.pop(key, None)
+    _touched_once.pop(key, None)
+    _fast_promote_until.pop(key, None)
+    _no_demote_until.pop(key, None)
+
+    _ghost_trim()
+>>>>>>> REPLACE
+
+</DIFF>

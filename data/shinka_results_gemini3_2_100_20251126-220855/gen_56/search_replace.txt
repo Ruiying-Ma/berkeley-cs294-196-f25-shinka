@@ -1,0 +1,78 @@
+<NAME>
+warm_ghost_rescue
+</NAME>
+
+<DESCRIPTION>
+1. Increase Ghost registry capacity to 5x cache capacity to better detect larger loops and recurring items that exceed the standard history window.
+2. Initialize frequency to 1 (instead of 0) for items rescued from Ghost or promoted from Small. This "Warm Start" allows these proven items to survive at least one eviction cycle in the Main queue, preventing immediate eviction in thrashing scenarios (like Trace 14).
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Lazy cleanup of ghost
+    while len(s3_ghost) > capacity:
+        # Remove oldest item (head of dict)
+        s3_ghost.pop(next(iter(s3_ghost)))
+=======
+    # Lazy cleanup of ghost
+    # Expanded ghost size to capture larger working sets/loops
+    target_ghost = capacity * 5
+    while len(s3_ghost) > target_ghost:
+        # Remove oldest item (head of dict)
+        s3_ghost.pop(next(iter(s3_ghost)))
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+            if freq > 0:
+                # Hit in Small: Promote to Main
+                # Reset frequency to 0 upon entering Main (new probation)
+                s3_small.pop(candidate)
+                s3_main[candidate] = None
+                s3_freq[candidate] = 0
+                continue
+=======
+            if freq > 0:
+                # Hit in Small: Promote to Main
+                # Warm start (freq=1) to prevent immediate eviction
+                s3_small.pop(candidate)
+                s3_main[candidate] = None
+                s3_freq[candidate] = 1
+                continue
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On Insert:
+    - If in Ghost, insert to Main (rescue).
+    - Else, insert to Small.
+    '''
+    _check_reset(cache_snapshot)
+    global s3_small, s3_main, s3_ghost, s3_freq
+    key = obj.key
+    s3_freq[key] = 0
+
+    if key in s3_ghost:
+        s3_main[key] = None
+        s3_ghost.pop(key)
+    else:
+        s3_small[key] = None
+=======
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On Insert:
+    - If in Ghost, insert to Main (rescue).
+    - Else, insert to Small.
+    '''
+    _check_reset(cache_snapshot)
+    global s3_small, s3_main, s3_ghost, s3_freq
+    key = obj.key
+
+    if key in s3_ghost:
+        s3_main[key] = None
+        s3_ghost.pop(key)
+        # Rescue: Warm start (freq=1)
+        s3_freq[key] = 1
+    else:
+        s3_small[key] = None
+        s3_freq[key] = 0
+>>>>>>> REPLACE
+</DIFF>

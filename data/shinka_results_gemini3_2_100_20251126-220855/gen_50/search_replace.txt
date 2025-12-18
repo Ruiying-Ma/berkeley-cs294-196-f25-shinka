@@ -1,0 +1,133 @@
+<NAME>
+s3_lifo_bypass_ghost_ext
+</NAME>
+
+<DESCRIPTION>
+1.  **Probabilistic LIFO Bypass**: Modify `evict` to use FIFO eviction for the small queue 10% of the time. This breaks pathological "gatekeeper" loops (Trace 14) where strict LIFO prevents new working sets from entering the cache.
+2.  **Extended Ghost Registry**: Increase `s3_ghost` capacity to 2x cache capacity in `update_after_evict`. This allows the algorithm to recognize and recover recurring items in loops that are larger than the cache but smaller than 2x cache.
+3.  **Ghost Frequency Decay**: Halve the restored frequency when an item returns from ghost in `update_after_insert`. This prevents old heavy hitters from dominating the cache immediately if their high frequency is stale.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+"""Cache eviction algorithm: S3-LIFO-LRU with Ghost-Frequency Restoration"""
+from collections import OrderedDict
+
+# Global State
+=======
+"""Cache eviction algorithm: S3-LIFO-LRU with Ghost-Frequency Restoration"""
+from collections import OrderedDict
+import random
+
+# Global State
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    S3-LIFO-LRU Eviction:
+    - Ages frequencies periodically.
+    - Favors evicting from Small (LIFO) to protect Main and filter scan/loops.
+    - Promotes from Small to Main if freq > 1.
+    - Fallback to Main (LRU).
+    '''
+    _reset_state(cache_snapshot)
+
+    # Aging Logic
+    if cache_snapshot.access_count % s3_config['aging_interval'] == 0:
+        _age_freqs()
+
+    target_small = s3_config['small_target']
+
+    # 1. Try evicting from Small if it's over budget or if Main is empty
+    # We use a loop to handle promotions
+    while len(s3_small) > target_small or (not s3_main and s3_small):
+        # LIFO Eviction: Inspect tail (newest)
+        victim_key, _ = s3_small.popitem(last=True)
+
+        # Check Promotion (freq > 1)
+        if s3_freq.get(victim_key, 0) > 1:
+            # Promote to Main (MRU)
+            s3_main[victim_key] = 1
+            s3_main.move_to_end(victim_key)
+            # Remove from freq map (optional, or keep for history)
+            # We keep it in s3_freq for continuity
+        else:
+            # Victim found. Put back for update_after_evict (or just return)
+            # We must return a key that is present in the cache.
+            # We popped it, so we must push it back to be consistent with external view
+            s3_small[victim_key] = 1
+            # move_to_end(last=True) is implied by assignment for new key
+            return victim_key
+
+    # 2. If Small is safe, evict from Main (LRU)
+    if s3_main:
+        return next(iter(s3_main))
+=======
+def evict(cache_snapshot, obj):
+    '''
+    S3-LIFO-LRU Eviction with Probabilistic Bypass:
+    - Ages frequencies periodically.
+    - Favors evicting from Small to protect Main.
+    - Small uses LIFO (90%) to filter scans, FIFO (10%) to flush stale items.
+    - Promotes from Small to Main if freq > 1.
+    '''
+    _reset_state(cache_snapshot)
+
+    # Aging Logic
+    if cache_snapshot.access_count % s3_config['aging_interval'] == 0:
+        _age_freqs()
+
+    target_small = s3_config['small_target']
+
+    # 1. Try evicting from Small if it's over budget or if Main is empty
+    # We use a loop to handle promotions
+    while len(s3_small) > target_small or (not s3_main and s3_small):
+        # Probabilistic FIFO Bypass: 10% chance to evict Oldest (FIFO) instead of Newest (LIFO)
+        # This prevents "gatekeeper" lock-out where new useful items are LIFO-evicted immediately.
+        use_fifo = (random.randint(1, 10) == 1)
+
+        if use_fifo:
+            victim_key, _ = s3_small.popitem(last=False) # FIFO (pop from head)
+        else:
+            victim_key, _ = s3_small.popitem(last=True)  # LIFO (pop from tail)
+
+        # Check Promotion (freq > 1)
+        if s3_freq.get(victim_key, 0) > 1:
+            # Promote to Main (MRU)
+            s3_main[victim_key] = 1
+            s3_main.move_to_end(victim_key)
+        else:
+            # Victim found. Put back to maintain state until update_after_evict
+            s3_small[victim_key] = 1
+            # Note: Putting it back moves it to tail (MRU).
+            # If we picked it via FIFO (head), this effectively gives it a "second chance"
+            # within s3_small logic if we were continuing, but we return it immediately as victim.
+            return victim_key
+
+    # 2. If Small is safe, evict from Main (LRU)
+    if s3_main:
+        return next(iter(s3_main))
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    if key in s3_ghost:
+        # Restore frequency
+        restored_freq = s3_ghost.pop(key)
+        s3_freq[key] = restored_freq
+        # Promote to Main immediately
+=======
+    if key in s3_ghost:
+        # Restore frequency with decay
+        restored_freq = s3_ghost.pop(key)
+        s3_freq[key] = restored_freq // 2
+        # Promote to Main immediately
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Maintain Ghost size
+    if len(s3_ghost) > capacity:
+        s3_ghost.popitem(last=False) # Remove oldest ghost
+=======
+    # Maintain Ghost size (Extended to 2x capacity)
+    if len(s3_ghost) > capacity * 2:
+        s3_ghost.popitem(last=False) # Remove oldest ghost
+>>>>>>> REPLACE
+</DIFF>

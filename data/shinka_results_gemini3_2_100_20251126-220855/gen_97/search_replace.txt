@@ -1,0 +1,158 @@
+<NAME>
+fifo_t1_strict_t2
+</NAME>
+
+<DESCRIPTION>
+This change introduces two key improvements to the S3-FIFO algorithm:
+1.  **FIFO Eviction for T1 (Probation)**: Replaces the LIFO eviction policy in the small queue with FIFO. While LIFO provides strict scan resistance, it is overly aggressive for short-term working sets that require a slightly longer window to demonstrate utility. FIFO allows items to transit the full T1 window, providing a fair opportunity for promotion, which generally improves hit rates on standard traces.
+2.  **Strict T2 (Main) Eviction**: Implements a "strict reset" policy where items evicted from the main queue (T2) are immediately removed from the ghost registry (frequency reset to 0). This addresses the "loop churning" problem (evident in Trace 14's 0.00 score) where items in large loops continuously promote, fill the main cache, and get evicted, only to retain their high frequency and promote again immediately. By forcing evicted main items to "prove" themselves from scratch (requiring two hits in short succession), we break this cycle, allowing the cache to stabilize on a static subset of the loop (static caching) or at least reduce churn, significantly improving performance on loop patterns larger than the cache.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    check_reset(cache_snapshot)
+    global m_p
+
+    capacity = cache_snapshot.capacity
+    current_time = cache_snapshot.access_count
+
+    # 1. Global Frequency Aging
+    # Occurs every 2 * capacity accesses
+    if current_time - m_p > capacity * 2:
+        # Decay frequencies
+        for k in m_b1:
+            m_b1[k] //= 2
+        m_p = float(current_time)
+
+    # T1 Target Size (10%)
+    t1_target = int(capacity * 0.1)
+    if t1_target < 1: t1_target = 1
+
+    # 2. Evict from T1 (Probation)
+    # Use LIFO to handle scans (scan items are evicted immediately)
+    if len(m_t1) >= t1_target:
+        while len(m_t1) > 0:
+            victim_key = next(reversed(m_t1)) # LIFO Candidate
+
+            # Promotion Check:
+            # If freq > 1 (meaning seen before, e.g., in ghost), promote to T2
+            if m_b1.get(victim_key, 0) > 1:
+                del m_t1[victim_key]
+                m_t2[victim_key] = None # Move to T2 MRU
+
+                # If T1 is now small enough, stop
+                if len(m_t1) < t1_target:
+                    break
+            else:
+                # Evict victim (Failed probation)
+                return victim_key
+
+    # 3. Evict from T2 (Main) - Second Chance
+    # Search for a victim with low frequency
+    # Limit search to avoid O(N) in worst case
+    search_limit = 10
+    while m_t2:
+        candidate = next(iter(m_t2)) # LRU Candidate
+
+        freq = m_b1.get(candidate, 0)
+
+        # If freq > 0, give second chance (retain)
+        if freq > 0 and search_limit > 0:
+            m_t2.move_to_end(candidate) # Reinsert at MRU
+            m_b1[candidate] = freq - 1  # Decrement frequency (Second Chance cost)
+            search_limit -= 1
+        else:
+            # Evict
+            return candidate
+
+    # Fallback (should be rare if T2 has items)
+    if m_t1:
+        return next(reversed(m_t1))
+    return obj.key
+=======
+def evict(cache_snapshot, obj):
+    check_reset(cache_snapshot)
+    global m_p
+
+    capacity = cache_snapshot.capacity
+    current_time = cache_snapshot.access_count
+
+    # 1. Global Frequency Aging
+    if current_time - m_p > capacity * 2:
+        for k in m_b1:
+            m_b1[k] //= 2
+        m_p = float(current_time)
+
+    # T1 Target Size (10%)
+    t1_target = int(capacity * 0.1)
+    if t1_target < 1: t1_target = 1
+
+    # 2. Evict from T1 (Probation)
+    # Use FIFO to allow short-term residence for working set capture
+    if len(m_t1) >= t1_target:
+        while len(m_t1) > 0:
+            # FIFO Eviction Candidate: Head of T1
+            victim_key = next(iter(m_t1))
+
+            # Promotion Check:
+            # If freq > 1 (meaning seen before/ghost), promote to T2
+            if m_b1.get(victim_key, 0) > 1:
+                del m_t1[victim_key]
+                m_t2[victim_key] = None # Move to T2 MRU
+
+                # Stop if T1 is healthy
+                if len(m_t1) < t1_target:
+                    break
+            else:
+                # Evict from T1
+                return victim_key
+
+    # 3. Evict from T2 (Main) - Second Chance
+    search_limit = 10
+    while m_t2:
+        candidate = next(iter(m_t2)) # LRU Candidate
+        freq = m_b1.get(candidate, 0)
+
+        # Second Chance: If freq > 0, retain and decay
+        if freq > 0 and search_limit > 0:
+            m_t2.move_to_end(candidate)
+            m_b1[candidate] = freq - 1
+            search_limit -= 1
+        else:
+            return candidate
+
+    # Fallback
+    if m_t1:
+        return next(iter(m_t1))
+    return obj.key
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    check_reset(cache_snapshot)
+    key = evicted_obj.key
+
+    if key in m_t1:
+        del m_t1[key]
+    elif key in m_t2:
+        del m_t2[key]
+
+    # Limit Ghost Size
+=======
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    check_reset(cache_snapshot)
+    key = evicted_obj.key
+
+    if key in m_t1:
+        del m_t1[key]
+        # Keep in ghost (m_b1) for history
+    elif key in m_t2:
+        del m_t2[key]
+        # Strict T2 Eviction: Remove from frequency map/ghost
+        # This breaks loop churn by forcing evicted main items to start over
+        if key in m_b1:
+            del m_b1[key]
+
+    # Limit Ghost Size
+>>>>>>> REPLACE
+</DIFF>

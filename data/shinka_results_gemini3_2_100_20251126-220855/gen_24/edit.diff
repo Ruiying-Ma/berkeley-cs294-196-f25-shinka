@@ -1,0 +1,305 @@
+--- a/original.py
++++ b/original.py
+@@ -1,165 +1,189 @@
+ # EVOLVE-BLOCK-START
+-"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
++from collections import OrderedDict
+ 
+-# ARC Global State
+-m_lru = {}    # key -> access_count
+-m_t1 = set()  # T1 keys (Recent)
+-m_t2 = set()  # T2 keys (Frequent)
+-m_b1 = set()  # B1 keys (Ghost Recent)
+-m_b2 = set()  # B2 keys (Ghost Frequent)
+-m_p = 0.0     # Adaptation parameter (Target T1 size)
++# S3-FIFO Global State
++# m_small: FIFO queue for new/probationary items
++# m_main: FIFO queue for protected/frequent items
++# m_ghost_s: Ghost history for items evicted from Small
++# m_ghost_m: Ghost history for items evicted from Main
++# m_freq: Frequency counter for items (simulates access bits)
++# m_ratio: Target ratio for the Small queue size (0.0 to 1.0)
++m_small = OrderedDict()
++m_main = OrderedDict()
++m_ghost_s = OrderedDict()
++m_ghost_m = OrderedDict()
++m_freq = {}
++m_ratio = 0.1
+ m_last_access_count = 0
+ 
+ def check_reset(cache_snapshot):
+-    global m_last_access_count, m_lru, m_t1, m_t2, m_b1, m_b2, m_p
++    '''
++    Detects if the trace has changed/reset and clears internal state.
++    '''
++    global m_last_access_count, m_small, m_main, m_ghost_s, m_ghost_m, m_freq, m_ratio
+     current_count = cache_snapshot.access_count
+     if current_count < m_last_access_count:
+-        m_lru.clear()
+-        m_t1.clear()
+-        m_t2.clear()
+-        m_b1.clear()
+-        m_b2.clear()
+-        m_p = 0.0
++        m_small.clear()
++        m_main.clear()
++        m_ghost_s.clear()
++        m_ghost_m.clear()
++        m_freq.clear()
++        m_ratio = 0.1
+     m_last_access_count = current_count
+ 
+ def evict(cache_snapshot, obj):
+     '''
+-    This function defines how the algorithm chooses the eviction victim.
++    Adaptive S3-FIFO Eviction Policy.
++    - Adapts partition size (S vs M) based on ghost hits.
++    - Selects victim from S or M based on size targets and access history.
+     '''
+     check_reset(cache_snapshot)
+-    global m_p, m_t1, m_t2, m_b1, m_b2, m_lru
++    global m_ratio, m_small, m_main, m_ghost_s, m_ghost_m, m_freq
+ 
+-    # ARC Adaptation: Adjust p based on ghost hits
+-    if obj.key in m_b1:
+-        delta = 1.0
+-        if len(m_b1) < len(m_b2):
+-            delta = float(len(m_b2)) / len(m_b1)
+-        m_p = min(float(cache_snapshot.capacity), m_p + delta)
+-    elif obj.key in m_b2:
+-        delta = 1.0
+-        if len(m_b2) < len(m_b1):
+-            delta = float(len(m_b1)) / len(m_b2)
+-        m_p = max(0.0, m_p - delta)
++    capacity = cache_snapshot.capacity
++    
++    # 1. Adapt S/M Partition Ratio
++    # If the missing object (obj) is in a ghost list, it indicates we evicted it too early.
++    if obj.key in m_ghost_s:
++        # Ghost S hit -> S was too small, increase target S size
++        m_ratio = min(0.9, m_ratio + 0.02)
++    elif obj.key in m_ghost_m:
++        # Ghost M hit -> M was too small (S too big), decrease target S size
++        m_ratio = max(0.01, m_ratio - 0.02)
+ 
+-    # Filter sets to match actual cache (handle drift/init)
+-    t1_real = [k for k in m_t1 if k in cache_snapshot.cache]
+-    t2_real = [k for k in m_t2 if k in cache_snapshot.cache]
++    target_s = max(1, int(capacity * m_ratio))
++    
++    # 2. Select Victim
++    # We loop to apply the "Second Chance" logic (clearing access bits and moving items).
++    # We limit attempts to avoid infinite loops in pathological cases (though access bits are cleared).
++    attempts = 0
++    max_attempts = len(m_small) + len(m_main) + 10 # Safety buffer
++    
++    while attempts < max_attempts:
++        attempts += 1
++        
++        # Determine which queue to examine
++        # Prefer evicting from S if it exceeds target size.
++        # But if M is empty, we must evict from S.
++        evict_from_s = False
++        if len(m_small) >= target_s or len(m_main) == 0:
++            evict_from_s = True
++            
++        if evict_from_s:
++            if not m_small:
++                # Should not happen if logic correct, but fallback to M
++                if m_main:
++                    evict_from_s = False
++                else:
++                    break # Both empty?
+ 
+-    # Fallback
+-    if not t1_real and not t2_real:
+-        t1_real = list(cache_snapshot.cache.keys())
+-
+-    # ARC Replace Logic
+-    replace_t1 = False
+-    if len(t1_real) > 0 and len(t1_real) > m_p:
+-        replace_t1 = True
+-    elif len(t1_real) > 0 and (obj.key in m_b2) and (len(t1_real) == int(m_p)):
+-        replace_t1 = True
+-
+-    victim_key = None
+-    if (replace_t1 or not t2_real) and t1_real:
+-        victim_key = min(t1_real, key=lambda k: m_lru.get(k, 0))
+-    else:
+-        # Evict from T2
+-        victim_key = min(t2_real, key=lambda k: m_lru.get(k, 0))
+-
+-    return victim_key
++        if evict_from_s:
++            # Check candidate from Small queue
++            key = next(iter(m_small))
++            freq = m_freq.get(key, 0)
++            
++            if freq > 0:
++                # Has been accessed: Promote to Main
++                m_small.popitem(last=False) # Remove from S head
++                m_main[key] = None          # Append to M tail
++                m_freq[key] = 0             # Clear access bit/freq
++            else:
++                # Not accessed: Evict this candidate
++                return key
++        else:
++            # Check candidate from Main queue
++            key = next(iter(m_main))
++            freq = m_freq.get(key, 0)
++            
++            if freq > 0:
++                # Has been accessed: Reinsert to Main tail
++                m_main.move_to_end(key)
++                m_freq[key] = 0             # Clear access bit/freq
++            else:
++                # Not accessed: Evict this candidate
++                return key
++                
++    # Fallback if internal state is inconsistent with cache_snapshot
++    # Return any key from the cache snapshot that exists
++    if cache_snapshot.cache:
++        return next(iter(cache_snapshot.cache))
++    return None
+ 
+ def update_after_hit(cache_snapshot, obj):
+     '''
+-    Update metadata after hit. Move to T2.
++    On hit, update frequency counter.
++    S3-FIFO does not move items on hit (lazy promotion).
+     '''
+     check_reset(cache_snapshot)
+-    global m_lru, m_t1, m_t2, m_b1, m_b2
+-    m_lru[obj.key] = cache_snapshot.access_count
+-
+-    if obj.key in m_t1:
+-        m_t1.remove(obj.key)
+-        m_t2.add(obj.key)
+-    # If already in T2, stays in T2.
++    global m_freq
++    # Cap frequency at 3 (2 bits effectively) to distinguish frequent items
++    m_freq[obj.key] = min(m_freq.get(obj.key, 0) + 1, 3)
+ 
+ def update_after_insert(cache_snapshot, obj):
+     '''
+-    Update metadata after insert. Handle ghost hits.
++    On insert, add to Small queue and clear ghost entries.
+     '''
+     check_reset(cache_snapshot)
+-    global m_lru, m_t1, m_t2, m_b1, m_b2
+-    m_lru[obj.key] = cache_snapshot.access_count
+-
+-    if obj.key in m_b1:
+-        m_b1.remove(obj.key)
+-        m_t2.add(obj.key)
+-    elif obj.key in m_b2:
+-        m_b2.remove(obj.key)
+-        m_t2.add(obj.key)
+-    else:
+-        # New object -> T1
+-        m_t1.add(obj.key)
+-        # Safety: ensure not in T2
+-        if obj.key in m_t2:
+-            m_t2.remove(obj.key)
++    global m_small, m_freq, m_ghost_s, m_ghost_m
++    
++    key = obj.key
++    # Remove from ghosts if present (it's now back in cache)
++    if key in m_ghost_s:
++        del m_ghost_s[key]
++    if key in m_ghost_m:
++        del m_ghost_m[key]
++        
++    # Insert new item into Small queue
++    m_small[key] = None
++    m_freq[key] = 0
+ 
+ def update_after_evict(cache_snapshot, obj, evicted_obj):
+     '''
+-    Update metadata after eviction. Move to ghosts.
++    After eviction, remove from queues and add to ghost lists.
+     '''
+     check_reset(cache_snapshot)
+-    global m_t1, m_t2, m_b1, m_b2, m_lru
+-
+-    if evicted_obj.key in m_t1:
+-        m_t1.remove(evicted_obj.key)
+-        m_b1.add(evicted_obj.key)
+-    elif evicted_obj.key in m_t2:
+-        m_t2.remove(evicted_obj.key)
+-        m_b2.add(evicted_obj.key)
+-
+-    # Manage ghost size: limit total ghosts to capacity
+-    target_ghost = cache_snapshot.capacity
+-    if len(m_b1) + len(m_b2) > target_ghost:
+-        # Evict LRU from ghosts (B1 U B2)
+-        # Optimization: Scan only if needed.
+-        # Simple implementation: check all ghosts.
+-        # Since ghosts are not in cache, we use m_lru timestamps.
+-        # But iterating all ghosts might be O(N). N=capacity. Accepted.
+-        victim_ghost = None
+-        min_ts = float('inf')
+-
+-        # Iterate B1
+-        for k in m_b1:
+-            ts = m_lru.get(k, 0)
+-            if ts < min_ts:
+-                min_ts = ts
+-                victim_ghost = k
+-        # Iterate B2
+-        for k in m_b2:
+-            ts = m_lru.get(k, 0)
+-            if ts < min_ts:
+-                min_ts = ts
+-                victim_ghost = k
+-
+-        if victim_ghost:
+-            if victim_ghost in m_b1: m_b1.remove(victim_ghost)
+-            elif victim_ghost in m_b2: m_b2.remove(victim_ghost)
+-            if victim_ghost in m_lru: del m_lru[victim_ghost]
+-
++    global m_small, m_main, m_ghost_s, m_ghost_m, m_freq
++    
++    key = evicted_obj.key
++    capacity = cache_snapshot.capacity
++    
++    # Remove from our internal queues
++    # The item should be at the head of one of them usually, or removed during evict() selection?
++    # No, evict() only *returns* the key. It does not delete the victim from m_small/m_main 
++    # if it returns it. It only moves *kept* items.
++    if key in m_small:
++        del m_small[key]
++        m_ghost_s[key] = None
++    elif key in m_main:
++        del m_main[key]
++        m_ghost_m[key] = None
++        
++    if key in m_freq:
++        del m_freq[key]
++        
++    # Maintain ghost sizes (e.g., up to capacity size each)
++    if len(m_ghost_s) > capacity:
++        m_ghost_s.popitem(last=False)
++    if len(m_ghost_m) > capacity:
++        m_ghost_m.popitem(last=False)
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

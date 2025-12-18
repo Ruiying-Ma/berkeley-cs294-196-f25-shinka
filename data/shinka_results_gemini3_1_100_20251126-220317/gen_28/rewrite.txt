@@ -1,0 +1,152 @@
+# EVOLVE-BLOCK-START
+"""
+AS3-FIFO: Adaptive S3-FIFO Algorithm
+Combines the tri-queue structure of S3-FIFO (Small, Main, Ghost) with 
+the adaptive sizing strategy of ARC.
+"""
+from collections import OrderedDict
+
+# Global State
+algo_state = {
+    'q_small': OrderedDict(),
+    'q_main': OrderedDict(),
+    'q_ghost_s': OrderedDict(),
+    'q_ghost_m': OrderedDict(),
+    'access_map': {},
+    'p': 0.0
+}
+
+def evict(cache_snapshot, obj):
+    state = algo_state
+    q_s = state['q_small']
+    q_m = state['q_main']
+    acc = state['access_map']
+    
+    # Adaptive target for Small queue
+    target_s = state['p']
+    
+    # Safety counter to prevent infinite loops
+    max_loops = (len(q_s) + len(q_m)) * 2 + 10
+    
+    while max_loops > 0:
+        max_loops -= 1
+        
+        # Determine eviction candidate source
+        # Evict from Small if it exceeds target size or if Main is empty
+        evict_small = False
+        if len(q_s) > target_s:
+            evict_small = True
+        elif not q_m:
+            evict_small = True
+            
+        if evict_small:
+            if not q_s:
+                # Should unlikely happen if cache is full
+                return next(iter(q_m)) if q_m else next(iter(cache_snapshot.cache))
+            
+            cand = next(iter(q_s))
+            
+            if acc.get(cand, 0) > 0:
+                # Lazy Promotion: Small -> Main
+                acc[cand] = 0
+                q_s.popitem(last=False) # Remove from head
+                q_m[cand] = None         # Add to Main tail
+                continue
+            else:
+                # Victim found in Small
+                return cand
+        else:
+            # Evict from Main
+            if not q_m:
+                 return next(iter(q_s))
+                 
+            cand = next(iter(q_m))
+            
+            if acc.get(cand, 0) > 0:
+                # Second Chance: Main -> Main Tail
+                acc[cand] = 0
+                q_m.move_to_end(cand)
+                continue
+            else:
+                # Victim found in Main
+                return cand
+                
+    # Fallback
+    if q_s: return next(iter(q_s))
+    return next(iter(q_m))
+
+def update_after_hit(cache_snapshot, obj):
+    acc = algo_state['access_map']
+    # Saturate hit count at 2 (0=new, 1=warm, 2=hot)
+    acc[obj.key] = min(acc.get(obj.key, 0) + 1, 2)
+
+def update_after_insert(cache_snapshot, obj):
+    state = algo_state
+    key = obj.key
+    capacity = cache_snapshot.capacity
+    
+    # Initialize/Reset for new trace
+    if cache_snapshot.access_count <= 1:
+        state['q_small'].clear()
+        state['q_main'].clear()
+        state['q_ghost_s'].clear()
+        state['q_ghost_m'].clear()
+        state['access_map'].clear()
+        state['p'] = max(1, int(capacity * 0.1))
+
+    # Adaptation Logic (ARC-inspired)
+    p = state['p']
+    q_gs = state['q_ghost_s']
+    q_gm = state['q_ghost_m']
+    
+    if key in q_gs:
+        # Ghost Hit in Small -> Small was too small -> Increase p
+        delta = 1
+        if len(q_gs) < len(q_gm):
+            delta = len(q_gm) / len(q_gs)
+        p = min(capacity, p + delta)
+        
+        del q_gs[key]
+        state['q_main'][key] = None # Rescue to Main
+        state['access_map'][key] = 0
+        
+    elif key in q_gm:
+        # Ghost Hit in Main -> Main was too small -> Decrease p
+        delta = 1
+        if len(q_gm) < len(q_gs):
+            delta = len(q_gs) / len(q_gm)
+        p = max(0, p - delta)
+        
+        del q_gm[key]
+        state['q_main'][key] = None # Rescue to Main
+        state['access_map'][key] = 0
+        
+    else:
+        # New Insert -> Small (Nursery)
+        state['q_small'][key] = None
+        state['access_map'][key] = 0
+        
+    state['p'] = p
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    state = algo_state
+    key = evicted_obj.key
+    capacity = cache_snapshot.capacity
+    
+    # Remove from cache queues and add to ghosts
+    if key in state['q_small']:
+        del state['q_small'][key]
+        state['q_ghost_s'][key] = None
+    elif key in state['q_main']:
+        del state['q_main'][key]
+        state['q_ghost_m'][key] = None
+        
+    if key in state['access_map']:
+        del state['access_map'][key]
+        
+    # Limit ghost size
+    while len(state['q_ghost_s']) > capacity:
+        state['q_ghost_s'].popitem(last=False)
+    while len(state['q_ghost_m']) > capacity:
+        state['q_ghost_m'].popitem(last=False)
+# EVOLVE-BLOCK-END

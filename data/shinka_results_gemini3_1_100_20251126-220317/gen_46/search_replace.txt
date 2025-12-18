@@ -1,0 +1,78 @@
+<NAME>
+optimize_promotion_and_frequency
+</NAME>
+
+<DESCRIPTION>
+This change implements two improvements to the W-TinyLFU inspired algorithm to better differentiate between "one-hit wonders" (scans/loops) and true working sets:
+
+1.  **Increase Frequency Cap (15 -> 60):** Raising the saturation point of the frequency counter allows the algorithm to distinguish between moderately frequent items (e.g., 15 hits) and very frequent items (e.g., 50 hits). This prevents the frequency signal from saturating too early, allowing the eviction policy to make better decisions when choosing between two "hot" items.
+
+2.  **Stricter Promotion to Protected Segment:** Previously, any item in the Probation segment was promoted to the Protected segment upon a single hit. This allows items that are accessed just twice (once insert, once hit) to pollute the Protected segment (which occupies 80% of the main cache). The new logic requires an item to have a frequency greater than 1 (implying at least 3 accesses or significant history) to be promoted. If the frequency is insufficient, the item is moved to the MRU of Probation, giving it a "second chance" in the probation pool without displacing established heavy hitters in the Protected segment.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Frequency with Doorkeeper and Cap
+    if key in freq:
+        freq[key] = min(freq[key] + 1, 15)
+=======
+    # Frequency with Doorkeeper and Cap
+    if key in freq:
+        freq[key] = min(freq[key] + 1, 60)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    elif key in probation:
+        # Promote
+        del probation[key]
+        protected[key] = None
+
+        # Enforce Protected Limit
+        w_cap = max(1, int(cache_snapshot.capacity * 0.05))
+        m_cap = cache_snapshot.capacity - w_cap
+        p_cap = int(m_cap * 0.8) # 80% of Main
+
+        while len(protected) > p_cap:
+            k, _ = protected.popitem(last=False)
+            probation[k] = None # Move to Probation MRU
+            probation.move_to_end(k)
+=======
+    elif key in probation:
+        # Promote only if frequent enough
+        if freq.get(key, 0) > 1:
+            del probation[key]
+            protected[key] = None
+
+            # Enforce Protected Limit
+            w_cap = max(1, int(cache_snapshot.capacity * 0.05))
+            m_cap = cache_snapshot.capacity - w_cap
+            p_cap = int(m_cap * 0.8) # 80% of Main
+
+            while len(protected) > p_cap:
+                k, _ = protected.popitem(last=False)
+                probation[k] = None # Move to Probation MRU
+                probation.move_to_end(k)
+        else:
+            probation.move_to_end(key)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+    freq = algo_state['freq']
+    dk = algo_state['doorkeeper']
+
+    # Frequency with Doorkeeper and Cap
+    if key in freq:
+        freq[key] = min(freq[key] + 1, 15)
+=======
+def update_after_insert(cache_snapshot, obj):
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+    freq = algo_state['freq']
+    dk = algo_state['doorkeeper']
+
+    # Frequency with Doorkeeper and Cap
+    if key in freq:
+        freq[key] = min(freq[key] + 1, 60)
+>>>>>>> REPLACE
+</DIFF>

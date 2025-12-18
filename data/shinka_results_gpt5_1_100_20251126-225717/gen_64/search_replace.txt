@@ -1,0 +1,305 @@
+<NAME>
+slru_lrfu_age_tinylfu
+</NAME>
+
+<DESCRIPTION>
+I enhance the SLRU+TinyLFU hybrid by:
+- Adding a per-key last-touch timestamp and using it in LRFU-style victim scoring, so candidates are compared by (decayed frequency, true age) across both segments. This allows eviction of truly stale protected entries instead of always preferring probation.
+- Increasing protected sampling and performing sampled demotion in _rebalance: when protected exceeds its target, demote the coldest among a few LRU candidates rather than strict LRU. This preserves hot items in protected and sheds stale ones.
+- Introducing a TinyLFU-like admission gate using the last victim’s score: on insert, if the incoming item’s frequency is not higher than the evicted victim’s, bias it to probation LRU (low priority). Only promote to protected when it is demonstrably hotter or has a recent protected ghost.
+- Slightly reducing the default protected fraction to 0.7 and increasing protected candidate sample size to 3 to reduce protected hoarding and improve responsiveness.
+- Keeping metadata consistent by updating and cleaning last-touch timestamps on hits/inserts/evictions.
+
+These changes should reduce miss rates by better aligning eviction/admission with both recency and frequency, limiting scan pollution, and more accurately demoting stale protected items.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+# Segmented LRU (SLRU) metadata:
+# - _probation: objects seen once (newly inserted), LRU-ordered
+# - _protected: objects that have been hit (promoted), LRU-ordered
+# We adapt the protected fraction slightly based on runtime signals.
+_probation = OrderedDict()   # key -> None (value unused)
+_protected = OrderedDict()   # key -> None (value unused)
+_key_seg = dict()            # key -> 'prob' or 'prot'
+
+# Ghost histories to recognize re-references to recently evicted items
+_ghost_probation = OrderedDict()  # key -> epoch of ghost insertion
+_ghost_protected = OrderedDict()  # key -> epoch of ghost insertion
+_GHOST_LIMIT_MULT = 2
+
+# TinyLFU-like lightweight decayed frequency
+_refcnt = {}                 # key -> (count, epoch)
+_epoch = 0
+_last_epoch_tick = 0
+_DECAY_WINDOW = 128          # accesses between epochs; adjusted using capacity
+_last_victim_score = 0.0
+
+_PROTECTED_FRAC = 0.8        # target fraction of cache to allocate to protected segment
+_ADAPT_STEP = 0.02           # step used to adjust protected fraction within [0.05, 0.95]
+
+# Scan-resistance and two-touch gating (epoch-scoped, low overhead)
+_scan_mode = False
+_scan_mode_epochs_left = 0
+_epoch_unique = set()        # unique keys observed within the current decay window
+_touched_once = {}           # key -> epoch when first touched in probation (for two-touch in scan mode)
+
+# Sampling parameters for LRFU-like victim selection
+_BASE_PROB_SAMPLE = 3
+_BASE_PROT_SAMPLE = 2
+=======
+# Segmented LRU (SLRU) metadata:
+# - _probation: objects seen once (newly inserted), LRU-ordered
+# - _protected: objects that have been hit (promoted), LRU-ordered
+# We adapt the protected fraction slightly based on runtime signals.
+_probation = OrderedDict()   # key -> None (value unused)
+_protected = OrderedDict()   # key -> None (value unused)
+_key_seg = dict()            # key -> 'prob' or 'prot'
+
+# Ghost histories to recognize re-references to recently evicted items
+_ghost_probation = OrderedDict()  # key -> epoch of ghost insertion
+_ghost_protected = OrderedDict()  # key -> epoch of ghost insertion
+_GHOST_LIMIT_MULT = 2
+
+# TinyLFU-like lightweight decayed frequency
+_refcnt = {}                 # key -> (count, epoch)
+_epoch = 0
+_last_epoch_tick = 0
+_DECAY_WINDOW = 128          # accesses between epochs; adjusted using capacity
+_last_victim_score = 0.0
+
+# Per-key last-touch timestamp (access_count) for true age across segments
+_last_touch = {}             # key -> access_count
+_NOW_FOR_VICTIM = 0          # temp now used inside evict candidate scoring
+
+_PROTECTED_FRAC = 0.7        # target fraction of cache to allocate to protected segment
+_ADAPT_STEP = 0.02           # step used to adjust protected fraction within [0.05, 0.95]
+
+# Scan-resistance and two-touch gating (epoch-scoped, low overhead)
+_scan_mode = False
+_scan_mode_epochs_left = 0
+_epoch_unique = set()        # unique keys observed within the current decay window
+_touched_once = {}           # key -> epoch when first touched in probation (for two-touch in scan mode)
+
+# Sampling parameters for LRFU-like victim selection
+_BASE_PROB_SAMPLE = 3
+_BASE_PROT_SAMPLE = 3
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def _rebalance(cache_snapshot):
+    """Demote protected LRU entries if protected size exceeds target."""
+    total = len(cache_snapshot.cache)
+    if total <= 0:
+        return
+    target = max(1, int(total * _PROTECTED_FRAC))
+
+    while len(_protected) > target:
+        # Demote protected LRU to probation MRU
+        k, _ = _protected.popitem(last=False)
+        _probation[k] = None
+        _key_seg[k] = 'prob'
+=======
+def _rebalance(cache_snapshot):
+    """Demote protected entries if protected size exceeds target.
+    Use sampled LRFU demotion: among a few LRU candidates from protected, demote the coldest by (score, age)."""
+    total = len(cache_snapshot.cache)
+    if total <= 0:
+        return
+    target = max(1, int(total * _PROTECTED_FRAC))
+
+    while len(_protected) > target:
+        # Sample first few LRU entries from protected
+        sample_keys = _sample_lru_keys(_protected, 4)
+        if not sample_keys:
+            break
+        # Compute coldest by decayed frequency, then by age (older first)
+        now = cache_snapshot.access_count
+        def prot_key_coldness(k, idx):
+            s = _score(k)
+            age = now - _last_touch.get(k, 0)
+            return (s, -age, idx, k)
+        # Choose coldest to demote
+        coldest = min((prot_key_coldness(k, i) for i, k in enumerate(sample_keys)))
+        k = coldest[3]
+        _protected.pop(k, None)
+        _probation[k] = None
+        _key_seg[k] = 'prob'
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def _victim_tuple(key, seg, rec_idx):
+    """Tuple for comparing eviction candidates. Lower is colder."""
+    # Prefer lower frequency; tie-break by segment (probation preferred), then by older recency (smaller index)
+    return (_score(key), 0 if seg == 'prob' else 1, rec_idx, key)
+=======
+def _victim_tuple(key, seg, rec_idx):
+    """Tuple for comparing eviction candidates. Lower is colder.
+    Order by decayed frequency, then true age (older preferred), then by segment (probation preferred), then by within-segment recency."""
+    s = _score(key)
+    age = _NOW_FOR_VICTIM - _last_touch.get(key, 0)
+    return (s, -age, 0 if seg == 'prob' else 1, rec_idx, key)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Keep metadata consistent and properly segmented before choosing a victim
+    _maybe_age(cache_snapshot)
+    _sync_metadata(cache_snapshot)
+    _rebalance(cache_snapshot)
+=======
+    # Keep metadata consistent and properly segmented before choosing a victim
+    _maybe_age(cache_snapshot)
+    _sync_metadata(cache_snapshot)
+    _rebalance(cache_snapshot)
+    # Set current time for victim scoring
+    global _NOW_FOR_VICTIM
+    _NOW_FOR_VICTIM = cache_snapshot.access_count
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    k = obj.key
+    _inc(k)
+    try:
+        _epoch_unique.add(k)
+    except Exception:
+        pass
+=======
+    k = obj.key
+    _inc(k)
+    # Update last-touch time for age-aware eviction
+    _last_touch[k] = cache_snapshot.access_count
+    try:
+        _epoch_unique.add(k)
+    except Exception:
+        pass
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    k = obj.key
+    _inc(k)
+    try:
+        _epoch_unique.add(k)
+    except Exception:
+        pass
+=======
+    k = obj.key
+    _inc(k)
+    # Update last-touch time for age-aware eviction
+    _last_touch[k] = cache_snapshot.access_count
+    try:
+        _epoch_unique.add(k)
+    except Exception:
+        pass
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    if _scan_mode:
+        # Scan resistance: insert at probation LRU to minimize pollution,
+        # require two-touch before promotion via update_after_hit.
+        _probation[k] = None
+        _probation.move_to_end(k, last=False)  # LRU side
+        _key_seg[k] = 'prob'
+    else:
+        if recent_prot_ghost or s >= 2:
+            # Re-admit into protected due to recent protected ghost hit or strong frequency
+            _protected[k] = None
+            _key_seg[k] = 'prot'
+            _increase_protected()
+        else:
+            # Default admission into probation
+            _probation[k] = None
+            _key_seg[k] = 'prob'
+            if recent_prob_ghost:
+                # Slight boost for recently evicted probation ghost to accelerate useful re-references
+                _probation.move_to_end(k, last=True)  # ensure MRU
+                _inc(k)
+            elif poor_locality and s == 0:
+                # Bias towards LRU position when locality is poor and item is cold
+                _probation.move_to_end(k, last=False)
+            else:
+                # Keep MRU position
+                _probation.move_to_end(k, last=True)
+=======
+    if _scan_mode:
+        # Scan resistance: insert at probation LRU to minimize pollution,
+        # require two-touch before promotion via update_after_hit.
+        _probation[k] = None
+        _probation.move_to_end(k, last=False)  # LRU side
+        _key_seg[k] = 'prob'
+    else:
+        # TinyLFU-style admission bias using last victim score
+        hotter_than_victim = s > _last_victim_score
+        if recent_prot_ghost or (s >= 2 and hotter_than_victim):
+            # Re-admit into protected due to recent protected ghost hit or strong frequency advantage
+            _protected[k] = None
+            _key_seg[k] = 'prot'
+            _increase_protected()
+        else:
+            # Default admission into probation
+            _probation[k] = None
+            _key_seg[k] = 'prob'
+            if not hotter_than_victim and not recent_prot_ghost:
+                # Too cold relative to evicted item: bias to LRU to die quickly
+                _probation.move_to_end(k, last=False)
+            elif recent_prob_ghost:
+                # Slight boost for recently evicted probation ghost to accelerate useful re-references
+                _probation.move_to_end(k, last=True)  # ensure MRU
+                _inc(k)
+            elif poor_locality and s == 0:
+                # Bias towards LRU position when locality is poor and item is cold
+                _probation.move_to_end(k, last=False)
+            else:
+                # Keep MRU position
+                _probation.move_to_end(k, last=True)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Clean any stale two-touch markers
+    _touched_once.pop(k, None)
+
+    _key_seg.pop(k, None)
+
+    # Trim ghost histories to bounded size
+    limit = max(1, _GHOST_LIMIT_MULT * max(cache_snapshot.capacity, 1))
+    while len(_ghost_probation) > limit:
+        _ghost_probation.popitem(last=False)
+    while len(_ghost_protected) > limit:
+        _ghost_protected.popitem(last=False)
+=======
+    # Clean any stale two-touch markers
+    _touched_once.pop(k, None)
+
+    _key_seg.pop(k, None)
+    # Remove last-touch metadata for evicted key
+    _last_touch.pop(k, None)
+
+    # Trim ghost histories to bounded size
+    limit = max(1, _GHOST_LIMIT_MULT * max(cache_snapshot.capacity, 1))
+    while len(_ghost_probation) > limit:
+        _ghost_probation.popitem(last=False)
+    while len(_ghost_protected) > limit:
+        _ghost_protected.popitem(last=False)
+>>>>>>> REPLACE
+
+</DIFF>

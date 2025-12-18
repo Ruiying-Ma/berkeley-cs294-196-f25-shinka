@@ -1,0 +1,376 @@
+<NAME>
+s3fifo_tiny_lfu_hybrid
+</NAME>
+
+<DESCRIPTION>
+Implements a hybrid of S3-FIFO and W-TinyLFU to optimize cache hit rates.
+
+Changes:
+1.  **Window Logic (S3-FIFO style)**:
+    - The Window cache is treated as a FIFO queue (no move-to-end on hits).
+    - We track hits in the Window using `window_hits`.
+    - At eviction time, if the Window is over capacity (10%), items at the tail that have been hit are immediately promoted to the Main cache (Probation). This acts as a "lazy promotion" mechanism, filtering one-hit wonders while preserving working sets.
+2.  **Eviction Logic (W-TinyLFU style)**:
+    - If the Window tail (unhit) is the candidate, it duels with the Main cache victim (Probation/Protected LRU).
+    - The duel uses frequency counts to decide.
+    - Importantly, if the Window candidate wins the duel (due to high global frequency), it is promoted to Main, and the Main victim is evicted. This allows high-frequency items to re-enter Main even if they weren't hit in the current Window pass.
+    - One-hit wonders (low frequency, not hit in Window) will typically lose the duel and be evicted.
+3.  **Frequency Tracking & Aging**:
+    - Uses a Doorkeeper (Set) to filter first accesses (Frequency 0/1).
+    - Main frequency counter tracks items seen 2+ times, capped at 15.
+    - Frequency aging is accelerated to `1 * capacity` (halving counts) to adapt quickly to workload changes.
+4.  **Configuration**:
+    - Window size increased to 10% (typical for S3-FIFO/TinyLFU).
+    - Protected segment size maintained at 80% of Main.
+
+This approach combines the strict filtering of S3-FIFO (using FIFO Window + Hit bit) with the frequency-based admission of TinyLFU (Dueling), providing robustness against both scans and looping patterns.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+# W-TinyLFU inspired State
+algo_state = {
+    'window': OrderedDict(),    # Window Cache (SLRU or LRU)
+    'probation': OrderedDict(), # Main Cache - Probation (SLRU)
+    'protected': OrderedDict(), # Main Cache - Protected (SLRU)
+    'freq': {},                 # Frequency Counter
+    'doorkeeper': set(),        # Doorkeeper for one-hit wonders
+    'freq_count': 0,            # Total increments for reset
+    'max_time': 0
+}
+
+def _check_reset(current_time):
+    if current_time < algo_state['max_time']:
+        algo_state['window'].clear()
+        algo_state['probation'].clear()
+        algo_state['protected'].clear()
+        algo_state['freq'].clear()
+        algo_state['doorkeeper'].clear()
+        algo_state['freq_count'] = 0
+        algo_state['max_time'] = 0
+    algo_state['max_time'] = current_time
+
+def evict(cache_snapshot, obj):
+    '''
+    W-TinyLFU Eviction Logic with Doorkeeper Support
+    '''
+    window = algo_state['window']
+    probation = algo_state['probation']
+    protected = algo_state['protected']
+    freq = algo_state['freq']
+    doorkeeper = algo_state['doorkeeper']
+
+    capacity = cache_snapshot.capacity
+    w_cap = max(1, int(capacity * 0.05)) # 5% Window
+
+    # Candidates
+    candidate_w = next(iter(window)) if window else None
+
+    # Main Candidate: Probation LRU, else Protected LRU
+    candidate_m = None
+    if probation:
+        candidate_m = next(iter(probation))
+    elif protected:
+        candidate_m = next(iter(protected))
+
+    victim = None
+
+    # 1. If Window needs space (is below target), grow it by evicting Main
+    # (Unless Main is empty, then evict Window)
+    if len(window) < w_cap and candidate_m:
+        victim = candidate_m
+    elif not candidate_m:
+        victim = candidate_w
+    elif not candidate_w:
+        victim = candidate_m
+    else:
+        # 2. Window is full. Duel.
+        # Helper to get frequency
+        def get_freq(k):
+            if k in freq: return freq[k]
+            if k in doorkeeper: return 1
+            return 0
+
+        fw = get_freq(candidate_w)
+        fm = get_freq(candidate_m)
+
+        # Tie-breaker: Prefer Main (Incumbent) -> Evict Window
+        if fw > fm:
+            victim = candidate_m
+        else:
+            victim = candidate_w
+
+    return victim
+
+def update_after_hit(cache_snapshot, obj):
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+    window = algo_state['window']
+    probation = algo_state['probation']
+    protected = algo_state['protected']
+    freq = algo_state['freq']
+    doorkeeper = algo_state['doorkeeper']
+
+    # Frequency Aging
+    algo_state['freq_count'] += 1
+    if algo_state['freq_count'] >= cache_snapshot.capacity * 5:
+        doorkeeper.clear()
+        to_remove = []
+        for k in freq:
+            freq[k] //= 2
+            if freq[k] == 0: to_remove.append(k)
+        for k in to_remove: del freq[k]
+        algo_state['freq_count'] = 0
+
+    # Frequency Update
+    if key in freq:
+        freq[key] = min(freq[key] + 1, 15)
+    elif key in doorkeeper:
+        freq[key] = 2
+        doorkeeper.remove(key)
+    else:
+        doorkeeper.add(key)
+
+    # Cache Maintenance
+    if key in window:
+        window.move_to_end(key)
+    elif key in protected:
+        protected.move_to_end(key)
+    elif key in probation:
+        # Promote
+        del probation[key]
+        protected[key] = None
+
+        # Enforce Protected Limit
+        w_cap = max(1, int(cache_snapshot.capacity * 0.05))
+        m_cap = cache_snapshot.capacity - w_cap
+        p_cap = int(m_cap * 0.8) # 80% of Main
+
+        while len(protected) > p_cap:
+            k, _ = protected.popitem(last=False)
+            probation[k] = None # Move to Probation MRU
+            probation.move_to_end(k)
+
+def update_after_insert(cache_snapshot, obj):
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+    freq = algo_state['freq']
+    doorkeeper = algo_state['doorkeeper']
+
+    # Frequency Aging
+    algo_state['freq_count'] += 1
+    if algo_state['freq_count'] >= cache_snapshot.capacity * 5:
+        doorkeeper.clear()
+        to_remove = []
+        for k in freq:
+            freq[k] //= 2
+            if freq[k] == 0: to_remove.append(k)
+        for k in to_remove: del freq[k]
+        algo_state['freq_count'] = 0
+
+    # Frequency Update
+    if key in freq:
+        freq[key] = min(freq[key] + 1, 15)
+    elif key in doorkeeper:
+        freq[key] = 2
+        doorkeeper.remove(key)
+    else:
+        doorkeeper.add(key)
+
+    # Insert to Window MRU
+    algo_state['window'][key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    v_key = evicted_obj.key
+    window = algo_state['window']
+    probation = algo_state['probation']
+    protected = algo_state['protected']
+
+    if v_key in window:
+        del window[v_key]
+    elif v_key in probation:
+        del probation[v_key]
+    elif v_key in protected:
+        del protected[v_key]
+
+    # Check for Window promotion
+    # If we evicted Main, and Window is now > Cap (it wasn't evicted), move Window LRU to Probation
+    w_cap = max(1, int(cache_snapshot.capacity * 0.05))
+    if len(window) > w_cap:
+        k, _ = window.popitem(last=False)
+        probation[k] = None # To Probation MRU
+        probation.move_to_end(k)
+=======
+# Advanced W-TinyLFU with Doorkeeper and FIFO Window (S3-FIFO elements)
+algo_state = {
+    'window': OrderedDict(),    # Window Cache (FIFO)
+    'window_hits': set(),       # Track hits in window
+    'probation': OrderedDict(), # Main Cache - Probation (SLRU)
+    'protected': OrderedDict(), # Main Cache - Protected (SLRU)
+    'freq': {},                 # Frequency Counter
+    'doorkeeper': set(),        # Doorkeeper
+    'freq_count': 0,            # Aging counter
+    'max_time': 0
+}
+
+def _check_reset(current_time):
+    if current_time < algo_state['max_time']:
+        algo_state['window'].clear()
+        algo_state['window_hits'].clear()
+        algo_state['probation'].clear()
+        algo_state['protected'].clear()
+        algo_state['freq'].clear()
+        algo_state['doorkeeper'].clear()
+        algo_state['freq_count'] = 0
+        algo_state['max_time'] = 0
+    algo_state['max_time'] = current_time
+
+def evict(cache_snapshot, obj):
+    '''
+    Eviction Logic:
+    - Window acts as a FIFO filter.
+    - If Window tail was hit -> Promote to Main.
+    - If Window tail was NOT hit -> Duel vs Main Victim (Probation/Protected).
+    - Uses Doorkeeper to filter one-hit wonders.
+    '''
+    window = algo_state['window']
+    window_hits = algo_state['window_hits']
+    probation = algo_state['probation']
+    protected = algo_state['protected']
+    freq = algo_state['freq']
+    doorkeeper = algo_state['doorkeeper']
+
+    capacity = cache_snapshot.capacity
+    w_cap = max(1, int(capacity * 0.10)) # 10% Window
+
+    # Lazy Promotion from Window: Process hits at tail
+    while len(window) > w_cap:
+        cand_key = next(iter(window))
+        if cand_key in window_hits:
+            window.popitem(last=False)
+            window_hits.remove(cand_key)
+            probation[cand_key] = None # Promote to Probation MRU
+        else:
+            break
+
+    # Candidates
+    cand_w = next(iter(window)) if window else None
+
+    cand_m = None
+    if probation:
+        cand_m = next(iter(probation))
+    elif protected:
+        cand_m = next(iter(protected))
+
+    # 1. Prefer evicting from Main if Window is small (to allow Window to grow)
+    # But only if Main has items.
+    if len(window) < w_cap and cand_m:
+        return cand_m
+    elif not cand_w:
+        return cand_m
+    elif not cand_m:
+        return cand_w
+
+    # 2. Duel: Window (unhit tail) vs Main
+    def get_freq(k):
+        if k in freq: return freq[k]
+        if k in doorkeeper: return 1
+        return 0
+
+    fw = get_freq(cand_w)
+    fm = get_freq(cand_m)
+
+    # Bias towards Main (Incumbent)
+    if fw > fm:
+        # Window wins (High Freq). Promote to Main. Evict Main victim.
+        window.popitem(last=False)
+        window_hits.discard(cand_w)
+        probation[cand_w] = None
+        return cand_m
+    else:
+        # Window loses.
+        return cand_w
+
+def update_after_hit(cache_snapshot, obj):
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+    state = algo_state
+
+    # Frequency Aging (Accelerated: 1 * Capacity)
+    state['freq_count'] += 1
+    if state['freq_count'] >= cache_snapshot.capacity:
+        state['doorkeeper'].clear()
+        state['freq'] = {k: v // 2 for k, v in state['freq'].items() if v > 1}
+        state['freq_count'] = 0
+
+    # Frequency Update
+    f = state['freq']
+    dk = state['doorkeeper']
+    if key in f:
+        f[key] = min(f[key] + 1, 15)
+    elif key in dk:
+        f[key] = 2
+        dk.remove(key)
+    else:
+        dk.add(key)
+
+    # Cache Maintenance
+    if key in state['window']:
+        state['window_hits'].add(key)
+        # FIFO Window: DO NOT move to end
+    elif key in state['protected']:
+        state['protected'].move_to_end(key)
+    elif key in state['probation']:
+        # Promote to Protected
+        del state['probation'][key]
+        state['protected'][key] = None
+
+        # Enforce Protected Limit (80% of Main)
+        w_cap = max(1, int(cache_snapshot.capacity * 0.10))
+        m_cap = max(1, cache_snapshot.capacity - w_cap)
+        p_cap = int(m_cap * 0.8)
+
+        while len(state['protected']) > p_cap:
+            k, _ = state['protected'].popitem(last=False)
+            state['probation'][k] = None
+            state['probation'].move_to_end(k)
+
+def update_after_insert(cache_snapshot, obj):
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+    state = algo_state
+
+    # Frequency Aging
+    state['freq_count'] += 1
+    if state['freq_count'] >= cache_snapshot.capacity:
+        state['doorkeeper'].clear()
+        state['freq'] = {k: v // 2 for k, v in state['freq'].items() if v > 1}
+        state['freq_count'] = 0
+
+    # Frequency Update
+    f = state['freq']
+    dk = state['doorkeeper']
+    if key in f:
+        f[key] = min(f[key] + 1, 15)
+    elif key in dk:
+        f[key] = 2
+        dk.remove(key)
+    else:
+        dk.add(key)
+
+    # Insert to Window (FIFO)
+    state['window'][key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    v_key = evicted_obj.key
+    state = algo_state
+
+    if v_key in state['window']:
+        del state['window'][v_key]
+        state['window_hits'].discard(v_key)
+    elif v_key in state['probation']:
+        del state['probation'][v_key]
+    elif v_key in state['protected']:
+        del state['protected'][v_key]
+>>>>>>> REPLACE
+</DIFF>

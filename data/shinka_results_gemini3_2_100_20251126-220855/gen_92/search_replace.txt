@@ -1,0 +1,108 @@
+<NAME>
+config_ghost_target
+</NAME>
+
+<DESCRIPTION>
+Increase the ghost registry target size to 3x capacity. The current implementation implicitly limits ghost size to `capacity` (in `update_after_evict`), which is insufficient for detecting loops larger than the cache but smaller than the extended history. A larger ghost registry allows the algorithm to recognize recurring items from larger working sets (like Trace 14) and rescue them upon re-entry.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    if not s3_config:
+        cap = cache_snapshot.capacity
+        # Small queue size target (10%)
+        s3_config['small_target'] = max(1, int(cap * 0.1))
+        # Aging interval (once per capacity accesses)
+        s3_config['aging_interval'] = cap
+=======
+    if not s3_config:
+        cap = cache_snapshot.capacity
+        # Small queue size target (10%)
+        s3_config['small_target'] = max(1, int(cap * 0.1))
+        # Aging interval (once per capacity accesses)
+        s3_config['aging_interval'] = cap
+        # Ghost registry size target (3x capacity)
+        s3_config['ghost_target'] = cap * 3
+>>>>>>> REPLACE
+</DIFF>
+
+
+<NAME>
+evict_second_chance_main
+</NAME>
+
+<DESCRIPTION>
+Refine eviction from the Main queue by implementing a Second Chance mechanism. Instead of purely evicting the LRU victim, the algorithm checks if the victim has a frequency > 0 (meaning it was hit at least once or restored from ghost). If so, it is moved to the MRU position and its frequency is decayed. This protects frequently accessed items from being flushed by temporary scans or cache pressure, effectively combining LRU and LFU characteristics.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # 2. If Small is safe, evict from Main (LRU)
+    if s3_main:
+        return next(iter(s3_main))
+=======
+    # 2. If Small is safe, evict from Main (LRU with Second Chance)
+    if s3_main:
+        # Check a few candidates for second chance
+        for _ in range(4):
+            victim_key = next(iter(s3_main))
+            freq = s3_freq.get(victim_key, 0)
+            if freq > 0:
+                s3_main.move_to_end(victim_key) # Second chance
+                s3_freq[victim_key] >>= 1       # Decay frequency
+            else:
+                return victim_key
+        return next(iter(s3_main))
+>>>>>>> REPLACE
+</DIFF>
+
+
+<NAME>
+insert_decay_restore
+</NAME>
+
+<DESCRIPTION>
+Modify `update_after_insert` to restore frequency from the ghost registry with a decay factor (`// 2`), while ensuring a minimum frequency of 1. This prevents items with stale high frequency from dominating the cache immediately, while the `max(1, ...)` boost ensures that even loop items (which may have had 0 frequency upon eviction) are recognized as "seen again" and given a non-zero frequency. This non-zero frequency grants them a "Second Chance" in the Main queue, significantly improving retention for looping access patterns.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    if key in s3_ghost:
+        # Restore frequency
+        restored_freq = s3_ghost.pop(key)
+        s3_freq[key] = restored_freq
+        # Promote to Main immediately
+        s3_main[key] = 1
+        s3_main.move_to_end(key)
+=======
+    if key in s3_ghost:
+        # Restore frequency with decay
+        restored_freq = s3_ghost.pop(key)
+        s3_freq[key] = max(1, restored_freq // 2)
+        # Promote to Main immediately
+        s3_main[key] = 1
+        s3_main.move_to_end(key)
+>>>>>>> REPLACE
+</DIFF>
+
+
+<NAME>
+evict_ghost_size
+</NAME>
+
+<DESCRIPTION>
+Update `update_after_evict` to use the configured `ghost_target` (3x capacity) for managing the ghost registry size, rather than the hardcoded `capacity`. This enables the extended history tracking necessary for loop detection.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Maintain Ghost size
+    if len(s3_ghost) > capacity:
+        s3_ghost.popitem(last=False) # Remove oldest ghost
+=======
+    # Maintain Ghost size
+    ghost_target = s3_config.get('ghost_target', capacity)
+    if len(s3_ghost) > ghost_target:
+        s3_ghost.popitem(last=False) # Remove oldest ghost
+>>>>>>> REPLACE
+</DIFF>

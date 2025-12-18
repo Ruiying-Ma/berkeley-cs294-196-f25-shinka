@@ -1,0 +1,163 @@
+<NAME>
+large_ghost_and_boost
+</NAME>
+
+<DESCRIPTION>
+1. Increase Ghost Registry size to 5x capacity to better detect large loops (like Trace 14).
+2. Introduce Probabilistic Promotion (1%) in Small queue eviction to ensure the Main segment gets populated even if the workload is scan-heavy or loop-heavy with no initial hits.
+3. Boost the frequency of items rescued from Ghost to 2 (from 0). This gives rescued items (proven recurrent) more resistance in the Main segment, preventing them from being evicted immediately in large loop scenarios.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # 2. Ghost Cleanup
+    while len(s3_ghost) > capacity:
+        s3_ghost.pop(next(iter(s3_ghost)))
+
+    # Window size for scanning candidates
+    k_window = 5
+
+    while True:
+        # 3. Queue Selection
+        # Evict from Small if over capacity or Main is empty
+        if len(s3_small) >= s_capacity or not s3_main:
+            queue = s3_small
+            is_small = True
+        else:
+            queue = s3_main
+            is_small = False
+
+        if not queue:
+            # Should not happen in a full cache unless empty
+            return None
+
+        # 4. Window Scan
+        # Peek at the first K items in the queue
+        candidates = list(itertools.islice(queue, k_window))
+
+        # 5. Check for Promotions / Maintenance
+        # Look for *any* item with frequency > 0 in the window.
+        promoted = False
+
+        for key in candidates:
+            freq = s3_freq.get(key, 0)
+            if freq > 0:
+                # Hot item found: Promote or Reinsert
+                if is_small:
+                    # S -> M Promotion
+                    s3_small.pop(key)
+                    s3_main[key] = None
+                    s3_freq[key] = 0 # Reset freq on promotion
+                else:
+                    # M -> M Reinsertion (give second chance)
+                    s3_main.pop(key)
+                    s3_main[key] = None # Move to MRU
+                    s3_freq[key] = freq - 1 # Decay frequency
+
+                promoted = True
+                break # Restart loop to reflect state change
+
+        if promoted:
+            continue
+=======
+    # 2. Ghost Cleanup
+    # Increase ghost capacity to 5x to catch larger loops
+    while len(s3_ghost) > 5 * capacity:
+        s3_ghost.pop(next(iter(s3_ghost)))
+
+    # Window size for scanning candidates
+    k_window = 5
+
+    while True:
+        # 3. Queue Selection
+        # Evict from Small if over capacity or Main is empty
+        if len(s3_small) >= s_capacity or not s3_main:
+            queue = s3_small
+            is_small = True
+        else:
+            queue = s3_main
+            is_small = False
+
+        if not queue:
+            # Should not happen in a full cache unless empty
+            return None
+
+        # 4. Window Scan
+        # Peek at the first K items in the queue
+        candidates = list(itertools.islice(queue, k_window))
+
+        # 5. Check for Promotions / Maintenance
+        # Look for *any* item with frequency > 0 in the window.
+        promoted = False
+
+        for key in candidates:
+            freq = s3_freq.get(key, 0)
+            if freq > 0:
+                # Hot item found: Promote or Reinsert
+                if is_small:
+                    # S -> M Promotion
+                    s3_small.pop(key)
+                    s3_main[key] = None
+                    s3_freq[key] = 0 # Reset freq on promotion
+                else:
+                    # M -> M Reinsertion (give second chance)
+                    s3_main.pop(key)
+                    s3_main[key] = None # Move to MRU
+                    s3_freq[key] = freq - 1 # Decay frequency
+
+                promoted = True
+                break # Restart loop to reflect state change
+
+            # Probabilistic Promotion from Small
+            # Anchors a small percentage of items in Main to handle large loops
+            if is_small and random.randint(1, 100) <= 1:
+                s3_small.pop(key)
+                s3_main[key] = None
+                s3_freq[key] = 0
+                promoted = True
+                break
+
+        if promoted:
+            continue
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On Insert:
+    - Check Ghost to decide S vs M.
+    - Initialize frequency.
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+    key = obj.key
+    s3_freq[key] = 0
+
+    if key in s3_ghost:
+        # Ghost hit: Rescue to Main
+        s3_main[key] = None
+        s3_ghost.pop(key)
+    else:
+        # New insert: Enter Small (Probation)
+        s3_small[key] = None
+=======
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On Insert:
+    - Check Ghost to decide S vs M.
+    - Initialize frequency.
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+    key = obj.key
+    s3_freq[key] = 0
+
+    if key in s3_ghost:
+        # Ghost hit: Rescue to Main
+        s3_main[key] = None
+        s3_ghost.pop(key)
+        # Boost frequency for rescued items to give them better survival in Main
+        # This helps loop patterns where items return after a long time
+        s3_freq[key] = 2
+    else:
+        # New insert: Enter Small (Probation)
+        s3_small[key] = None
+>>>>>>> REPLACE
+</DIFF>

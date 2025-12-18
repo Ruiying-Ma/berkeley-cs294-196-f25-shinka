@@ -1,0 +1,90 @@
+<NAME>
+tune_ghost_parameters
+</NAME>
+
+<DESCRIPTION>
+Adjust ghost queue parameters to recover performance on looping traces (like Trace 29).
+1. Increase ghost capacity from 1x to 3x cache capacity. Larger ghost size helps detect longer loops which were being missed by the previous iteration.
+2. Reset frequency to 0 (instead of 2) upon ghost hit promotion. This prevents the Main queue from being polluted by weak recurring items, requiring them to "prove" themselves again to stay in the protected region. This aligns with the strategy from the higher-performing "Prior Program 1".
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    global _s3_small, _s3_main, _s3_ghost, _s3_freq
+    _check_reset(cache_snapshot)
+
+    key = obj.key
+    if key in _s3_ghost:
+        # Ghost Hit: Promote to Main with protection
+        if key not in _s3_main and key not in _s3_small:
+            _s3_main[key] = None
+            # Start with freq=2 to survive initial Main passes
+            # This helps loops larger than cache to persist
+            _s3_freq[key] = 2
+        _s3_ghost.pop(key)
+    else:
+        # New Insert: Start in Small
+        if key not in _s3_small and key not in _s3_main:
+            _s3_small[key] = None
+            _s3_freq[key] = 0
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    global _s3_small, _s3_main, _s3_ghost, _s3_freq
+    _check_reset(cache_snapshot)
+
+    key = evicted_obj.key
+    # Track in Ghost
+    if key in _s3_small:
+        _s3_small.pop(key)
+        _s3_ghost[key] = None
+    elif key in _s3_main:
+        _s3_main.pop(key)
+        # Also track Main evictions in Ghost for robustness
+        _s3_ghost[key] = None
+
+    _s3_freq.pop(key, None)
+
+    # Cap Ghost Size
+    if len(_s3_ghost) > cache_snapshot.capacity:
+        _s3_ghost.pop(next(iter(_s3_ghost)), None)
+=======
+def update_after_insert(cache_snapshot, obj):
+    global _s3_small, _s3_main, _s3_ghost, _s3_freq
+    _check_reset(cache_snapshot)
+
+    key = obj.key
+    if key in _s3_ghost:
+        # Ghost Hit: Promote to Main
+        # Reset freq to 0 ensures we don't pollute Main with "weak" ghosts
+        if key not in _s3_main and key not in _s3_small:
+            _s3_main[key] = None
+            _s3_freq[key] = 0
+        _s3_ghost.pop(key)
+    else:
+        # New Insert: Start in Small
+        if key not in _s3_small and key not in _s3_main:
+            _s3_small[key] = None
+            _s3_freq[key] = 0
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    global _s3_small, _s3_main, _s3_ghost, _s3_freq
+    _check_reset(cache_snapshot)
+
+    key = evicted_obj.key
+    # Track in Ghost
+    # Prioritize checking Small as most evictions come from there (or demoted through there)
+    if key in _s3_small:
+        _s3_small.pop(key)
+        _s3_ghost[key] = None
+    elif key in _s3_main:
+        _s3_main.pop(key)
+        _s3_ghost[key] = None
+
+    _s3_freq.pop(key, None)
+
+    # Cap Ghost Size: Increased to 3x to better capture large loops
+    if len(_s3_ghost) > cache_snapshot.capacity * 3:
+        _s3_ghost.pop(next(iter(_s3_ghost)), None)
+>>>>>>> REPLACE
+</DIFF>

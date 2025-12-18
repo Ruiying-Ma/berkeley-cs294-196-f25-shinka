@@ -1,0 +1,216 @@
+# EVOLVE-BLOCK-START
+"""Cache eviction algorithm with Adaptive TinyLFU, Doorkeeper, and SLRU"""
+from collections import OrderedDict
+
+# Adaptive TinyLFU State
+algo_state = {
+    'window': OrderedDict(),    # Nursery (FIFO behavior for eviction, promote on hit)
+    'probation': OrderedDict(), # Main Cache - Probation (SLRU)
+    'protected': OrderedDict(), # Main Cache - Protected (SLRU)
+    'ghost_w': OrderedDict(),   # History of keys evicted from Window
+    'ghost_p': OrderedDict(),   # History of keys evicted from Probation
+    'freq': {},                 # Frequency Counter
+    'doorkeeper': set(),        # Doorkeeper (1-bit counter approx)
+    'target_w': 1.0,            # Target Window Size
+    'op_count': 0,              # Operation counter for aging
+    'max_time': 0,              # Track trace reset
+    'initialized': False        # Flag for initial setup
+}
+
+def _check_reset(current_time):
+    if current_time < algo_state['max_time']:
+        algo_state['window'].clear()
+        algo_state['probation'].clear()
+        algo_state['protected'].clear()
+        algo_state['ghost_w'].clear()
+        algo_state['ghost_p'].clear()
+        algo_state['freq'].clear()
+        algo_state['doorkeeper'].clear()
+        algo_state['target_w'] = 1.0
+        algo_state['op_count'] = 0
+        algo_state['initialized'] = False
+        algo_state['max_time'] = 0
+    algo_state['max_time'] = current_time
+
+def _get_freq(key):
+    # Calculate frequency with Doorkeeper logic
+    f = algo_state['freq'].get(key, 0)
+    if key in algo_state['doorkeeper']:
+        f += 1
+    return f
+
+def evict(cache_snapshot, obj):
+    '''
+    Eviction Logic:
+    1. Determine candidates (Window LRU vs Main LRU).
+    2. Check Adaptive Window Sizing logic.
+    3. Duel if necessary using Frequency.
+    '''
+    window = algo_state['window']
+    probation = algo_state['probation']
+    protected = algo_state['protected']
+    target_w = algo_state['target_w']
+    
+    # Identify candidates
+    candidate_w = next(iter(window)) if window else None
+    
+    candidate_m = None
+    if probation:
+        candidate_m = next(iter(probation))
+    elif protected:
+        candidate_m = next(iter(protected))
+        
+    # If Main is empty, must evict Window
+    if not candidate_m:
+        return candidate_w
+    # If Window is empty, must evict Main
+    if not candidate_w:
+        return candidate_m
+
+    # Adaptive Logic
+    # If Window is growing (<= target), prefer evicting Main to make space
+    if len(window) <= target_w:
+        return candidate_m
+    else:
+        # Window is full/oversized. Duel to decide.
+        fw = _get_freq(candidate_w)
+        fm = _get_freq(candidate_m)
+        
+        # Tie-breaker: Prefer Main (Incumbent) -> Evict Window
+        if fw > fm:
+            return candidate_m
+        else:
+            return candidate_w
+
+def update_after_hit(cache_snapshot, obj):
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+    window = algo_state['window']
+    probation = algo_state['probation']
+    protected = algo_state['protected']
+    
+    # Update Frequency & Doorkeeper
+    if key in algo_state['freq']:
+        algo_state['freq'][key] += 1
+    elif key in algo_state['doorkeeper']:
+        algo_state['freq'][key] = 1
+        algo_state['doorkeeper'].remove(key)
+    else:
+        algo_state['doorkeeper'].add(key)
+        
+    # Aging
+    algo_state['op_count'] += 1
+    if algo_state['op_count'] >= cache_snapshot.capacity * 10:
+        to_remove = []
+        for k in algo_state['freq']:
+            algo_state['freq'][k] //= 2
+            if algo_state['freq'][k] == 0: to_remove.append(k)
+        for k in to_remove: del algo_state['freq'][k]
+        algo_state['doorkeeper'].clear()
+        algo_state['op_count'] = 0
+
+    # Cache Promotions
+    if key in window:
+        # Hit in Window -> Promote to Probation (S3-FIFO logic)
+        del window[key]
+        probation[key] = None
+    elif key in probation:
+        # Hit in Probation -> Promote to Protected
+        del probation[key]
+        protected[key] = None
+    elif key in protected:
+        # Hit in Protected -> MRU
+        protected.move_to_end(key)
+        
+    # Enforce Protected Capacity (80% of Main)
+    main_size = len(probation) + len(protected)
+    if main_size > 0:
+        protected_cap = int(main_size * 0.8)
+        while len(protected) > protected_cap:
+            k, _ = protected.popitem(last=False)
+            probation[k] = None # Demote to Probation MRU
+
+def update_after_insert(cache_snapshot, obj):
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+    capacity = cache_snapshot.capacity
+    
+    # Initialize target_w on first run
+    if not algo_state['initialized']:
+        algo_state['target_w'] = max(1, int(capacity * 0.1))
+        algo_state['initialized'] = True
+
+    # Frequency Update (Insert counts as access)
+    if key in algo_state['freq']:
+        algo_state['freq'][key] += 1
+    elif key in algo_state['doorkeeper']:
+        algo_state['freq'][key] = 1
+        algo_state['doorkeeper'].remove(key)
+    else:
+        algo_state['doorkeeper'].add(key)
+
+    # Adaptive Sizing based on Ghosts
+    if key in algo_state['ghost_w']:
+        # Hit in window ghost -> Window too small
+        algo_state['target_w'] = min(capacity, algo_state['target_w'] + 1)
+        del algo_state['ghost_w'][key]
+    elif key in algo_state['ghost_p']:
+        # Hit in main ghost -> Main too small
+        algo_state['target_w'] = max(1, algo_state['target_w'] - 1)
+        del algo_state['ghost_p'][key]
+
+    # Insert New Item into Window
+    algo_state['window'][key] = None
+
+    # Aging
+    algo_state['op_count'] += 1
+    if algo_state['op_count'] >= capacity * 10:
+        to_remove = []
+        for k in algo_state['freq']:
+            algo_state['freq'][k] //= 2
+            if algo_state['freq'][k] == 0: to_remove.append(k)
+        for k in to_remove: del algo_state['freq'][k]
+        algo_state['doorkeeper'].clear()
+        algo_state['op_count'] = 0
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    v_key = evicted_obj.key
+    window = algo_state['window']
+    probation = algo_state['probation']
+    protected = algo_state['protected']
+    
+    # Determine source and clean up
+    src_is_main = False
+    if v_key in window:
+        del window[v_key]
+        algo_state['ghost_w'][v_key] = None
+    elif v_key in probation:
+        del probation[v_key]
+        algo_state['ghost_p'][v_key] = None
+        src_is_main = True
+    elif v_key in protected:
+        del protected[v_key]
+        algo_state['ghost_p'][v_key] = None
+        src_is_main = True
+        
+    # Manage Ghost Capacity (Global or per list)
+    # Keeping total ghosts ~ capacity is standard
+    capacity = cache_snapshot.capacity
+    while len(algo_state['ghost_w']) + len(algo_state['ghost_p']) > capacity:
+        # Prune ghosts (simple FIFO/LRU)
+        if len(algo_state['ghost_w']) > len(algo_state['ghost_p']):
+             algo_state['ghost_w'].popitem(last=False)
+        else:
+             if algo_state['ghost_p']:
+                 algo_state['ghost_p'].popitem(last=False)
+             elif algo_state['ghost_w']:
+                 algo_state['ghost_w'].popitem(last=False)
+
+    # Rebalance if we evicted Main but Window is too large
+    # This prevents Window from consuming all space if Main keeps losing duels
+    # We move Window LRU to Probation (transferring the pressure)
+    if src_is_main and len(window) > algo_state['target_w']:
+        if window:
+            k, _ = window.popitem(last=False)
+            probation[k] = None
+# EVOLVE-BLOCK-END

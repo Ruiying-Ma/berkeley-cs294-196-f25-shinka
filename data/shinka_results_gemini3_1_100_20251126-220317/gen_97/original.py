@@ -1,0 +1,220 @@
+# EVOLVE-BLOCK-START
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+
+from collections import deque, OrderedDict
+
+# Improved W-TinyLFU state
+algo_state = {
+    'window': OrderedDict(),    # key -> size (LRU)
+    'window_size': 0,
+    'probation': OrderedDict(), # key -> size (LRU)
+    'protected': OrderedDict(), # key -> size (LRU)
+    'protected_size': 0,
+    'freq': {},               # key -> count
+    'doorkeeper': set(),      # key
+    'access_count': 0,        # For aging
+    'last_trace_access': -1   # Detect trace reset
+}
+
+def _check_trace_reset(snapshot_access_count):
+    if snapshot_access_count < algo_state['last_trace_access']:
+        algo_state['window'].clear()
+        algo_state['window_size'] = 0
+        algo_state['probation'].clear()
+        algo_state['protected'].clear()
+        algo_state['protected_size'] = 0
+        algo_state['freq'].clear()
+        algo_state['doorkeeper'].clear()
+        algo_state['access_count'] = 0
+    algo_state['last_trace_access'] = snapshot_access_count
+
+def evict(cache_snapshot, obj):
+    '''
+    W-TinyLFU with optimized parameters:
+    - 1% Window size
+    - Biased Duel (Favor Main)
+    - Size-based Doorkeeper reset
+    '''
+    _check_trace_reset(cache_snapshot.access_count)
+
+    window = algo_state['window']
+    probation = algo_state['probation']
+    protected = algo_state['protected']
+    freq = algo_state['freq']
+    dk = algo_state['doorkeeper']
+
+    capacity = cache_snapshot.capacity
+    w_cap = max(1, int(capacity * 0.01))
+
+    def get_freq(k):
+        if k in freq: return freq[k]
+        if k in dk: return 1
+        return 0
+
+    # Candidates
+    cand_w_key = next(iter(window)) if window else None
+    cand_m_key = None
+    if probation:
+        cand_m_key = next(iter(probation))
+    elif protected:
+        cand_m_key = next(iter(protected))
+
+    # 1. Window Growth Logic
+    # If Window is not full, we typically evict from Main.
+    # But if Main victim is valuable (freq > 0), we spare it and evict from Window.
+    if algo_state['window_size'] < w_cap:
+        if cand_m_key:
+            fm = get_freq(cand_m_key)
+            if fm > 0:
+                # Spare Main, evict Window if possible
+                if cand_w_key: return cand_w_key
+                else: return cand_m_key # Window empty, must evict Main
+            else:
+                return cand_m_key
+        else:
+            # Main empty
+            if cand_w_key: return cand_w_key
+            return None
+
+    # 2. Steady State (Window Full) -> Duel
+    if not cand_w_key:
+        return cand_m_key
+    if not cand_m_key:
+        return cand_w_key
+
+    fw = get_freq(cand_w_key)
+    fm = get_freq(cand_m_key)
+
+    # Biased Duel: Evict Main only if Window is strictly better by margin
+    if fw > fm + 1:
+        return cand_m_key
+    else:
+        return cand_w_key
+
+def update_after_hit(cache_snapshot, obj):
+    _check_trace_reset(cache_snapshot.access_count)
+    key = obj.key
+    algo_state['access_count'] += 1
+
+    # Frequency Update
+    f = algo_state['freq']
+    dk = algo_state['doorkeeper']
+
+    if key in f:
+        f[key] = min(f[key] + 1, 15) # Cap at 15
+    elif key in dk:
+        dk.remove(key)
+        f[key] = 2
+    else:
+        dk.add(key)
+
+    # Aging (Frequency Halving)
+    if algo_state['access_count'] >= cache_snapshot.capacity * 10:
+        to_rem = []
+        for k in f:
+            f[k] //= 2
+            if f[k] == 0: to_rem.append(k)
+        for k in to_rem: del f[k]
+        algo_state['access_count'] = 0
+
+    # Doorkeeper Reset (Size-based)
+    if len(dk) > cache_snapshot.capacity * 2:
+        dk.clear()
+
+    # SLRU / Window Management
+    if key in algo_state['window']:
+        algo_state['window'].move_to_end(key)
+    elif key in algo_state['protected']:
+        algo_state['protected'].move_to_end(key)
+    elif key in algo_state['probation']:
+        # Promote to Protected
+        val = algo_state['probation'].pop(key)
+        algo_state['protected'][key] = val
+        algo_state['protected_size'] += val
+
+        # Enforce Protected Limit (80% of capacity)
+        limit = int(cache_snapshot.capacity * 0.8)
+        while algo_state['protected_size'] > limit and algo_state['protected']:
+            k, v = algo_state['protected'].popitem(last=False)
+            algo_state['protected_size'] -= v
+            algo_state['probation'][k] = v
+            algo_state['probation'].move_to_end(k) # Move to MRU of Probation
+
+def update_after_insert(cache_snapshot, obj):
+    _check_trace_reset(cache_snapshot.access_count)
+    key = obj.key
+    size = obj.size
+    algo_state['access_count'] += 1
+
+    # Frequency Update
+    f = algo_state['freq']
+    dk = algo_state['doorkeeper']
+
+    if key in f:
+        f[key] = min(f[key] + 1, 15)
+    elif key in dk:
+        dk.remove(key)
+        f[key] = 2
+    else:
+        dk.add(key)
+
+    # Aging
+    if algo_state['access_count'] >= cache_snapshot.capacity * 10:
+        to_rem = []
+        for k in f:
+            f[k] //= 2
+            if f[k] == 0: to_rem.append(k)
+        for k in to_rem: del f[k]
+        algo_state['access_count'] = 0
+
+    # Doorkeeper Reset
+    if len(dk) > cache_snapshot.capacity * 2:
+        dk.clear()
+
+    # Insert into Window
+    algo_state['window'][key] = size
+    algo_state['window_size'] += size
+
+    # Check Window Overflow -> Move to Probation
+    w_cap = max(1, int(cache_snapshot.capacity * 0.01))
+    while algo_state['window_size'] > w_cap and algo_state['window']:
+        k, s = algo_state['window'].popitem(last=False)
+        algo_state['window_size'] -= s
+        algo_state['probation'][k] = s
+        algo_state['probation'].move_to_end(k) # MRU of Probation
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    key = evicted_obj.key
+    size = evicted_obj.size
+
+    # Remove from appropriate structure
+    if key in algo_state['window']:
+        del algo_state['window'][key]
+        algo_state['window_size'] -= size
+    elif key in algo_state['probation']:
+        del algo_state['probation'][key]
+    elif key in algo_state['protected']:
+        val = algo_state['protected'].pop(key)
+        algo_state['protected_size'] -= val
+
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

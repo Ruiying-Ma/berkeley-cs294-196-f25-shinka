@@ -1,0 +1,198 @@
+# EVOLVE-BLOCK-START
+"""
+W-TinyLFU with Ghost Shield for Demoted Items.
+"""
+
+from collections import deque, OrderedDict
+
+# Global state
+algo_state = {
+    'window': deque(),        # Queue of (key, size)
+    'window_size': 0,
+    'probation': OrderedDict(), # key -> size - Main Cache (Probationary)
+    'protected': OrderedDict(), # key -> size - Main Cache (Protected)
+    'protected_size': 0,
+    'demoted': set(),         # key - items demoted from Protected to Probation
+    'freq': {},               # key -> count
+    'doorkeeper': set(),      # key
+    'access_count': 0,        # Internal counter for aging
+    'last_trace_access': -1   # To detect trace reset
+}
+
+def _check_trace_reset(snapshot_access_count):
+    if snapshot_access_count < algo_state['last_trace_access']:
+        algo_state['window'].clear()
+        algo_state['window_size'] = 0
+        algo_state['probation'].clear()
+        algo_state['protected'].clear()
+        algo_state['protected_size'] = 0
+        algo_state['demoted'].clear()
+        algo_state['freq'].clear()
+        algo_state['doorkeeper'].clear()
+        algo_state['access_count'] = 0
+    algo_state['last_trace_access'] = snapshot_access_count
+
+def _update_freq(key, capacity):
+    freq = algo_state['freq']
+    dk = algo_state['doorkeeper']
+
+    if key in freq:
+        freq[key] = min(freq[key] + 1, 15)
+    elif key in dk:
+        dk.remove(key)
+        freq[key] = 2
+    else:
+        dk.add(key)
+
+    # Aging: Every 5*capacity accesses
+    if algo_state['access_count'] >= capacity * 5:
+        to_rem = []
+        for k in freq:
+            freq[k] //= 2
+            if freq[k] == 0: to_rem.append(k)
+        for k in to_rem: del freq[k]
+        algo_state['access_count'] = 0
+    
+    # Doorkeeper Reset
+    if len(dk) > capacity * 2:
+        dk.clear()
+
+def evict(cache_snapshot, obj):
+    _check_trace_reset(cache_snapshot.access_count)
+    
+    window = algo_state['window']
+    probation = algo_state['probation']
+    protected = algo_state['protected']
+    freq = algo_state['freq']
+    demoted = algo_state['demoted']
+    dk = algo_state['doorkeeper']
+
+    capacity = cache_snapshot.capacity
+    w_cap = max(1, int(capacity * 0.01))
+
+    def get_freq(k):
+        if k in freq: return freq[k]
+        if k in dk: return 1
+        return 0
+
+    cand_w = window[0] if window else None
+    cand_m_key = None
+    if probation:
+        cand_m_key = next(iter(probation)) # LRU
+    elif protected:
+        cand_m_key = next(iter(protected)) # Should be rare (if probation empty)
+
+    # 1. Window Growth Phase
+    if algo_state['window_size'] < w_cap:
+        if cand_m_key:
+            fm = get_freq(cand_m_key)
+            # Spare Main if it has value or is a demoted/shielded item
+            if fm > 0 or cand_m_key in demoted:
+                if cand_w: return cand_w[0]
+                return cand_m_key
+            else:
+                return cand_m_key
+        else:
+            if cand_w: return cand_w[0]
+            return None
+
+    # 2. Steady State -> Duel
+    if not cand_w: return cand_m_key
+    if not cand_m_key: return cand_w[0]
+
+    cand_w_key = cand_w[0]
+    fw = get_freq(cand_w_key)
+    fm = get_freq(cand_m_key)
+
+    # Bias Logic:
+    # Newcomers (Window) vs Incumbents (Main/Probation)
+    # If Incumbent was recently demoted from Protected, it gets a strong shield (Bias 4)
+    # Otherwise, it gets standard treatment (Bias 0) - fair fight
+    bias = 0
+    if cand_m_key in demoted:
+        bias = 4
+    
+    if fw > fm + bias:
+        return cand_m_key
+    else:
+        return cand_w_key
+
+def update_after_hit(cache_snapshot, obj):
+    _check_trace_reset(cache_snapshot.access_count)
+    key = obj.key
+    algo_state['access_count'] += 1
+
+    _update_freq(key, cache_snapshot.capacity)
+    
+    if key in algo_state['protected']:
+        algo_state['protected'].move_to_end(key)
+    elif key in algo_state['probation']:
+        # Promote to Protected
+        val = algo_state['probation'].pop(key)
+        algo_state['protected'][key] = val
+        algo_state['protected_size'] += val
+        
+        if key in algo_state['demoted']:
+            algo_state['demoted'].remove(key)
+        
+        limit = int(cache_snapshot.capacity * 0.8)
+        while algo_state['protected_size'] > limit and algo_state['protected']:
+            k, v = algo_state['protected'].popitem(last=False) # LRU of Protected
+            algo_state['protected_size'] -= v
+            algo_state['probation'][k] = v
+            algo_state['probation'].move_to_end(k) # MRU of Probation
+            algo_state['demoted'].add(k) # Flag as demoted
+
+def update_after_insert(cache_snapshot, obj):
+    _check_trace_reset(cache_snapshot.access_count)
+    key = obj.key
+    size = obj.size
+    algo_state['access_count'] += 1
+
+    _update_freq(key, cache_snapshot.capacity)
+
+    algo_state['window'].append((key, size))
+    algo_state['window_size'] += size
+
+    w_cap = max(1, int(cache_snapshot.capacity * 0.01))
+    while algo_state['window_size'] > w_cap and algo_state['window']:
+        k, s = algo_state['window'].popleft()
+        algo_state['window_size'] -= s
+        algo_state['probation'][k] = s
+        algo_state['probation'].move_to_end(k)
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    key = evicted_obj.key
+    size = evicted_obj.size
+
+    if algo_state['window'] and algo_state['window'][0][0] == key:
+        algo_state['window'].popleft()
+        algo_state['window_size'] -= size
+    elif key in algo_state['probation']:
+        del algo_state['probation'][key]
+        if key in algo_state['demoted']:
+            algo_state['demoted'].remove(key)
+    elif key in algo_state['protected']:
+        v = algo_state['protected'].pop(key)
+        algo_state['protected_size'] -= v
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

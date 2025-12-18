@@ -1,0 +1,215 @@
+<NAME>
+arc_lfu_crosslist_selection
+</NAME>
+
+<DESCRIPTION>
+I introduce a cross-list LFU-aware replacement that respects ARC’s primary decision but can override it when the other list clearly holds a much colder victim. Concretely:
+- I add a helper that returns both the candidate and its (freq, timestamp) score among the oldest k items of a list. This preserves LRU behavior for ties and leverages lightweight LFU to identify colder items.
+- In evict, I compute candidate scores from both T1 and T2. I start with the standard ARC replace decision (T1 vs T2). If both sides have candidates and the opposite side’s candidate has a significantly lower frequency (by at least 1), I evict from that opposite side instead. This selectively avoids evicting relatively “hotter” entries and reduces miss rate on mixed workloads.
+- All other metadata handling remains the same, ensuring ghosts and p-update logic continue to operate. This hybrid ARC+LFU decision uses data already maintained (m_freq, timestamps) and keeps ARC stability while improving victim choice quality.
+
+This change strengthens eviction decisions without disrupting the existing update_after_hit/insert/evict invariants and should help across diverse traces, especially where hot items appear in the “wrong” list relative to ARC’s default replacement.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def _pick_lfu_among_lru(od, sample_k):
+    # Among the k oldest in od, pick the key with the lowest frequency.
+    # Tie-break by oldest timestamp to better approximate true LRU for equals.
+    if not od:
+        return None
+    k = max(1, sample_k)
+    best_key = None
+    best_freq = None
+    best_ts = None
+    count = 0
+    for key in od.keys():
+        f = m_freq.get(key, 0)
+        ts = m_key_timestamp.get(key, float('inf'))
+        if (best_freq is None or
+            f < best_freq or
+            (f == best_freq and ts < best_ts)):
+            best_freq = f
+            best_ts = ts
+            best_key = key
+        count += 1
+        if count >= k:
+            break
+    return best_key if best_key is not None else next(iter(od))
+=======
+def _pick_lfu_among_lru_with_score(od, sample_k):
+    # Among the k oldest in od, pick the key with the lowest frequency.
+    # Tie-break by oldest timestamp to better approximate true LRU for equals.
+    # Return a tuple (key, freq, ts). If od empty, return (None, None, None).
+    if not od:
+        return (None, None, None)
+    k = max(1, sample_k)
+    best_key = None
+    best_freq = None
+    best_ts = None
+    count = 0
+    for key in od.keys():
+        f = m_freq.get(key, 0)
+        ts = m_key_timestamp.get(key, float('inf'))
+        if (best_freq is None or
+            f < best_freq or
+            (f == best_freq and ts < best_ts)):
+            best_freq = f
+            best_ts = ts
+            best_key = key
+        count += 1
+        if count >= k:
+            break
+    if best_key is None:
+        # Fallback to LRU if somehow not set
+        try:
+            best_key = next(iter(od))
+        except StopIteration:
+            return (None, None, None)
+        best_freq = m_freq.get(best_key, 0)
+        best_ts = m_key_timestamp.get(best_key, float('inf'))
+    return (best_key, best_freq, best_ts)
+
+
+def _pick_lfu_among_lru(od, sample_k):
+    # Backward-compatible wrapper that returns only the key
+    key, _, _ = _pick_lfu_among_lru_with_score(od, sample_k)
+    return key
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    _ensure_capacity(cache_snapshot)
+    _maybe_age(cache_snapshot)
+    # Keep metadata consistent
+    if (len(arc_T1) + len(arc_T2)) != len(cache_snapshot.cache):
+        _resync(cache_snapshot)
+
+    # ARC replacement: choose between T1 and T2 depending on arc_p and ghost hit type
+    x_in_B2 = obj.key in arc_B2
+    t1_sz = len(arc_T1)
+    choose_T1 = (t1_sz >= 1 and (t1_sz > arc_p or (x_in_B2 and t1_sz == arc_p)))
+
+    # Frequency-aware sampling among the k oldest of the chosen list
+    sample_k = min(16, max(2, (arc_capacity if arc_capacity else 1) // 8))
+    candidate = None
+    if choose_T1 and arc_T1:
+        candidate = _pick_lfu_among_lru(arc_T1, sample_k)
+    elif (not choose_T1) and arc_T2:
+        candidate = _pick_lfu_among_lru(arc_T2, sample_k)
+
+    # If preferred list empty, try the other resident list
+    if candidate is None:
+        if arc_T1:
+            candidate = _pick_lfu_among_lru(arc_T1, sample_k)
+        elif arc_T2:
+            candidate = _pick_lfu_among_lru(arc_T2, sample_k)
+
+    if candidate is None:
+        # Fallback: choose the oldest by timestamp if available, else any key
+        if m_key_timestamp and cache_snapshot.cache:
+            min_ts = float('inf')
+            best = None
+            for k in cache_snapshot.cache.keys():
+                ts = m_key_timestamp.get(k, float('inf'))
+                if ts < min_ts:
+                    min_ts = ts
+                    best = k
+            candidate = best
+        if candidate is None and cache_snapshot.cache:
+            candidate = next(iter(cache_snapshot.cache.keys()))
+    return candidate
+=======
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    _ensure_capacity(cache_snapshot)
+    _maybe_age(cache_snapshot)
+    # Keep metadata consistent
+    if (len(arc_T1) + len(arc_T2)) != len(cache_snapshot.cache):
+        _resync(cache_snapshot)
+
+    # ARC replacement: choose between T1 and T2 depending on arc_p and ghost hit type
+    x_in_B2 = obj.key in arc_B2
+    t1_sz = len(arc_T1)
+    choose_T1 = (t1_sz >= 1 and (t1_sz > arc_p or (x_in_B2 and t1_sz == arc_p)))
+
+    # Frequency-aware sampling among the k oldest of both lists
+    cap = arc_capacity if arc_capacity else 1
+    sample_k = min(16, max(2, cap // 8))
+
+    k1, f1, ts1 = _pick_lfu_among_lru_with_score(arc_T1, sample_k)
+    k2, f2, ts2 = _pick_lfu_among_lru_with_score(arc_T2, sample_k)
+
+    # Start with canonical ARC decision
+    candidate = None
+    cand_freq = None
+    cand_ts = None
+    if choose_T1:
+        if k1 is not None:
+            candidate, cand_freq, cand_ts = k1, f1, ts1
+        elif k2 is not None:
+            candidate, cand_freq, cand_ts = k2, f2, ts2
+    else:
+        if k2 is not None:
+            candidate, cand_freq, cand_ts = k2, f2, ts2
+        elif k1 is not None:
+            candidate, cand_freq, cand_ts = k1, f1, ts1
+
+    # Cross-list override: if the opposite list has a much colder candidate, pick it
+    MARGIN = 1  # require at least 1 lower frequency to override
+    if k1 is not None and k2 is not None:
+        if choose_T1:
+            # Opposite (T2) is much colder
+            if f2 is not None and cand_freq is not None and (f2 + MARGIN) < cand_freq:
+                candidate, cand_freq, cand_ts = k2, f2, ts2
+            elif f2 == cand_freq and ts2 is not None and cand_ts is not None and ts2 < cand_ts:
+                # Tie-break by older timestamp if frequencies equal
+                candidate, cand_freq, cand_ts = k2, f2, ts2
+        else:
+            # Opposite (T1) is much colder
+            if f1 is not None and cand_freq is not None and (f1 + MARGIN) < cand_freq:
+                candidate, cand_freq, cand_ts = k1, f1, ts1
+            elif f1 == cand_freq and ts1 is not None and cand_ts is not None and ts1 < cand_ts:
+                candidate, cand_freq, cand_ts = k1, f1, ts1
+
+    # If still no candidate, try any resident list deterministically
+    if candidate is None:
+        if arc_T1:
+            candidate = _pick_lfu_among_lru(arc_T1, sample_k)
+        elif arc_T2:
+            candidate = _pick_lfu_among_lru(arc_T2, sample_k)
+
+    if candidate is None:
+        # Fallback: choose the oldest by timestamp if available, else any key
+        if m_key_timestamp and cache_snapshot.cache:
+            min_ts = float('inf')
+            best = None
+            for k in cache_snapshot.cache.keys():
+                ts = m_key_timestamp.get(k, float('inf'))
+                if ts < min_ts:
+                    min_ts = ts
+                    best = k
+            candidate = best
+        if candidate is None and cache_snapshot.cache:
+            candidate = next(iter(cache_snapshot.cache.keys()))
+    return candidate
+>>>>>>> REPLACE
+
+</DIFF>

@@ -1,0 +1,357 @@
+<NAME>
+arc_tlfu_scan_ghost_smooth
+</NAME>
+
+<DESCRIPTION>
+I improved the ARC+TinyLFU policy with three targeted enhancements to reduce miss rate across diverse workloads:
+
+1) Canonical ARC ghost management and replace logic:
+- Bound the combined ghost size |B1|+|B2| ≤ capacity (instead of per-list bounds), pruning from B1 if |B1| > p, else from B2. This stabilizes adaptation and improves scan resistance.
+- In choose_victim, added ARC’s “new in B2 and |T1| == p → evict from T1” rule, which better biases eviction during frequency-favoring phases.
+
+2) Scan detection with temporary T1-bias:
+- Track a miss streak and, when it indicates a streaming pattern (miss_streak > 2×capacity, small T2, and B1 ≥ B2), immediately reduce p and activate a short “scan mode” window that forces victim selection from T1. This protects frequent items (T2) from being thrashed during scans, improving the low-hit-rate traces.
+
+3) Smoother p-adaptation:
+- Apply a damped update (alpha=0.25) to p on ghost hits (B1/B2) to reduce oscillation, preserving stability while remaining responsive.
+
+Additionally, p is now a float to support smooth updates, hits reset the miss streak, and minor robustness improvements were included. These changes keep the TinyLFU-guided admission and sampled victim selection while making the algorithm more stable and scan-resistant, which should improve combined score across traces.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    __slots__ = (
+        "T1", "T2", "B1", "B2",
+        "p", "capacity", "_last_evicted_from",
+        "sketch", "_sample_k"
+    )
+
+    def __init__(self):
+        self.T1 = OrderedDict()
+        self.T2 = OrderedDict()
+        self.B1 = OrderedDict()
+        self.B2 = OrderedDict()
+        self.p = 0
+        self.capacity = None
+        self._last_evicted_from = None  # 'T1' or 'T2'
+        self.sketch = _CmSketch(width_power=12, d=3)
+        self._sample_k = 6
+=======
+    __slots__ = (
+        "T1", "T2", "B1", "B2",
+        "p", "capacity", "_last_evicted_from",
+        "sketch", "_sample_k", "_miss_streak", "_scan_mode_until"
+    )
+
+    def __init__(self):
+        self.T1 = OrderedDict()
+        self.T2 = OrderedDict()
+        self.B1 = OrderedDict()
+        self.B2 = OrderedDict()
+        self.p = 0.0
+        self.capacity = None
+        self._last_evicted_from = None  # 'T1' or 'T2'
+        self.sketch = _CmSketch(width_power=12, d=3)
+        self._sample_k = 6
+        self._miss_streak = 0
+        self._scan_mode_until = 0
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def _prune_ghosts(self):
+        cap = self.capacity or 1
+        # Bound each ghost list individually to capacity.
+        while len(self.B1) > cap:
+            self.B1.popitem(last=False)
+        while len(self.B2) > cap:
+            self.B2.popitem(last=False)
+=======
+    def _prune_ghosts(self):
+        cap = self.capacity or 1
+        # Prefer canonical ARC bound: |B1| + |B2| ≤ capacity.
+        # Also drop entries that became resident.
+        for k in list(self.B1.keys()):
+            if k in self.T1 or k in self.T2:
+                self.B1.pop(k, None)
+        for k in list(self.B2.keys()):
+            if k in self.T1 or k in self.T2:
+                self.B2.pop(k, None)
+        while (len(self.B1) + len(self.B2)) > cap:
+            if len(self.B1) > int(self.p):
+                self.B1.popitem(last=False)
+            else:
+                self.B2.popitem(last=False)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def choose_victim(self, cache_snapshot, new_obj) -> str:
+        """
+        ARC + TinyLFU victim selection:
+        - If T1 exceeds target p, evict from T1 (sampled LRU-min-freq).
+        - Else choose between T1 and T2 by comparing TinyLFU(new) vs TinyLFU(candidate_T2).
+          If new <= candidate_T2, evict from T1 (protect existing hot items).
+          Otherwise evict from T2 (admit the hotter incoming).
+        """
+        self._ensure_capacity(cache_snapshot.capacity)
+        self._prune_stale_residents(cache_snapshot)
+
+        cand_T1 = self._sample_lru_min_freq(self.T1) if len(self.T1) > 0 else None
+        cand_T2 = self._sample_lru_min_freq(self.T2) if len(self.T2) > 0 else None
+
+        # ARC rule: if T1 is larger than target, evict from T1
+        if cand_T1 is not None and len(self.T1) > self.p:
+            self._last_evicted_from = 'T1'
+            return cand_T1
+
+        # If only one segment is non-empty, evict from it
+        if cand_T1 is None and cand_T2 is not None:
+            self._last_evicted_from = 'T2'
+            return cand_T2
+        if cand_T2 is None and cand_T1 is not None:
+            self._last_evicted_from = 'T1'
+            return cand_T1
+
+        # Both candidates exist: competitive admission via TinyLFU
+        if cand_T1 is not None and cand_T2 is not None:
+            f_new = self.sketch.estimate(new_obj.key)
+            f_t2 = self.sketch.estimate(cand_T2)
+            if f_new <= f_t2:
+                self._last_evicted_from = 'T1'
+                return cand_T1
+            else:
+                self._last_evicted_from = 'T2'
+                return cand_T2
+
+        # Fallbacks
+        if len(self.T2) > 0:
+            self._last_evicted_from = 'T2'
+            return self._sample_lru_min_freq(self.T2)
+        if len(self.T1) > 0:
+            self._last_evicted_from = 'T1'
+            return self._sample_lru_min_freq(self.T1)
+
+        # Final resort: pick any key from the actual cache
+        self._last_evicted_from = 'T1'
+        return next(iter(cache_snapshot.cache))
+=======
+    def choose_victim(self, cache_snapshot, new_obj) -> str:
+        """
+        ARC + TinyLFU victim selection:
+        - If T1 exceeds target p, evict from T1 (sampled LRU-min-freq).
+        - If new key is in B2 and |T1| == p, evict from T1 (ARC rule).
+        - During detected scan mode, prefer evicting from T1 to protect T2.
+        - Else choose between T1 and T2 by comparing TinyLFU(new) vs TinyLFU(candidate_T2).
+        """
+        self._ensure_capacity(cache_snapshot.capacity)
+        self._prune_stale_residents(cache_snapshot)
+
+        cand_T1 = self._sample_lru_min_freq(self.T1) if len(self.T1) > 0 else None
+        cand_T2 = self._sample_lru_min_freq(self.T2) if len(self.T2) > 0 else None
+
+        in_B2 = (new_obj.key in self.B2)
+
+        # Scan-mode bias: for the next ~capacity accesses, evict from T1 when possible
+        now = cache_snapshot.access_count
+        if now < getattr(self, "_scan_mode_until", 0) and cand_T1 is not None:
+            self._last_evicted_from = 'T1'
+            return cand_T1
+
+        # ARC rule: if T1 is larger than target, or (new in B2 and |T1|==p), evict from T1
+        if cand_T1 is not None and (len(self.T1) > self.p or (in_B2 and len(self.T1) == int(self.p))):
+            self._last_evicted_from = 'T1'
+            return cand_T1
+
+        # If only one segment is non-empty, evict from it
+        if cand_T1 is None and cand_T2 is not None:
+            self._last_evicted_from = 'T2'
+            return cand_T2
+        if cand_T2 is None and cand_T1 is not None:
+            self._last_evicted_from = 'T1'
+            return cand_T1
+
+        # Both candidates exist: competitive admission via TinyLFU
+        if cand_T1 is not None and cand_T2 is not None:
+            f_new = self.sketch.estimate(new_obj.key)
+            f_t2 = self.sketch.estimate(cand_T2)
+            if f_new <= f_t2:
+                self._last_evicted_from = 'T1'
+                return cand_T1
+            else:
+                self._last_evicted_from = 'T2'
+                return cand_T2
+
+        # Fallbacks
+        if len(self.T2) > 0:
+            self._last_evicted_from = 'T2'
+            return self._sample_lru_min_freq(self.T2)
+        if len(self.T1) > 0:
+            self._last_evicted_from = 'T1'
+            return self._sample_lru_min_freq(self.T1)
+
+        # Final resort: pick any key from the actual cache
+        self._last_evicted_from = 'T1'
+        return next(iter(cache_snapshot.cache))
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def on_hit(self, cache_snapshot, obj):
+        """
+        Hit handling:
+        - Increment TinyLFU.
+        - If in T1: promote to T2 only if frequency estimate >= threshold, else refresh in T1.
+        - If in T2: refresh in T2.
+        - If not tracked but cache hit: treat as frequent and place in T2.
+        """
+        self._ensure_capacity(cache_snapshot.capacity)
+        key = obj.key
+        self.sketch.increment(key, 1)
+
+        if key in self.T1:
+            # Gate promotion to avoid polluting T2 with one-hit wonders
+            if self.sketch.estimate(key) >= 2:
+                self.T1.pop(key, None)
+                self._touch_T2(key)
+            else:
+                self._touch_T1(key)
+        elif key in self.T2:
+            self._touch_T2(key)
+        else:
+            # Metadata desync: cache had it; assume it's frequent
+            self._touch_T2(key)
+=======
+    def on_hit(self, cache_snapshot, obj):
+        """
+        Hit handling:
+        - Increment TinyLFU.
+        - If in T1: promote to T2 only if frequency estimate >= threshold, else refresh in T1.
+        - If in T2: refresh in T2.
+        - If not tracked but cache hit: treat as frequent and place in T2.
+        """
+        self._ensure_capacity(cache_snapshot.capacity)
+        key = obj.key
+        self.sketch.increment(key, 1)
+
+        # Any hit breaks a pure-miss streaming streak
+        self._miss_streak = 0
+
+        if key in self.T1:
+            # Gate promotion to avoid polluting T2 with one-hit wonders
+            if self.sketch.estimate(key) >= 2:
+                self.T1.pop(key, None)
+                self._touch_T2(key)
+            else:
+                self._touch_T1(key)
+        elif key in self.T2:
+            self._touch_T2(key)
+        else:
+            # Metadata desync: cache had it; assume it's frequent
+            self._touch_T2(key)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def on_insert(self, cache_snapshot, obj):
+        """
+        Insert handling (called on miss after space made, if needed):
+        - If key in B1: increase p (favor recency) and insert into T2.
+        - If key in B2: decrease p (favor frequency) and insert into T2.
+        - Else: TinyLFU competitive admission:
+            Compare f(new) to a sampled T2 victim; if f(new) > f(victim_T2), insert to T2,
+            otherwise insert to T1.
+        """
+        self._ensure_capacity(cache_snapshot.capacity)
+        key = obj.key
+        # Count misses as well
+        self.sketch.increment(key, 1)
+
+        if key in self.B1:
+            delta = max(1, len(self.B2) // max(1, len(self.B1)))
+            self.p = min(self.capacity, self.p + delta)
+            self.B1.pop(key, None)
+            self._touch_T2(key)
+        elif key in self.B2:
+            delta = max(1, len(self.B1) // max(1, len(self.B2)))
+            self.p = max(0, self.p - delta)
+            self.B2.pop(key, None)
+            self._touch_T2(key)
+        else:
+            f_new = self.sketch.estimate(key)
+            if len(self.T2) > 0:
+                k2 = self._sample_lru_min_freq(self.T2)
+                f_k2 = self.sketch.estimate(k2) if k2 is not None else 0
+                if f_new > f_k2:
+                    self._touch_T2(key)
+                else:
+                    self._touch_T1(key)
+            else:
+                # Mild threshold when T2 empty
+                if f_new >= 2:
+                    self._touch_T2(key)
+                else:
+                    self._touch_T1(key)
+
+        # Ensure ghosts are bounded
+        self._prune_ghosts()
+=======
+    def on_insert(self, cache_snapshot, obj):
+        """
+        Insert handling (called on miss after space made, if needed):
+        - If key in B1: increase p (favor recency) with damped adaptation and insert into T2.
+        - If key in B2: decrease p (favor frequency) with damped adaptation and insert into T2.
+        - Else: TinyLFU competitive admission:
+            Compare f(new) to a sampled T2 victim; if f(new) > f(victim_T2), insert to T2,
+            otherwise insert to T1.
+        - Track miss streak to detect scans and temporarily bias eviction to T1.
+        """
+        self._ensure_capacity(cache_snapshot.capacity)
+        key = obj.key
+        now = cache_snapshot.access_count
+        # Count misses as well
+        self.sketch.increment(key, 1)
+
+        # Update miss streak and detect scans
+        self._miss_streak = getattr(self, "_miss_streak", 0) + 1
+        if self._miss_streak > (2 * self.capacity) and len(self.T2) < max(1, self.capacity // 10) and len(self.B1) >= len(self.B2):
+            # Streaming pattern: strongly prefer recency for a short cooldown window
+            self.p = max(0.0, self.p * 0.5)
+            self._scan_mode_until = now + self.capacity
+
+        alpha = 0.25  # dampening factor for p updates
+
+        if key in self.B1:
+            delta = float(max(1, len(self.B2) // max(1, len(self.B1))))
+            self.p = min(self.capacity, max(0.0, self.p + alpha * delta))
+            self.B1.pop(key, None)
+            self._touch_T2(key)
+        elif key in self.B2:
+            delta = float(max(1, len(self.B1) // max(1, len(self.B2))))
+            self.p = max(0.0, min(self.capacity, self.p - alpha * delta))
+            self.B2.pop(key, None)
+            self._touch_T2(key)
+        else:
+            f_new = self.sketch.estimate(key)
+            if len(self.T2) > 0:
+                k2 = self._sample_lru_min_freq(self.T2)
+                f_k2 = self.sketch.estimate(k2) if k2 is not None else 0
+                if f_new > f_k2:
+                    self._touch_T2(key)
+                else:
+                    self._touch_T1(key)
+            else:
+                # Mild threshold when T2 empty
+                if f_new >= 2:
+                    self._touch_T2(key)
+                else:
+                    self._touch_T1(key)
+
+        # Ensure ghosts are bounded
+        self._prune_ghosts()
+>>>>>>> REPLACE
+</DIFF>

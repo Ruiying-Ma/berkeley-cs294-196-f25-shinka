@@ -1,0 +1,271 @@
+<NAME>
+slru_with_adaptive_protected_ratio
+</NAME>
+
+<DESCRIPTION>
+I replace the pure LRU timestamp-based policy with a Segmented LRU (SLRU) policy featuring probation and protected segments, plus a simple adaptive mechanism to tune the protected segment size. SLRU improves scan resistance and balances recency and frequency: new items enter the probation segment; only items that are hit get promoted to the protected segment. Evictions preferentially come from the LRU end of probation, preserving frequently used items in protected.
+
+Key elements:
+- Maintain two OrderedDict-based LRU lists: probation and protected, and a membership map.
+- On hit in probation, promote to protected; on hit in protected, refresh position.
+- On insert, add to probation MRU.
+- Evict from probation LRU; if empty, evict from protected LRU.
+- Adaptive tuning: increase protected fraction when we see hits in probation (indicating value in promoting), and decrease it when we are forced to evict from protected (indicating probation is starved). A lightweight rebalance keeps protected size under a target computed from the current cache occupancy.
+
+This design provides better performance across diverse workloads by preventing short scans from evicting long-term hot items (a weakness of plain LRU) while still allowing recency to matter. The metadata is kept consistent with the actual cache content through a sync step, making it robust across runs or unexpected state.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+
+m_key_timestamp = dict()
+
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    candid_obj_key = None
+    min_ts = min(m_key_timestamp.values())
+    candid_obj_keys = list(key for key in cache_snapshot.cache if m_key_timestamp[key] == min_ts)
+    candid_obj_key = candid_obj_keys[0]
+    return candid_obj_key
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_key_timestamp
+    assert obj.key in m_key_timestamp
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp
+    assert obj.key not in m_key_timestamp
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp
+    assert obj.key not in m_key_timestamp
+    assert evicted_obj.key in m_key_timestamp
+    m_key_timestamp.pop(evicted_obj.key)
+=======
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+
+from collections import OrderedDict
+
+# Segmented LRU (SLRU) metadata:
+# - _probation: objects seen once (newly inserted), LRU-ordered
+# - _protected: objects that have been hit (promoted), LRU-ordered
+# We adapt the protected fraction slightly based on runtime signals.
+_probation = OrderedDict()   # key -> None (value unused)
+_protected = OrderedDict()   # key -> None (value unused)
+_key_seg = dict()            # key -> 'prob' or 'prot'
+
+_PROTECTED_FRAC = 0.8        # target fraction of cache to allocate to protected segment
+_ADAPT_STEP = 0.02           # step used to adjust protected fraction within [0.05, 0.95]
+
+
+def _increase_protected():
+    global _PROTECTED_FRAC
+    _PROTECTED_FRAC = min(0.95, _PROTECTED_FRAC + _ADAPT_STEP)
+
+
+def _decrease_protected():
+    global _PROTECTED_FRAC
+    _PROTECTED_FRAC = max(0.05, _PROTECTED_FRAC - _ADAPT_STEP)
+
+
+def _sync_metadata(cache_snapshot):
+    """Ensure SLRU metadata matches current cache content."""
+    cached_keys = set(cache_snapshot.cache.keys())
+
+    # Remove entries no longer in cache
+    for k in list(_key_seg.keys()):
+        if k not in cached_keys:
+            if _key_seg.get(k) == 'prob':
+                _probation.pop(k, None)
+            else:
+                _protected.pop(k, None)
+            _key_seg.pop(k, None)
+
+    # Add cached keys missing from metadata into probation MRU
+    for k in cached_keys:
+        if k not in _key_seg:
+            _probation[k] = None
+            _key_seg[k] = 'prob'
+
+
+def _rebalance(cache_snapshot):
+    """Demote protected LRU entries if protected size exceeds target."""
+    total = len(cache_snapshot.cache)
+    if total <= 0:
+        return
+    target = max(1, int(total * _PROTECTED_FRAC))
+
+    while len(_protected) > target:
+        # Demote protected LRU to probation MRU
+        k, _ = _protected.popitem(last=False)
+        _probation[k] = None
+        _key_seg[k] = 'prob'
+
+
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    # Keep metadata consistent and properly segmented before choosing a victim
+    _sync_metadata(cache_snapshot)
+    _rebalance(cache_snapshot)
+
+    candid_obj_key = None
+    victim_from_protected = False
+
+    # Prefer evicting from probation LRU for scan resistance
+    for k in list(_probation.keys()):
+        if k in cache_snapshot.cache:
+            candid_obj_key = k
+            victim_from_protected = False
+            break
+        else:
+            # stale
+            _probation.pop(k, None)
+            _key_seg.pop(k, None)
+
+    # If probation empty, evict from protected LRU and adapt by shrinking protected fraction
+    if candid_obj_key is None:
+        for k in list(_protected.keys()):
+            if k in cache_snapshot.cache:
+                candid_obj_key = k
+                victim_from_protected = True
+                break
+            else:
+                # stale
+                _protected.pop(k, None)
+                _key_seg.pop(k, None)
+        if candid_obj_key is None and cache_snapshot.cache:
+            # Fallback: pick any key from cache if metadata got desynced
+            candid_obj_key = next(iter(cache_snapshot.cache.keys()))
+
+    # Adaptive tuning: if we are forced to evict from protected, reduce its target fraction slightly
+    if victim_from_protected:
+        _decrease_protected()
+
+    return candid_obj_key
+
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    _sync_metadata(cache_snapshot)
+
+    k = obj.key
+    seg = _key_seg.get(k)
+
+    if seg == 'prob':
+        # Promote to protected on first hit
+        _probation.pop(k, None)
+        _protected[k] = None  # inserted at MRU
+        _key_seg[k] = 'prot'
+        _increase_protected()  # hits in probation signal benefit from a larger protected segment
+    elif seg == 'prot':
+        # Refresh recency in protected
+        if k in _protected:
+            _protected.move_to_end(k, last=True)
+        else:
+            # If somehow missing from the structure, reinsert into protected
+            _protected[k] = None
+            _key_seg[k] = 'prot'
+    else:
+        # Unknown key (shouldn't happen on hit) – treat as probation then promote
+        _probation[k] = None
+        _key_seg[k] = 'prob'
+        _probation.pop(k, None)
+        _protected[k] = None
+        _key_seg[k] = 'prot'
+        _increase_protected()
+
+    _rebalance(cache_snapshot)
+
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    _sync_metadata(cache_snapshot)
+    k = obj.key
+
+    # Insert new object into probation MRU
+    # If it somehow exists in protected/probation, reset to probation as newly inserted
+    if _key_seg.get(k) == 'prot':
+        _protected.pop(k, None)
+    else:
+        _probation.pop(k, None)  # remove if already existed to refresh order
+    _probation[k] = None
+    _key_seg[k] = 'prob'
+
+    # No need to rebalance here; protected size hasn't increased.
+    # Rebalance only ensures protected <= target.
+    _rebalance(cache_snapshot)
+
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    # Remove evicted key from metadata
+    k = evicted_obj.key
+    seg = _key_seg.pop(k, None)
+    if seg == 'prob':
+        _probation.pop(k, None)
+    elif seg == 'prot':
+        _protected.pop(k, None)
+
+    # After an eviction, ensure protected segment still respects target (it might shrink due to target change)
+    _rebalance(cache_snapshot)
+>>>>>>> REPLACE
+
+</DIFF>

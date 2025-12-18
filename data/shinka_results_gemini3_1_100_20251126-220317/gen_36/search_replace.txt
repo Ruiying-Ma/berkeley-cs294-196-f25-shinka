@@ -1,0 +1,81 @@
+<NAME>
+walrus_strict_cap
+</NAME>
+
+<DESCRIPTION>
+I am proposing two targeted improvements to the WALRUS algorithm to improve hit rates, specifically addressing scan resistance and long-term cache pollution:
+
+1.  **Frequency Capping (`inc_freq`)**: I will modify `inc_freq` to cap the maximum frequency of any item at 15. In the current implementation, frequency counters can grow indefinitely, allowing long-standing items to become "immortal" even after they stop being accessed. Capping the frequency ensures that the aging mechanism can effectively demote cold items, keeping the cache responsive to phase changes.
+
+2.  **Strict Admission Policy (`evict`)**: I will modify the eviction logic to enforce a "Hit-Required" admission policy. Currently, the algorithm allows any new item in the Window to duel with Main items based on frequency. I will add a check to ensure that a Window item must have been hit at least once (frequency > 1) before it is allowed to challenge a Main item. If a Window item reaches the eviction point with frequency <= 1 (meaning it was inserted but never accessed again), it is evicted immediately. This serves as a filter for one-hit wonders (scans), protecting the valuable Main segment from being polluted by transient data.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def inc_freq(self, key):
+        self.freq[key] = self.freq.get(key, 0) + 1
+
+    def age_freqs(self):
+=======
+    def inc_freq(self, key):
+        curr = self.freq.get(key, 0)
+        if curr < 15:
+            self.freq[key] = curr + 1
+
+    def age_freqs(self):
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Scenario 1: Window is full (or over quota)
+    # Check if we should evict from Window or if Window victim can displace a Main item
+    if len(state.window) >= target_window:
+        # Candidate from Window (FIFO Tail)
+        w_candidate = state.window[0]
+
+        # If Main is empty, we must evict from Window
+        if not state.main:
+            return w_candidate
+
+        # Candidate from Main (Approximate LFU via Sampling)
+        # Random sampling is used to avoid O(N) sort/scan
+        sample_keys = random.sample(list(state.main), min(len(state.main), state.sample_size))
+        m_candidate = min(sample_keys, key=lambda k: state.get_freq(k))
+
+        # Duel: Frequency check
+        # Strict inequality (>): New items must PROVE they are better to displace Main items.
+        # This provides scan resistance (frequency 1 items lose to frequency > 1).
+        w_freq = state.get_freq(w_candidate)
+        m_freq = state.get_freq(m_candidate)
+
+        if w_freq > m_freq:
+            victim = m_candidate
+        else:
+            victim = w_candidate
+=======
+    # Scenario 1: Window is full (or over quota)
+    # Check if we should evict from Window or if Window victim can displace a Main item
+    if len(state.window) >= target_window:
+        # Candidate from Window (FIFO Tail)
+        w_candidate = state.window[0]
+
+        # If Main is empty, we must evict from Window
+        if not state.main:
+            return w_candidate
+
+        w_freq = state.get_freq(w_candidate)
+
+        # Strict Admission: Window item must have > 1 frequency (at least one hit)
+        # to challenge Main. This filters one-hit wonders (scans).
+        if w_freq <= 1:
+            return w_candidate
+
+        # Candidate from Main (Approximate LFU via Sampling)
+        sample_keys = random.sample(list(state.main), min(len(state.main), state.sample_size))
+        m_candidate = min(sample_keys, key=lambda k: state.get_freq(k))
+
+        # Duel: Frequency check
+        if w_freq > state.get_freq(m_candidate):
+            victim = m_candidate
+        else:
+            victim = w_candidate
+>>>>>>> REPLACE
+</DIFF>

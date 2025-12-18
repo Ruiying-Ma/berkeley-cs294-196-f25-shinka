@@ -1,0 +1,163 @@
+# EVOLVE-BLOCK-START
+"""S3-FIFO with Adaptive Demotion and Extended Ghost"""
+
+from collections import OrderedDict
+
+# Global State
+_s3_small = OrderedDict()
+_s3_main = OrderedDict()
+_s3_ghost = OrderedDict()
+_s3_freq = {}
+_last_ts = -1
+
+# Constants
+_SMALL_RATIO = 0.2
+_GHOST_RATIO = 4.0
+
+def _check_reset(snapshot):
+    global _s3_small, _s3_main, _s3_ghost, _s3_freq, _last_ts
+    if snapshot.access_count < _last_ts:
+        _s3_small.clear()
+        _s3_main.clear()
+        _s3_ghost.clear()
+        _s3_freq.clear()
+    _last_ts = snapshot.access_count
+
+def _trim_ghost(capacity):
+    limit = int(capacity * _GHOST_RATIO)
+    while len(_s3_ghost) > limit:
+        _s3_ghost.popitem(last=False)
+
+def evict(cache_snapshot, obj):
+    '''
+    Advanced S3-FIFO with:
+    - Expanded Small Queue (20% reservation)
+    - Conditional Demotion (Main -> Ghost if Small is full)
+    - Extended Ghost Registry (4x capacity)
+    - Tenancy Bonus (Ghost promotions start with freq=2)
+    '''
+    global _s3_small, _s3_main, _s3_ghost, _s3_freq
+    _check_reset(cache_snapshot)
+    
+    capacity = cache_snapshot.capacity
+    s_target = max(1, int(capacity * _SMALL_RATIO))
+    
+    while True:
+        # 1. Check Small Queue (Probation)
+        # Evict from Small if it exceeds its target reservation OR Main is empty
+        if len(_s3_small) > s_target or not _s3_main:
+            if not _s3_small:
+                # Fallback if both empty (should rarely happen if cache not empty)
+                if cache_snapshot.cache:
+                    return next(iter(cache_snapshot.cache))
+                return None
+            
+            candidate, _ = _s3_small.popitem(last=False) # FIFO Head
+            
+            # Consistency check
+            if candidate not in cache_snapshot.cache:
+                _s3_freq.pop(candidate, None)
+                continue
+            
+            freq = _s3_freq.get(candidate, 0)
+            if freq > 0:
+                # Promotion: Small -> Main
+                # Reset frequency to 0 to require proof of utility in Main
+                _s3_main[candidate] = None
+                _s3_freq[candidate] = 0 
+                continue
+            else:
+                # Eviction: Small -> Ghost
+                _s3_ghost[candidate] = None
+                _trim_ghost(capacity)
+                _s3_freq.pop(candidate, None)
+                return candidate
+        
+        # 2. Check Main Queue (Protected)
+        else:
+            if not _s3_main:
+                 continue
+
+            candidate, _ = _s3_main.popitem(last=False) # FIFO Head
+            
+            if candidate not in cache_snapshot.cache:
+                _s3_freq.pop(candidate, None)
+                continue
+            
+            freq = _s3_freq.get(candidate, 0)
+            if freq > 0:
+                # Reinsertion: Main -> Main (with Decay)
+                _s3_main[candidate] = None
+                _s3_freq[candidate] = freq - 1
+                continue
+            else:
+                # Conditional Demotion
+                # If Small queue is under pressure (full), do not demote Main items there.
+                # This protects the Probation queue for new insertions (Scan Resistance).
+                if len(_s3_small) < s_target:
+                    # Demote: Main -> Small
+                    _s3_small[candidate] = None
+                    _s3_freq[candidate] = 0
+                    continue
+                else:
+                    # Direct Eviction: Main -> Ghost
+                    _s3_ghost[candidate] = None
+                    _trim_ghost(capacity)
+                    _s3_freq.pop(candidate, None)
+                    return candidate
+
+def update_after_hit(cache_snapshot, obj):
+    global _s3_freq
+    _check_reset(cache_snapshot)
+    curr = _s3_freq.get(obj.key, 0)
+    # Cap frequency at 3
+    _s3_freq[obj.key] = min(curr + 1, 3)
+
+def update_after_insert(cache_snapshot, obj):
+    global _s3_small, _s3_main, _s3_ghost, _s3_freq
+    _check_reset(cache_snapshot)
+    
+    key = obj.key
+    # Check Ghost for Tenancy Bonus (Recurrence)
+    if key in _s3_ghost:
+        if key not in _s3_main and key not in _s3_small:
+            _s3_main[key] = None
+            # Give bonus frequency to stick in Main longer (Tenancy Bonus)
+            _s3_freq[key] = 2 
+        del _s3_ghost[key]
+    else:
+        # Standard insert to Small (Probation)
+        if key not in _s3_small and key not in _s3_main:
+            _s3_small[key] = None
+            _s3_freq[key] = 0
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    global _s3_small, _s3_main, _s3_freq
+    _check_reset(cache_snapshot)
+    
+    key = evicted_obj.key
+    # Cleanup (queue management is primarily handled in evict, this is safety)
+    _s3_small.pop(key, None)
+    _s3_main.pop(key, None)
+    _s3_freq.pop(key, None)
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

@@ -48,7 +48,10 @@ def get_client_llm(model_name: str, structured_output: bool = False) -> Tuple[An
                 client, mode=instructor.mode.Mode.ANTHROPIC_JSON
             )
     elif model_name in OPENAI_MODELS.keys():
-        client = openai.OpenAI()
+        client = openai.OpenAI(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            base_url="https://api.openai.com/v1",
+        )
         if structured_output:
             client = instructor.from_openai(client, mode=instructor.Mode.TOOLS_STRICT)
     elif model_name.startswith("azure-"):
@@ -70,7 +73,7 @@ def get_client_llm(model_name: str, structured_output: bool = False) -> Tuple[An
             client = instructor.from_openai(client, mode=instructor.Mode.MD_JSON)
     elif model_name in GEMINI_MODELS.keys():
         client = openai.OpenAI(
-            api_key=os.environ["GEMINI_API_KEY"],
+            api_key=os.getenv("GEMINI_API_KEY"),
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
         )
         if structured_output:

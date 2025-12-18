@@ -1,0 +1,309 @@
+--- a/original.py
++++ b/original.py
+@@ -1,221 +1,283 @@
+ # EVOLVE-BLOCK-START
+ """Cache eviction algorithm for optimizing hit rates across multiple workloads
+-Simplified ARC:
+-- Resident sets: T1 (recent), T2 (frequent).
++Hybrid ARC + LFU-aging:
++- Resident sets: T1 (recent/probation), T2 (frequent/protected).
+ - Ghost sets: B1 (recently evicted from T1), B2 (recently evicted from T2).
+ - Adaptive target p controls desired size of T1.
++- Within T2, eviction prefers lowest effective frequency with aging by recency.
+ """
+ 
+ # Resident metadata
+ # - m_key_timestamp: last access time for each resident key
+ # - m_key_segment: 't1' (recent) or 't2' (frequent) for resident keys
+ m_key_timestamp = dict()
+ m_key_segment = dict()
+ 
++# Per-key frequency counter (resident only)
++m_freq_count = dict()
++
+ # Ghost metadata (key -> last timestamp when it entered ghost)
+ m_ghost_b1_ts = dict()
+ m_ghost_b2_ts = dict()
+ 
+ # Adaptive target for T1 size
+ m_target_p = None
+ 
+ 
+ def _cap(cache_snapshot):
+     try:
+         return int(cache_snapshot.capacity)
+     except Exception:
++        # Fallback to number of resident items if capacity missing
+         return max(1, len(cache_snapshot.cache))
+ 
+ 
+ def _ensure_init(cache_snapshot):
+     global m_target_p
+     if m_target_p is None:
+-        m_target_p = max(1, _cap(cache_snapshot) // 2)
++        # Start near half of capacity, a good neutral ARC default
++        m_target_p = max(0, _cap(cache_snapshot) // 2)
+ 
+ 
+ def _resident_sets(cache_snapshot):
+     """Return (t1_keys, t2_keys) among current cache keys, using metadata."""
+     cache_keys = set(cache_snapshot.cache.keys())
+     t1_keys = []
+     t2_keys = []
+     for k in cache_keys:
+         seg = m_key_segment.get(k, 't1')
+         if seg == 't2':
+             t2_keys.append(k)
+         else:
+-            # default everything unknown to t1
++            # default anything unknown to T1
+             if seg not in ('t1', 't2'):
+                 m_key_segment[k] = 't1'
+             t1_keys.append(k)
+     return t1_keys, t2_keys
+ 
+ 
+ def _lru_key(keys):
+     """Return LRU key among `keys` using m_key_timestamp; None if empty."""
+     if not keys:
+         return None
+     return min(keys, key=lambda k: m_key_timestamp.get(k, float('inf')))
+ 
+ 
+ def _prune_ghosts(cache_snapshot):
+-    """Keep total ghost size <= capacity by discarding oldest ghosts."""
++    """Keep total ghost entries <= 2 * capacity by discarding oldest ghosts."""
+     total = len(m_ghost_b1_ts) + len(m_ghost_b2_ts)
+     cap = _cap(cache_snapshot)
+-    while total > cap:
++    ghost_cap = max(1, 2 * cap)
++    while total > ghost_cap:
+         # Evict the oldest across both ghosts
+         b1_old_key = min(m_ghost_b1_ts, key=m_ghost_b1_ts.get) if m_ghost_b1_ts else None
+         b2_old_key = min(m_ghost_b2_ts, key=m_ghost_b2_ts.get) if m_ghost_b2_ts else None
+         if b1_old_key is None and b2_old_key is None:
+             break
+         if b2_old_key is None or (b1_old_key is not None and m_ghost_b1_ts[b1_old_key] <= m_ghost_b2_ts.get(b2_old_key, float('inf'))):
+             m_ghost_b1_ts.pop(b1_old_key, None)
+         else:
+             m_ghost_b2_ts.pop(b2_old_key, None)
+         total = len(m_ghost_b1_ts) + len(m_ghost_b2_ts)
+ 
+ 
++def _effective_freq_for_t2_key(cache_snapshot, k):
++    """
++    Compute an aged frequency for a T2 key:
++    eff_freq = max(1, freq - staleness // window)
++    where:
++      - freq is the raw per-key hit count,
++      - staleness is time since last access,
++      - window scales with capacity to avoid over-aggressive aging.
++    """
++    raw = m_freq_count.get(k, 1)
++    last_ts = m_key_timestamp.get(k, cache_snapshot.access_count)
++    staleness = max(0, cache_snapshot.access_count - last_ts)
++    window = max(1, _cap(cache_snapshot) // 2)
++    aged = max(1, raw - (staleness // window))
++    return aged
++
++
++def _choose_t2_victim(cache_snapshot, t2_keys):
++    """
++    Choose a T2 victim using aged frequency (lowest first) with LRU tiebreaker.
++    """
++    if not t2_keys:
++        return None
++    # Precompute keys with their effective freq
++    best_key = None
++    best_tuple = None  # (eff_freq, last_ts)
++    for k in t2_keys:
++        eff = _effective_freq_for_t2_key(cache_snapshot, k)
++        ts = m_key_timestamp.get(k, float('inf'))
++        tup = (eff, ts)
++        if best_tuple is None or tup < best_tuple:
++            best_tuple = tup
++            best_key = k
++    return best_key
++
++
+ def evict(cache_snapshot, obj):
+     '''
+     This function defines how the algorithm chooses the eviction victim.
+     - Args:
+         - `cache_snapshot`: A snapshot of the current cache state.
+         - `obj`: The new object that needs to be inserted into the cache.
+     - Return:
+         - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+     '''
+     _ensure_init(cache_snapshot)
+     t1_keys, t2_keys = _resident_sets(cache_snapshot)
+ 
+-    # ARC-like replace() rule:
++    # ARC-like replace() decision:
+     # Prefer evicting from T1 when:
+     # - T1 is larger than target p, or
+-    # - The incoming key is in B2 and T1 is at target (to reduce T1), or
++    # - The incoming key is in B2 and T1 is at/above target (to reduce T1), or
+     # - T2 is empty (nothing protected yet).
+     evict_from_t1 = False
+     if len(t1_keys) > m_target_p:
+         evict_from_t1 = True
+     elif obj.key in m_ghost_b2_ts and len(t1_keys) >= max(1, m_target_p):
+         evict_from_t1 = True
+     elif not t2_keys and t1_keys:
+         evict_from_t1 = True
+ 
+     if evict_from_t1 and t1_keys:
++        # T1 uses LRU eviction
+         victim = _lru_key(t1_keys)
+         if victim is not None:
+             return victim
+ 
+-    # Otherwise evict LRU from T2 if available
+     if t2_keys:
+-        victim = _lru_key(t2_keys)
++        # T2 uses LFU-with-aging; tie-breaker LRU
++        victim = _choose_t2_victim(cache_snapshot, t2_keys)
+         if victim is not None:
+             return victim
+ 
+     # Fallback: global LRU
+     all_keys = list(cache_snapshot.cache.keys())
+     if not all_keys:
+         return None
+     return _lru_key(all_keys)
+ 
+ 
+ def update_after_hit(cache_snapshot, obj):
+     '''
+     This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+     - Args:
+         - `cache_snapshot`: A snapshot of the current cache state.
+         - `obj`: The object accessed during the cache hit.
+     - Return: `None`
+     '''
+-    global m_key_timestamp, m_key_segment
++    global m_key_timestamp, m_key_segment, m_freq_count
+     _ensure_init(cache_snapshot)
+ 
+     # Refresh recency
+     m_key_timestamp[obj.key] = cache_snapshot.access_count
+ 
+-    # Promote from T1 to T2 on a hit (frequency signal)
++    # Initialize segment/frequency if missing (safety)
+     seg = m_key_segment.get(obj.key, 't1')
++    if seg not in ('t1', 't2'):
++        seg = 't1'
++    m_key_segment[obj.key] = seg
++    if obj.key not in m_freq_count:
++        m_freq_count[obj.key] = 1
++
++    # Promote from T1 to T2 on a hit; increment frequency
+     if seg != 't2':
+         m_key_segment[obj.key] = 't2'
++        m_freq_count[obj.key] = min(255, m_freq_count.get(obj.key, 1) + 1)
++    else:
++        # In T2: reinforce frequency with cap to avoid runaway growth
++        m_freq_count[obj.key] = min(255, m_freq_count.get(obj.key, 1) + 1)
+ 
+ 
+ def update_after_insert(cache_snapshot, obj):
+     '''
+     This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+     - Args:
+         - `cache_snapshot`: A snapshot of the current cache state.
+         - `obj`: The object that was just inserted into the cache.
+     - Return: `None`
+     '''
+-    global m_key_timestamp, m_key_segment, m_target_p
+-    _ensure_init(cache_snapshot)
+-
+-    # ARC adaptation: if we see a miss on a key present in a ghost list,
+-    # adjust target p and insert into T2.
++    global m_key_timestamp, m_key_segment, m_target_p, m_ghost_b1_ts, m_ghost_b2_ts, m_freq_count
++    _ensure_init(cache_snapshot)
++
++    # Determine insertion segment per ARC and adapt p based on ghost hits.
+     seg = 't1'
++    init_freq = 1
+     if obj.key in m_ghost_b1_ts:
+-        # Increase p (give more room to recency) proportional to |B2|/|B1|
++        # Increase p (favor recency) proportional to |B2|/|B1|
+         inc = max(1, len(m_ghost_b2_ts) // max(1, len(m_ghost_b1_ts)))
+         m_target_p = min(_cap(cache_snapshot), m_target_p + inc)
+         m_ghost_b1_ts.pop(obj.key, None)
+-        seg = 't2'
++        seg = 't2'  # ARC moves from B1 to T2 on re-reference
++        init_freq = 2
+     elif obj.key in m_ghost_b2_ts:
+         # Decrease p (favor frequency) proportional to |B1|/|B2|
+         dec = max(1, len(m_ghost_b1_ts) // max(1, len(m_ghost_b2_ts)))
+         m_target_p = max(0, m_target_p - dec)
+         m_ghost_b2_ts.pop(obj.key, None)
+         seg = 't2'
+-
+-    # Insert into resident set
++        init_freq = 3
++
++    # Insert into resident set, initialize metadata
+     m_key_segment[obj.key] = seg
+     m_key_timestamp[obj.key] = cache_snapshot.access_count
++    m_freq_count[obj.key] = init_freq
+ 
+     # Control ghost size
+     _prune_ghosts(cache_snapshot)
+ 
+ 
+ def update_after_evict(cache_snapshot, obj, evicted_obj):
+     '''
+     This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+     - Args:
+         - `cache_snapshot`: A snapshot of the current cache state.
+         - `obj`: The object to be inserted into the cache.
+         - `evicted_obj`: The object that was just evicted from the cache.
+     - Return: `None`
+     '''
+-    global m_key_timestamp, m_key_segment, m_ghost_b1_ts, m_ghost_b2_ts
+-    _ensure_init(cache_snapshot)
++    global m_key_timestamp, m_key_segment, m_ghost_b1_ts, m_ghost_b2_ts, m_freq_count
++    _ensure_init(cache_snapshot)
++
++    if evicted_obj is None:
++        return
+ 
+     # Remove resident metadata for evicted key
+     seg = m_key_segment.pop(evicted_obj.key, 't1')
+     m_key_timestamp.pop(evicted_obj.key, None)
++    m_freq_count.pop(evicted_obj.key, None)
+ 
+     # Add to corresponding ghost list with current time to maintain LRU
+     ts = cache_snapshot.access_count
+     if seg == 't2':
+         m_ghost_b2_ts[evicted_obj.key] = ts
+     else:
+         m_ghost_b1_ts[evicted_obj.key] = ts
+ 
+     # Control ghost size
+     _prune_ghosts(cache_snapshot)
+ 
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

@@ -1,0 +1,92 @@
+<NAME>
+increase_window_and_freq_cap
+</NAME>
+
+<DESCRIPTION>
+1. Increase the Window size from 1% to 2% of the cache capacity. A slightly larger window allows new items more time to prove their utility (accumulate frequency) before facing the eviction duel, which can improve hit rates in workloads with shifting working sets or "lukewarm" items.
+2. Increase the maximum frequency count from 15 to 63. This provides finer granularity in the eviction duel, allowing the algorithm to better distinguish between moderately popular items and extremely popular ones, ensuring that the most valuable items are retained in the Main cache.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    capacity = cache_snapshot.capacity
+    w_cap = max(1, int(capacity * 0.01))
+
+    def get_freq(k):
+=======
+    capacity = cache_snapshot.capacity
+    w_cap = max(1, int(capacity * 0.02))
+
+    def get_freq(k):
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    if key in f:
+        f[key] = min(f[key] + 1, 15)
+    elif key in dk:
+        dk.remove(key)
+        f[key] = 2
+    else:
+        dk.add(key)
+=======
+    if key in f:
+        f[key] = min(f[key] + 1, 63)
+    elif key in dk:
+        dk.remove(key)
+        f[key] = 2
+    else:
+        dk.add(key)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Frequency Update
+    f = algo_state['freq']
+    dk = algo_state['doorkeeper']
+
+    if key in f:
+        f[key] = min(f[key] + 1, 15)
+    elif key in dk:
+        dk.remove(key)
+        f[key] = 2
+    else:
+        dk.add(key)
+
+    # Aging (also on insert)
+    if algo_state['access_count'] > cache_snapshot.capacity * 5:
+        algo_state['doorkeeper'].clear()
+        algo_state['freq'] = {k: v // 2 for k, v in f.items() if v > 1}
+        algo_state['access_count'] = 0
+
+    # Insert into Window
+    algo_state['window'].append((key, size))
+    algo_state['window_size'] += size
+
+    # Check Window Overflow -> Move to Probation
+    w_cap = max(1, int(cache_snapshot.capacity * 0.01))
+    while algo_state['window_size'] > w_cap and algo_state['window']:
+=======
+    # Frequency Update
+    f = algo_state['freq']
+    dk = algo_state['doorkeeper']
+
+    if key in f:
+        f[key] = min(f[key] + 1, 63)
+    elif key in dk:
+        dk.remove(key)
+        f[key] = 2
+    else:
+        dk.add(key)
+
+    # Aging (also on insert)
+    if algo_state['access_count'] > cache_snapshot.capacity * 5:
+        algo_state['doorkeeper'].clear()
+        algo_state['freq'] = {k: v // 2 for k, v in f.items() if v > 1}
+        algo_state['access_count'] = 0
+
+    # Insert into Window
+    algo_state['window'].append((key, size))
+    algo_state['window_size'] += size
+
+    # Check Window Overflow -> Move to Probation
+    w_cap = max(1, int(cache_snapshot.capacity * 0.02))
+    while algo_state['window_size'] > w_cap and algo_state['window']:
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,130 @@
+<NAME>
+wtinylfu_eviction_bias_refine
+</NAME>
+
+<DESCRIPTION>
+The current hybrid W-TinyLFU + LRFU policy over-evicts from the window (W) whenever W≥target, which harms LRU-friendly workloads and starves main-space adaptation. It also uses conservative thresholds for early promotion and a gated W→M1 admission that can trap items in the window, leading to churn and more misses.
+
+I propose three targeted changes:
+
+1) Eviction decision refinement: Remove the unconditional “evict W LRU when W≥target.” Instead, perform admission-vs-eviction comparison in choose_victim per W-TinyLFU: compare TinyLFU(new) against a cold M1 candidate (LRU-tail sample). If new is hotter (with scan-aware bias), replace the M1 candidate. Otherwise evict the colder between W’s LRU and the M1 candidate using a lexicographic coldness order (TinyLFU estimate then decayed score). If M1 is empty, compare with M2 using a stronger bias. This restores competitive admission and reduces unnecessary evictions from W.
+
+2) Easier early promotions from W: Lower thresholds for promoting W hits to M2. This prevents repeated churn in W and protects emerging hot items faster, improving mid- to long-term hit rate.
+
+3) Simpler W→M1 admission path on insert: When the window exceeds its target, always move W’s LRU to M1. The primary TinyLFU admission control is now at eviction time; gating at insert was blocking main admission and worsening churn.
+
+These changes keep the scan-cooldown bias and decayed scoring, but make eviction/admission decisions more faithful to W-TinyLFU while improving responsiveness to hot items, which should lower miss rates on mixed workloads.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        # If window is already at/over target, free space by evicting window LRU
+        if len(self.W) >= w_tgt and self.W:
+            return self._lru(self.W)
+
+        # Candidates
+        cand_w = self._lru(self.W)
+        cand_m1, f_m1, _ = self._sample_cold_candidate(self.M1, now)
+        cand_m2, f_m2, _ = (None, None, None)
+        if cand_m1 is None:
+            cand_m2, f_m2, _ = self._sample_cold_candidate(self.M2, now)
+
+        f_new = self.sketch.estimate(new_obj.key)
+        bias = 3 if self.scan_cooldown > 0 else 1
+
+        # Prefer replacing a cold M1 entry if new is hotter (with bias)
+        if cand_m1 is not None and f_new > (f_m1 or 0) + bias:
+            return cand_m1
+
+        # Otherwise evict from the window to preserve main
+        if cand_w is not None:
+            return cand_w
+
+        # If no window/M1 option, consider replacing a cold protected entry (stronger bias)
+        if cand_m2 is not None and f_new > (f_m2 or 0) + (bias + 1):
+            return cand_m2
+=======
+        # Candidates from segments
+        cand_w = self._lru(self.W)
+        cand_m1, f_m1, dec_m1 = self._sample_cold_candidate(self.M1, now)
+        cand_m2, f_m2, dec_m2 = (None, None, None)
+        if cand_m1 is None:
+            cand_m2, f_m2, dec_m2 = self._sample_cold_candidate(self.M2, now)
+
+        f_new = self.sketch.estimate(new_obj.key)
+        bias = 3 if self.scan_cooldown > 0 else 1
+
+        # Admission-vs-eviction: if new is hotter than a cold M1 entry, replace that M1 entry.
+        if cand_m1 is not None and f_new >= (f_m1 or 0) + bias:
+            return cand_m1
+
+        # Otherwise, prefer evicting the colder between window LRU and cold M1 candidate
+        if cand_w is not None and cand_m1 is not None:
+            est_w = self.sketch.estimate(cand_w)
+            dec_w = self._decayed_score(cand_w, now)
+            # Choose lexicographically by (est, decayed)
+            if est_w < (f_m1 or 0) or (est_w == (f_m1 or 0) and dec_w <= (dec_m1 or 0.0)):
+                return cand_w
+            else:
+                return cand_m1
+
+        # If only window has a candidate, evict from window
+        if cand_w is not None:
+            return cand_w
+
+        # If no window/M1 option, consider replacing a cold protected entry (with stronger bias)
+        if cand_m2 is not None:
+            if f_new >= (f_m2 or 0) + (bias + 1):
+                return cand_m2
+            # Otherwise pick the colder of window (if any) and M2 candidate
+            est_w = self.sketch.estimate(cand_w) if cand_w is not None else None
+            dec_w = self._decayed_score(cand_w, now) if cand_w is not None else None
+            if cand_w is not None and (est_w is not None) and (est_w < (f_m2 or 0) or (est_w == (f_m2 or 0) and dec_w <= (dec_m2 or 0.0))):
+                return cand_w
+            return cand_m2
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+            est = self.sketch.estimate(key)
+            dec = self._decayed_score(key, now)
+            thr_est = 4 if self.scan_cooldown > 0 else 3
+            thr_dec = 2.0 if self.scan_cooldown > 0 else 1.5
+=======
+            est = self.sketch.estimate(key)
+            dec = self._decayed_score(key, now)
+            thr_est = 3 if self.scan_cooldown > 0 else 2
+            thr_dec = 1.6 if self.scan_cooldown > 0 else 1.2
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        # Rebalance: if W is beyond target, TinyLFU-gated move of W's LRU to M1 (admission path)
+        w_tgt, _, prot_tgt = self._targets()
+        if len(self.W) > w_tgt:
+            w_lru = self._lru(self.W)
+            if w_lru is not None and w_lru != key:
+                cand_m1, f_m1, _ = self._sample_cold_candidate(self.M1, now)
+                f_w = self.sketch.estimate(w_lru)
+                bias = 3 if self.scan_cooldown > 0 else 1
+                # Admit into M1 only if at least as hot as a cold M1 candidate (with bias)
+                if f_w >= (f_m1 or 0) + bias:
+                    self.W.pop(w_lru, None)
+                    self._touch(self.M1, w_lru)
+                else:
+                    # Keep in window; refresh to MRU to avoid immediate churn
+                    self._touch(self.W, w_lru)
+=======
+        # Rebalance: if W is beyond target, move W's LRU to M1 (admission path).
+        # TinyLFU admission is enforced primarily at eviction time in choose_victim.
+        w_tgt, _, prot_tgt = self._targets()
+        if len(self.W) > w_tgt:
+            w_lru = self._lru(self.W)
+            if w_lru is not None and w_lru != key:
+                self.W.pop(w_lru, None)
+                self._touch(self.M1, w_lru)
+>>>>>>> REPLACE
+
+</DIFF>

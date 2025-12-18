@@ -1,0 +1,160 @@
+# EVOLVE-BLOCK-START
+"""Cache eviction algorithm using LIRS (Low Inter-reference Recency Set)"""
+from collections import OrderedDict
+
+# LIRS Global State
+m_s = OrderedDict()    # Stack S: Tracks recency of LIR and HIR blocks.
+m_q = OrderedDict()    # Queue Q: Tracks resident HIR blocks.
+m_lir = set()          # Set of LIR (hot) block keys.
+m_last_access_count = -1
+m_h_lir_ratio = 0.99   # Target LIR size ratio (99% LIR, 1% HIR)
+
+def _check_reset(cache_snapshot):
+    """Resets global state if a new trace is detected."""
+    global m_s, m_q, m_lir, m_last_access_count
+    if cache_snapshot.access_count < m_last_access_count:
+        m_s.clear()
+        m_q.clear()
+        m_lir.clear()
+    m_last_access_count = cache_snapshot.access_count
+
+def _prune_stack():
+    """Removes HIR blocks from the bottom of the stack S."""
+    global m_s, m_lir
+    while m_s:
+        # Peek at the bottom (oldest) item
+        bottom_key = next(iter(m_s))
+        if bottom_key in m_lir:
+            # Stop if we hit an LIR block. The bottom of S must always be an LIR block
+            # (defining the maximum recency for LIR status).
+            break
+        # Remove HIR block from bottom of S
+        m_s.popitem(last=False)
+
+def evict(cache_snapshot, obj):
+    '''
+    LIRS Eviction Policy:
+    - Primary Victim: LRU of the HIR Queue (Q).
+    - Fallback: If Q is empty, evict from LIR (requires demotion).
+    '''
+    _check_reset(cache_snapshot)
+    global m_s, m_q, m_lir
+
+    # 1. Try to evict from Resident HIR set (Q)
+    if m_q:
+        return next(iter(m_q))
+    
+    # 2. If Q is empty (rare, but possible if cache is all LIR), evict from LIR.
+    # The LIR block to evict is the one at the bottom of S (the least recent LIR).
+    if m_s:
+        victim = next(iter(m_s))
+        return victim
+    
+    # 3. Fallback for safety (should not happen if cache is populated)
+    if cache_snapshot.cache:
+        return next(iter(cache_snapshot.cache))
+    return None
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    Handle Cache Hit:
+    - If LIR: Update recency in S, prune S.
+    - If Resident HIR:
+      - If in S: Promote to LIR (hit in stack).
+      - If not in S: Keep as HIR, update recency.
+    '''
+    _check_reset(cache_snapshot)
+    global m_s, m_q, m_lir, m_h_lir_ratio
+    
+    key = obj.key
+    capacity = cache_snapshot.capacity
+    target_lir = max(1, int(capacity * m_h_lir_ratio))
+
+    if key in m_lir:
+        # Case 1: LIR Block Hit
+        # Move to top of S
+        if key in m_s:
+            m_s.move_to_end(key)
+        else:
+            # Recovery if state drifted
+            m_s[key] = 1
+        _prune_stack()
+
+    elif key in m_q:
+        # Case 2: Resident HIR Block Hit
+        if key in m_s:
+            # Case 2a: In S -> Promote to LIR
+            del m_q[key]
+            m_lir.add(key)
+            m_s.move_to_end(key)
+            
+            # Maintain LIR capacity
+            if len(m_lir) > target_lir:
+                # Demote the bottom LIR block to HIR
+                demoted = next(iter(m_s))
+                m_s.popitem(last=False) # Remove from S (will rejoin as HIR logic requires? No, see below)
+                m_lir.remove(demoted)
+                m_q[demoted] = 1        # Add to Q
+                _prune_stack()
+        else:
+            # Case 2b: Not in S -> Stay Resident HIR
+            m_s[key] = 1 # Add to S (becomes most recent)
+            m_q.move_to_end(key) # Update in Q
+            m_s.move_to_end(key) # Redundant but safe
+            
+    else:
+        # Metadata missing? Treat as Resident HIR
+        m_s[key] = 1
+        m_q[key] = 1
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Handle Cache Miss (Insert):
+    - If in S (Non-resident HIR): Promote to LIR.
+    - Else: Insert as new Resident HIR.
+    '''
+    _check_reset(cache_snapshot)
+    global m_s, m_q, m_lir, m_h_lir_ratio
+    
+    key = obj.key
+    capacity = cache_snapshot.capacity
+    target_lir = max(1, int(capacity * m_h_lir_ratio))
+
+    if key in m_s:
+        # Case 3: Hit on Non-resident HIR (Ghost hit within history window)
+        # Promote to LIR
+        m_lir.add(key)
+        m_s.move_to_end(key)
+        
+        if len(m_lir) > target_lir:
+            # Demote bottom LIR
+            demoted = next(iter(m_s))
+            m_s.popitem(last=False)
+            m_lir.remove(demoted)
+            m_q[demoted] = 1
+            _prune_stack()
+    else:
+        # Case 4: Cold Miss / New Block
+        # Insert as Resident HIR
+        m_s[key] = 1
+        m_q[key] = 1
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Handle Eviction:
+    - Remove from Q or LIR sets.
+    - If in S, it effectively becomes a Non-resident HIR (ghost).
+    '''
+    key = evicted_obj.key
+    global m_q, m_lir
+    
+    if key in m_q:
+        del m_q[key]
+    if key in m_lir:
+        m_lir.remove(key)
+    
+    # Note: We do NOT remove from m_s here. 
+    # If the key is in m_s, it remains there as "Non-resident HIR" 
+    # until it is pruned from the bottom of S.
+
+# EVOLVE-BLOCK-END

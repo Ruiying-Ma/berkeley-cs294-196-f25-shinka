@@ -1,0 +1,329 @@
+<NAME>
+arc_tinylfu_coldest_candidate_scan_guard_ghost_aging
+</NAME>
+
+<DESCRIPTION>
+I refine the current ARC + TinyLFU policy with four targeted improvements:
+
+1) Coldest-candidate eviction tie-break: When both T1 and T2 have eviction candidates and ARC’s primary conditions don’t decide, choose to evict from the segment whose sampled LRU-side candidate has the lower TinyLFU estimate. This removes the objectively colder block and reduces unnecessary churn, improving stability in mixed workloads.
+
+2) Scan-mode robustness: During detected scan periods, slow down promotion from T1 by raising the promotion threshold (TinyLFU ≥ 3) and avoid admitting new items directly into T2 (for non-ghost inserts). This protects the hot set from scan pollution.
+
+3) Ghost hygiene on hits: Remove any ghost entries for keys that are currently resident whenever they’re hit. This prevents stale ghosts from biasing adaptation and aligns with canonical ARC ghost management.
+
+4) Periodic ghost aging: Add a lightweight periodic purge inside _prune_ghosts, removing ~10% of the LRU entries from the larger ghost list every ≈capacity calls. This keeps history fresh, reduces stale bias, and improves responsiveness to phase changes.
+
+These changes keep the core mechanics intact while tightening tie-breaking decisions, controlling scan pollution, and maintaining healthier metadata. They are minimal, consistent, and should reduce miss rates across diverse traces.
+
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    __slots__ = (
+        "T1", "T2", "B1", "B2",
+        "p", "capacity", "_last_evicted_from",
+        "sketch", "_sample_k", "_miss_streak", "_scan_mode_until"
+    )
+=======
+    __slots__ = (
+        "T1", "T2", "B1", "B2",
+        "p", "capacity", "_last_evicted_from",
+        "sketch", "_sample_k", "_miss_streak", "_scan_mode_until", "_ghost_ops"
+    )
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        self._miss_streak = 0
+        self._scan_mode_until = 0
+=======
+        self._miss_streak = 0
+        self._scan_mode_until = 0
+        self._ghost_ops = 0
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def _prune_ghosts(self):
+        cap = self.capacity or 1
+        # Prefer canonical ARC bound: |B1| + |B2| ≤ capacity.
+        # Also drop entries that became resident.
+        for k in list(self.B1.keys()):
+            if k in self.T1 or k in self.T2:
+                self.B1.pop(k, None)
+        for k in list(self.B2.keys()):
+            if k in self.T1 or k in self.T2:
+                self.B2.pop(k, None)
+        while (len(self.B1) + len(self.B2)) > cap:
+            if len(self.B1) > int(self.p):
+                self.B1.popitem(last=False)
+            else:
+                self.B2.popitem(last=False)
+=======
+    def _prune_ghosts(self):
+        cap = self.capacity or 1
+        # Prefer canonical ARC bound: |B1| + |B2| ≤ capacity.
+        # Also drop entries that became resident.
+        for k in list(self.B1.keys()):
+            if k in self.T1 or k in self.T2:
+                self.B1.pop(k, None)
+        for k in list(self.B2.keys()):
+            if k in self.T1 or k in self.T2:
+                self.B2.pop(k, None)
+
+        # Increment maintenance counter and periodically age ghosts from the larger list.
+        self._ghost_ops = getattr(self, "_ghost_ops", 0) + 1
+        if self._ghost_ops % max(1, cap) == 0:
+            # Drop ~10% of the larger ghost list from its LRU side to keep history fresh.
+            if len(self.B1) >= len(self.B2):
+                n = max(1, len(self.B1) // 10)
+                for _ in range(n):
+                    if not self.B1:
+                        break
+                    self.B1.popitem(last=False)
+            else:
+                n = max(1, len(self.B2) // 10)
+                for _ in range(n):
+                    if not self.B2:
+                        break
+                    self.B2.popitem(last=False)
+
+        while (len(self.B1) + len(self.B2)) > cap:
+            if len(self.B1) > int(self.p):
+                self.B1.popitem(last=False)
+            else:
+                self.B2.popitem(last=False)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Both candidates exist: competitive admission via TinyLFU
+        if cand_T1 is not None and cand_T2 is not None:
+            f_new = self.sketch.estimate(new_obj.key)
+            f_t2 = self.sketch.estimate(cand_T2)
+            if f_new <= f_t2:
+                self._last_evicted_from = 'T1'
+                return cand_T1
+            else:
+                self._last_evicted_from = 'T2'
+                return cand_T2
+=======
+        # Both candidates exist: pick the colder candidate first; if close, use TinyLFU(new) vs T2
+        if cand_T1 is not None and cand_T2 is not None:
+            f_t1 = self.sketch.estimate(cand_T1)
+            f_t2 = self.sketch.estimate(cand_T2)
+            if f_t1 < f_t2:
+                self._last_evicted_from = 'T1'
+                return cand_T1
+            elif f_t2 < f_t1:
+                self._last_evicted_from = 'T2'
+                return cand_T2
+            # Tie or too close: competitive admission via TinyLFU(new) vs T2-candidate
+            f_new = self.sketch.estimate(new_obj.key)
+            if f_new <= f_t2:
+                self._last_evicted_from = 'T1'
+                return cand_T1
+            else:
+                self._last_evicted_from = 'T2'
+                return cand_T2
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def on_hit(self, cache_snapshot, obj):
+        """
+        Hit handling:
+        - Increment TinyLFU.
+        - If in T1: promote to T2 only if frequency estimate >= threshold, else refresh in T1.
+        - If in T2: refresh in T2.
+        - If not tracked but cache hit: treat as frequent and place in T2.
+        """
+        self._ensure_capacity(cache_snapshot.capacity)
+        key = obj.key
+        self.sketch.increment(key, 1)
+
+        # Any hit breaks a pure-miss streaming streak
+        self._miss_streak = 0
+
+        if key in self.T1:
+            # Gate promotion to avoid polluting T2 with one-hit wonders
+            if self.sketch.estimate(key) >= 2:
+                self.T1.pop(key, None)
+                self._touch_T2(key)
+            else:
+                self._touch_T1(key)
+        elif key in self.T2:
+            self._touch_T2(key)
+        else:
+            # Metadata desync: cache had it; assume it's frequent
+            self._touch_T2(key)
+=======
+    def on_hit(self, cache_snapshot, obj):
+        """
+        Hit handling:
+        - Increment TinyLFU.
+        - If in T1: promote to T2 only if frequency estimate >= threshold (higher in scan mode), else refresh in T1.
+        - If in T2: refresh in T2.
+        - If not tracked but cache hit: treat as frequent and place in T2.
+        Also remove any ghost entries for this resident key to keep ghost history clean.
+        """
+        self._ensure_capacity(cache_snapshot.capacity)
+        key = obj.key
+        self.sketch.increment(key, 1)
+
+        # Any hit breaks a pure-miss streaming streak
+        self._miss_streak = 0
+
+        # Remove stale ghost duplicates for resident key
+        self.B1.pop(key, None)
+        self.B2.pop(key, None)
+
+        # Promotion threshold: stricter during scan-mode cooldown
+        now = cache_snapshot.access_count
+        in_scan = now < getattr(self, "_scan_mode_until", 0)
+        promote_threshold = 3 if in_scan else 2
+
+        if key in self.T1:
+            # Gate promotion to avoid polluting T2 with one-hit wonders
+            if self.sketch.estimate(key) >= promote_threshold:
+                self.T1.pop(key, None)
+                self._touch_T2(key)
+            else:
+                self._touch_T1(key)
+        elif key in self.T2:
+            self._touch_T2(key)
+        else:
+            # Metadata desync: cache had it; assume it's frequent
+            self._touch_T2(key)
+        # Light ghost maintenance
+        self._prune_ghosts()
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def on_insert(self, cache_snapshot, obj):
+        """
+        Insert handling (called on miss after space made, if needed):
+        - If key in B1: increase p (favor recency) with damped adaptation and insert into T2.
+        - If key in B2: decrease p (favor frequency) with damped adaptation and insert into T2.
+        - Else: TinyLFU competitive admission:
+            Compare f(new) to a sampled T2 victim; if f(new) > f(victim_T2), insert to T2,
+            otherwise insert to T1.
+        - Track miss streak to detect scans and temporarily bias eviction to T1.
+        """
+        self._ensure_capacity(cache_snapshot.capacity)
+        key = obj.key
+        now = cache_snapshot.access_count
+        # Count misses as well
+        self.sketch.increment(key, 1)
+
+        # Update miss streak and detect scans
+        self._miss_streak = getattr(self, "_miss_streak", 0) + 1
+        if self._miss_streak > (2 * self.capacity) and len(self.T2) < max(1, self.capacity // 10) and len(self.B1) >= len(self.B2):
+            # Streaming pattern: strongly prefer recency for a short cooldown window
+            self.p = max(0.0, self.p * 0.5)
+            self._scan_mode_until = now + self.capacity
+
+        alpha = 0.25  # dampening factor for p updates
+
+        if key in self.B1:
+            delta = float(max(1, len(self.B2) // max(1, len(self.B1))))
+            self.p = min(self.capacity, max(0.0, self.p + alpha * delta))
+            self.B1.pop(key, None)
+            self._touch_T2(key)
+        elif key in self.B2:
+            delta = float(max(1, len(self.B1) // max(1, len(self.B2))))
+            self.p = max(0.0, min(self.capacity, self.p - alpha * delta))
+            self.B2.pop(key, None)
+            self._touch_T2(key)
+        else:
+            f_new = self.sketch.estimate(key)
+            if len(self.T2) > 0:
+                k2 = self._sample_lru_min_freq(self.T2)
+                f_k2 = self.sketch.estimate(k2) if k2 is not None else 0
+                if f_new > f_k2:
+                    self._touch_T2(key)
+                else:
+                    self._touch_T1(key)
+            else:
+                # Mild threshold when T2 empty
+                if f_new >= 2:
+                    self._touch_T2(key)
+                else:
+                    self._touch_T1(key)
+
+        # Ensure ghosts are bounded
+        self._prune_ghosts()
+=======
+    def on_insert(self, cache_snapshot, obj):
+        """
+        Insert handling (called on miss after space made, if needed):
+        - If key in B1: increase p (favor recency) with damped adaptation and insert into T2.
+        - If key in B2: decrease p (favor frequency) with damped adaptation and insert into T2.
+        - Else: TinyLFU competitive admission:
+            Compare f(new) to a sampled T2 victim; if f(new) > f(victim_T2), insert to T2,
+            otherwise insert to T1.
+        - During scan-mode cooldown, avoid direct T2 admissions for non-ghosts to prevent pollution.
+        - Track miss streak to detect scans and temporarily bias eviction to T1.
+        """
+        self._ensure_capacity(cache_snapshot.capacity)
+        key = obj.key
+        now = cache_snapshot.access_count
+        # Count misses as well
+        self.sketch.increment(key, 1)
+
+        # Update miss streak and detect scans
+        self._miss_streak = getattr(self, "_miss_streak", 0) + 1
+        if self._miss_streak > (2 * self.capacity) and len(self.T2) < max(1, self.capacity // 10) and len(self.B1) >= len(self.B2):
+            # Streaming pattern: strongly prefer recency for a short cooldown window
+            self.p = max(0.0, self.p * 0.5)
+            self._scan_mode_until = now + self.capacity
+
+        alpha = 0.25  # dampening factor for p updates
+
+        if key in self.B1:
+            delta = float(max(1, len(self.B2) // max(1, len(self.B1))))
+            self.p = min(self.capacity, max(0.0, self.p + alpha * delta))
+            self.B1.pop(key, None)
+            self._touch_T2(key)
+        elif key in self.B2:
+            delta = float(max(1, len(self.B1) // max(1, len(self.B2))))
+            self.p = max(0.0, min(self.capacity, self.p - alpha * delta))
+            self.B2.pop(key, None)
+            self._touch_T2(key)
+        else:
+            # Scan mode: avoid admitting directly into T2
+            in_scan = now < getattr(self, "_scan_mode_until", 0)
+            if in_scan:
+                self._touch_T1(key)
+            else:
+                f_new = self.sketch.estimate(key)
+                if len(self.T2) > 0:
+                    k2 = self._sample_lru_min_freq(self.T2)
+                    f_k2 = self.sketch.estimate(k2) if k2 is not None else 0
+                    if f_new > f_k2:
+                        self._touch_T2(key)
+                    else:
+                        self._touch_T1(key)
+                else:
+                    # Mild threshold when T2 empty
+                    if f_new >= 2:
+                        self._touch_T2(key)
+                    else:
+                        self._touch_T1(key)
+
+        # Ensure ghosts are bounded and maintained
+        self._prune_ghosts()
+>>>>>>> REPLACE
+
+</DIFF>

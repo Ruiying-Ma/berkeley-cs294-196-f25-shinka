@@ -1,0 +1,140 @@
+<NAME>
+optimize_s3_fifo_params_v2
+</NAME>
+
+<DESCRIPTION>
+Optimizes the S3-FIFO algorithm by tuning key parameters based on trace analysis:
+1.  **Ghost Registry Capacity (2x -> 5x)**: Significantly increases the ghost registry size to better capture long looping patterns (Trace 14, 29, 34) that exceed the previous history horizon.
+2.  **Frequency Cap (3 -> 7)**: Raises the maximum frequency count to allow finer differentiation between "warm" and "hot" items, improving retention in the Main queue for static locality (Trace 28).
+3.  **Optimistic Rescue (freq=0 -> freq=1)**: Items rescued from the Ghost registry are now initialized with a frequency of 1 (instead of 0). This gives them a "second chance" buffer in the Main queue, preventing immediate demotion if the Main queue is churning.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+"""
+S3-FIFO with Frequency-Based Retention and Extended Ghost (S3-FIFO-F-G2).
+Combines:
+1. S3-FIFO structure (Small/Main queues) with Conditional Demotion.
+2. Frequency tracking (0-3) from the Current program for better Main retention (Scan resistance + Loop capture).
+3. Extended Ghost Registry (2x capacity) from the Inspiration program for detecting long loops (Trace 29).
+4. Conservative Rescue (rescued items start cold) to prevent pollution from the large ghost registry.
+"""
+
+from collections import OrderedDict
+
+# Global structures
+# _q_small: FIFO queue for probation (Keys -> None)
+# _q_main: FIFO queue for protected items (Keys -> None)
+# _q_ghost: FIFO queue for tracking history (Keys -> None)
+# _freq_map: Dictionary mapping key -> frequency count (0-3)
+_q_small = OrderedDict()
+_q_main = OrderedDict()
+_q_ghost = OrderedDict()
+_freq_map = {}
+_last_access_count = -1
+=======
+"""
+S3-FIFO with Frequency-Based Retention, Extended Ghost (5x), and Aggressive Rescue.
+Changes:
+1. Ghost Registry capacity increased to 5x (Trace 29 optimization).
+2. Frequency cap increased to 7 (Better differentiation of hot items).
+3. Ghost Rescue grants freq=1 (Optimistic Rescue) to protect returning loop items.
+"""
+
+from collections import OrderedDict
+
+# Global structures
+# _q_small: FIFO queue for probation (Keys -> None)
+# _q_main: FIFO queue for protected items (Keys -> None)
+# _q_ghost: FIFO queue for tracking history (Keys -> None)
+# _freq_map: Dictionary mapping key -> frequency count (0-7)
+_q_small = OrderedDict()
+_q_main = OrderedDict()
+_q_ghost = OrderedDict()
+_freq_map = {}
+_last_access_count = -1
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+            else:
+                # Eviction: Small -> Ghost
+                _q_ghost[candidate] = None
+                # Extended Ghost Size: 2x Capacity (Trace 29 optimization)
+                if len(_q_ghost) > capacity * 2:
+                    _q_ghost.popitem(last=False)
+                _freq_map.pop(candidate, None)
+                return candidate
+=======
+            else:
+                # Eviction: Small -> Ghost
+                _q_ghost[candidate] = None
+                # Extended Ghost Size: 5x Capacity (Better loop capture)
+                if len(_q_ghost) > capacity * 5:
+                    _q_ghost.popitem(last=False)
+                _freq_map.pop(candidate, None)
+                return candidate
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+                else:
+                    # Eviction: Main -> Ghost
+                    _q_ghost[candidate] = None
+                    if len(_q_ghost) > capacity * 2:
+                        _q_ghost.popitem(last=False)
+                    _freq_map.pop(candidate, None)
+                    return candidate
+
+def update_after_hit(cache_snapshot, obj):
+    global _freq_map
+    _reset_state_if_needed(cache_snapshot)
+
+    # Increment frequency, cap at 3 (from Current program)
+    curr = _freq_map.get(obj.key, 0)
+    _freq_map[obj.key] = min(curr + 1, 3)
+
+def update_after_insert(cache_snapshot, obj):
+    global _q_small, _q_main, _q_ghost, _freq_map
+    _reset_state_if_needed(cache_snapshot)
+
+    key = obj.key
+
+    if key in _q_ghost:
+        # Rescue: Ghost -> Main
+        del _q_ghost[key]
+        _q_main[key] = None
+        # Conservative Rescue: freq=0.
+        # Prevents pollution from large ghost. Must prove utility again.
+        _freq_map[key] = 0
+    else:
+=======
+                else:
+                    # Eviction: Main -> Ghost
+                    _q_ghost[candidate] = None
+                    if len(_q_ghost) > capacity * 5:
+                        _q_ghost.popitem(last=False)
+                    _freq_map.pop(candidate, None)
+                    return candidate
+
+def update_after_hit(cache_snapshot, obj):
+    global _freq_map
+    _reset_state_if_needed(cache_snapshot)
+
+    # Increment frequency, cap at 7
+    curr = _freq_map.get(obj.key, 0)
+    _freq_map[obj.key] = min(curr + 1, 7)
+
+def update_after_insert(cache_snapshot, obj):
+    global _q_small, _q_main, _q_ghost, _freq_map
+    _reset_state_if_needed(cache_snapshot)
+
+    key = obj.key
+
+    if key in _q_ghost:
+        # Rescue: Ghost -> Main
+        del _q_ghost[key]
+        _q_main[key] = None
+        # Optimistic Rescue: freq=1.
+        # Returning items from Ghost are likely part of a loop or working set.
+        # Giving them a small buffer (1) prevents immediate eviction if Main is churning.
+        _freq_map[key] = 1
+    else:
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,143 @@
+<NAME>
+optimize_s3_fifo_lru_ghost
+</NAME>
+
+<DESCRIPTION>
+Improve S3-FIFO by:
+1. Extending Ghost cache size to 3x capacity to capture larger loops and working sets (addressing Trace 14).
+2. Implementing "Gradual Demotion" in the Main queue: decrement frequency instead of resetting to 0 on eviction survival, providing smoother aging for popular items.
+3. Implementing "True LRU" for the Main queue: move items to MRU (tail) on hit. This makes the protected segment more responsive to recency while still protected by frequency gates.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO Eviction Policy:
+    - Keeps a small FIFO queue (S) for new items and a large FIFO queue (M) for popular items.
+    - Uses a Ghost queue (G) to track evicted items from S.
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+
+    capacity = cache_snapshot.capacity
+    # Target size for Small queue (10% of capacity)
+    s_capacity = max(1, int(capacity * 0.1))
+
+    # Lazy cleanup of ghost
+    while len(s3_ghost) > capacity:
+        s3_ghost.pop(next(iter(s3_ghost)))
+
+    while True:
+        # Decision: Evict from Small or Main?
+        # If Small is larger than target, evict from Small.
+        # Also if Main is empty, we must evict from Small.
+        if len(s3_small) >= s_capacity or not s3_main:
+            if not s3_small:
+                # Should not happen if cache is full and Main is empty
+                return None
+
+            candidate = next(iter(s3_small))
+            freq = s3_freq.get(candidate, 0)
+
+            if freq > 0:
+                # Second Chance: Move to Main
+                s3_small.pop(candidate)
+                s3_main[candidate] = None
+                s3_freq[candidate] = 0
+                continue
+            else:
+                # Victim found in Small
+                return candidate
+
+        else:
+            # Evict from Main
+            candidate = next(iter(s3_main))
+            freq = s3_freq.get(candidate, 0)
+
+            if freq > 0:
+                # Second Chance: Reinsert to Main tail
+                s3_main.pop(candidate)
+                s3_main[candidate] = None
+                s3_freq[candidate] = 0
+                continue
+            else:
+                # Victim found in Main
+                return candidate
+=======
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO Eviction Policy:
+    - Keeps a small FIFO queue (S) for new items and a large FIFO queue (M) for popular items.
+    - Uses a Ghost queue (G) to track evicted items from S.
+    - Main queue uses LRU with frequency-based gradual demotion.
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+
+    capacity = cache_snapshot.capacity
+    # Target size for Small queue (10% of capacity)
+    s_capacity = max(1, int(capacity * 0.1))
+
+    # Lazy cleanup of ghost - Extended to 3x to catch larger loops
+    while len(s3_ghost) > 3 * capacity:
+        s3_ghost.pop(next(iter(s3_ghost)))
+
+    while True:
+        # Decision: Evict from Small or Main?
+        # If Small is larger than target, evict from Small.
+        # Also if Main is empty, we must evict from Small.
+        if len(s3_small) >= s_capacity or not s3_main:
+            if not s3_small:
+                # Should not happen if cache is full and Main is empty
+                return None
+
+            candidate = next(iter(s3_small))
+            freq = s3_freq.get(candidate, 0)
+
+            if freq > 0:
+                # Second Chance: Move to Main
+                s3_small.pop(candidate)
+                s3_main[candidate] = None
+                s3_freq[candidate] = 0 # Reset freq on promotion
+                continue
+            else:
+                # Victim found in Small
+                return candidate
+
+        else:
+            # Evict from Main
+            candidate = next(iter(s3_main))
+            freq = s3_freq.get(candidate, 0)
+
+            if freq > 0:
+                # Second Chance: Reinsert to Main tail
+                s3_main.pop(candidate)
+                s3_main[candidate] = None
+                s3_freq[candidate] = freq - 1 # Gradual demotion
+                continue
+            else:
+                # Victim found in Main
+                return candidate
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def update_after_hit(cache_snapshot, obj):
+    '''
+    S3-FIFO Update on Hit:
+    - Increment frequency (cap at 3).
+    '''
+    global s3_freq
+    s3_freq[obj.key] = min(s3_freq.get(obj.key, 0) + 1, 3)
+=======
+def update_after_hit(cache_snapshot, obj):
+    '''
+    S3-FIFO Update on Hit:
+    - Increment frequency (cap at 3).
+    - If in Main, move to MRU (True LRU).
+    '''
+    global s3_freq, s3_main
+    key = obj.key
+    s3_freq[key] = min(s3_freq.get(key, 0) + 1, 3)
+
+    if key in s3_main:
+        s3_main[key] = s3_main.pop(key)
+>>>>>>> REPLACE
+</DIFF>

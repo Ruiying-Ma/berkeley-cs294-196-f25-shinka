@@ -1,0 +1,650 @@
+--- a/original.py
++++ b/original.py
+@@ -1,561 +1,635 @@
+ # EVOLVE-BLOCK-START
+ """Hybrid W-TinyLFU + LRFU-decayed scoring with SLRU main segments.
+ 
+ Public API:
+ - evict(cache_snapshot, obj) -> key
+ - update_after_hit(cache_snapshot, obj)
+ - update_after_insert(cache_snapshot, obj)
+ - update_after_evict(cache_snapshot, obj, evicted_obj)
+ """
+ 
+-from collections import OrderedDict
++from collections import OrderedDict, deque
+ import random
+ from itertools import islice
+ 
+ 
+ class _CmSketch:
+     """
+     Count-Min Sketch with conservative aging (TinyLFU).
+     - d hash functions, width w (power-of-two).
+     - Periodic right-shift halves counters to forget stale history.
+     """
+     __slots__ = ("d", "w", "tables", "mask", "ops", "age_period", "seeds")
+ 
+     def __init__(self, width_power=12, d=3):
+         self.d = int(max(1, d))
+         w = 1 << int(max(8, width_power))  # min 256
+         self.w = w
+         self.mask = w - 1
+         self.tables = [[0] * w for _ in range(self.d)]
+         self.ops = 0
+         self.age_period = max(1024, w)
+         self.seeds = (0x9e3779b1, 0x85ebca77, 0xc2b2ae3d, 0x27d4eb2f)
+ 
+     def _hash(self, key_hash: int, i: int) -> int:
+         h = key_hash ^ self.seeds[i % len(self.seeds)]
+         h ^= (h >> 33) & 0xFFFFFFFFFFFFFFFF
+         h *= 0xff51afd7ed558ccd
+         h &= 0xFFFFFFFFFFFFFFFF
+         h ^= (h >> 33)
+         h *= 0xc4ceb9fe1a85ec53
+         h &= 0xFFFFFFFFFFFFFFFF
+         h ^= (h >> 33)
+         return h & self.mask
+ 
+     def _maybe_age(self):
+         self.ops += 1
+         if self.ops % self.age_period == 0:
+             for t in self.tables:
+                 for i in range(self.w):
+                     t[i] >>= 1
+ 
+     def increment(self, key: str, amount: int = 1):
++        # Conservative update: increment only counters at the current minimum to reduce noise
+         h = hash(key)
++        idxs = [self._hash(h, i) for i in range(self.d)]
++        vals = [self.tables[i][idxs[i]] for i in range(self.d)]
++        mn = min(vals) if vals else 0
+         for i in range(self.d):
+-            idx = self._hash(h, i)
+-            v = self.tables[i][idx] + amount
+-            if v > 255:
+-                v = 255
+-            self.tables[i][idx] = v
++            if self.tables[i][idxs[i]] == mn:
++                v = self.tables[i][idxs[i]] + amount
++                if v > 255:
++                    v = 255
++                self.tables[i][idxs[i]] = v
+         self._maybe_age()
+ 
+     def estimate(self, key: str) -> int:
+         h = hash(key)
+         est = 1 << 30
+         for i in range(self.d):
+             idx = self._hash(h, i)
+             v = self.tables[i][idx]
+             if v < est:
+                 est = v
+         return est
+ 
+ 
+ class _WTinyLFUPolicy:
+     """
+     Windowed TinyLFU + SLRU main with LRFU-style decayed scores:
+     - W: window LRU (recency buffer).
+     - M1: main probationary (first-time in main).
+     - M2: main protected (promoted on re-use).
+     - TinyLFU sketch for admission decisions.
+     - LRFU decayed scores for intra-segment victim selection and demotion.
+     """
+ 
+     __slots__ = (
+         "W", "M1", "M2", "capacity",
+         "win_frac", "prot_frac", "sketch", "_sample_k",
+         "hits_w", "hits_main", "last_tune_time", "tune_period",
+         "score", "last_time", "decay_base", "decay_half_life",
+         "miss_streak", "scan_cooldown",
+-        "prom_cnt", "demo_cnt", "hits_m2"
++        "prom_cnt", "demo_cnt", "hits_m2",
++        "ema_miss", "ema_alpha", "recent_ring", "recent_set", "ring_max"
+     )
+ 
+     def __init__(self):
+         self.W = OrderedDict()
+         self.M1 = OrderedDict()
+         self.M2 = OrderedDict()
+         self.capacity = None
+         # Targets as fractions of capacity
+         self.win_frac = 0.2   # 20% window
+         self.prot_frac = 0.8  # 80% of main reserved for protected
+         self.sketch = _CmSketch(width_power=12, d=3)
+         self._sample_k = 6
+         # Adaptive tuning state
+         self.hits_w = 0
+         self.hits_main = 0
+         self.hits_m2 = 0
+         self.last_tune_time = 0
+         self.tune_period = 0
+         self.prom_cnt = 0
+         self.demo_cnt = 0
+         # LRFU decayed score state
+         self.score = {}     # key -> float decayed score
+         self.last_time = {} # key -> last access_count
+         self.decay_half_life = 16
+         self.decay_base = 2 ** (-1.0 / self.decay_half_life)
+         # Scan detection state
+         self.miss_streak = 0
+         self.scan_cooldown = 0
++        # EMA miss-rate and recent-phase accelerator
++        self.ema_miss = 0.0
++        self.ema_alpha = 0.05
++        self.recent_ring = deque()
++        self.recent_set = set()
++        self.ring_max = 0
+ 
+     # ----- helpers -----
+ 
+     def _ensure_capacity(self, cap: int):
+         if self.capacity is None:
+             self.capacity = max(int(cap), 1)
+             self._sample_k = max(4, min(12, (self.capacity // 8) or 4))
+             # Age faster for smaller caches
+             try:
+                 self.sketch.age_period = max(512, min(16384, self.capacity * 8))
+             except Exception:
+                 pass
+             # Set adaptive tuning period relative to capacity
+             self.tune_period = max(256, self.capacity * 4)
+             self.last_tune_time = 0
+             # LRFU decay tuned to capacity: shorter half-life for small caches
+             self.decay_half_life = max(8, min(64, (self.capacity // 2) or 8))
+             self.decay_base = 2 ** (-1.0 / float(self.decay_half_life))
++            # Recent ring sizing
++            self.ring_max = max(1, self.capacity)
++            # trim if needed
++            while len(self.recent_ring) > self.ring_max:
++                old = self.recent_ring.popleft()
++                self.recent_set.discard(old)
+             return
+         if self.capacity != cap:
+             # Reset segments if external capacity changes to avoid desync.
+             self.W.clear(); self.M1.clear(); self.M2.clear()
+             self.capacity = max(int(cap), 1)
+             self._sample_k = max(4, min(12, (self.capacity // 8) or 4))
+             try:
+                 self.sketch.age_period = max(512, min(16384, self.capacity * 8))
+             except Exception:
+                 pass
+             self.tune_period = max(256, self.capacity * 4)
+             self.last_tune_time = 0
+             self.decay_half_life = max(8, min(64, (self.capacity // 2) or 8))
+             self.decay_base = 2 ** (-1.0 / float(self.decay_half_life))
++            # Resize recent ring
++            self.ring_max = max(1, self.capacity)
++            while len(self.recent_ring) > self.ring_max:
++                old = self.recent_ring.popleft()
++                self.recent_set.discard(old)
+ 
+     def _targets(self):
+         cap = self.capacity or 1
+         w_tgt = max(1, int(round(cap * self.win_frac)))
+         main_cap = max(0, cap - w_tgt)
+         prot_tgt = int(round(main_cap * self.prot_frac))
+         prob_tgt = max(0, main_cap - prot_tgt)
+         return w_tgt, prob_tgt, prot_tgt
+ 
+     def _ensure_meta(self, k: str, now: int):
+         if k not in self.last_time:
+             self.last_time[k] = now
+         if k not in self.score:
+             self.score[k] = 0.0
+ 
+     def _decayed_score(self, k: str, now: int) -> float:
+         # Lazily decay the score to 'now'
+         self._ensure_meta(k, now)
+         old = self.last_time[k]
+         dt = now - old
+         if dt > 0:
+             self.score[k] *= self.decay_base ** dt
+             self.last_time[k] = now
+         return self.score[k]
+ 
+     def _self_heal(self, cache_snapshot):
+         # Ensure all cached keys are tracked and no phantom entries remain.
+         now = cache_snapshot.access_count
+         cache_keys = set(cache_snapshot.cache.keys())
+         for od in (self.W, self.M1, self.M2):
+             for k in list(od.keys()):
+                 if k not in cache_keys:
+                     od.pop(k, None)
+         tracked = set(self.W.keys()) | set(self.M1.keys()) | set(self.M2.keys())
+         missing = cache_keys - tracked
+         if missing:
+             w_tgt, _, _ = self._targets()
+             # Place missing into W until target, then into M1
+             for k in missing:
+                 if len(self.W) < w_tgt:
+                     self.W[k] = None
+                 else:
+                     self.M1[k] = None
+                 self._ensure_meta(k, now)
+ 
+     def _maybe_tune(self, now: int):
+         # Periodically adapt window/protected sizes and decay parameters.
+         if self.tune_period <= 0:
+             return
+         if (now - self.last_tune_time) >= self.tune_period:
+             # Window sizing based on hit share
+             if self.hits_w > self.hits_main * 1.1:
+                 self.win_frac = min(0.5, self.win_frac + 0.05)
+             elif self.hits_main > self.hits_w * 1.1:
+                 self.win_frac = max(0.05, self.win_frac - 0.05)
+ 
+             # Protected fraction tuning using promotions/demotions and hit share
+             total_main_hits = max(1, self.hits_main)
+             m2_share = (self.hits_m2 / float(total_main_hits)) if total_main_hits > 0 else 0.0
+             if self.prom_cnt < self.demo_cnt * 0.8 or self.hits_w > self.hits_main * 1.2:
+                 self.prot_frac = max(0.60, self.prot_frac - 0.05)
+             elif m2_share > 0.7 and self.prom_cnt >= self.demo_cnt:
+                 self.prot_frac = min(0.90, self.prot_frac + 0.05)
+             if self.scan_cooldown > 0:
+                 self.prot_frac = max(0.60, self.prot_frac - 0.05)
+ 
+             # Adapt LRFU half-life and TinyLFU aging to phase
+             cap = self.capacity or 1
+             if self.hits_w >= self.hits_main:
+                 self.decay_half_life = max(8, self.decay_half_life - 4)
+                 try:
+                     self.sketch.age_period = max(4 * cap, min(16 * cap, 6 * cap))
+                 except Exception:
+                     pass
+             else:
+                 self.decay_half_life = min(64, self.decay_half_life + 4)
+                 try:
+                     self.sketch.age_period = max(4 * cap, min(16 * cap, 12 * cap))
+                 except Exception:
+                     pass
+             self.decay_base = 2 ** (-1.0 / float(self.decay_half_life))
+ 
+             # Decay counters and reset period stats
+             self.hits_w >>= 1
+             self.hits_main >>= 1
+             self.hits_m2 >>= 1
+             self.prom_cnt = 0
+             self.demo_cnt = 0
+             self.last_tune_time = now
+ 
+     def _lru(self, od: OrderedDict):
+         return next(iter(od)) if od else None
+ 
+     def _touch(self, od: OrderedDict, key: str):
+         od[key] = None
+         od.move_to_end(key)
+ 
+     def _sample_cold_candidate(self, od: OrderedDict, now: int):
+         """
+         Return (key, tiny_est, decayed) for the coldest among a randomized slice
+         of the LRU tail. We sample k keys from a window of size up to 4k oldest
+         entries to avoid deterministic tail bias.
+         """
+         if not od:
+             return None, None, None
+         n = len(od)
+         k = min(self._sample_k, n)
+         span = min(n, self._sample_k * 4)
+         start = 0
+         if span > k:
+             start = random.randrange(0, span - k + 1)
+         # Collect a slice of the LRU tail and evaluate first k within it
+         keys_slice = list(islice(od.keys(), start, start + span))
+         best_k, best_est, best_dec = None, None, None
+         for key in islice(keys_slice, 0, k):
+             est = self.sketch.estimate(key)
+             dec = self._decayed_score(key, now)
+             if (best_est is None
+                 or est < best_est
+                 or (est == best_est and dec < best_dec)):
+                 best_k, best_est, best_dec = key, est, dec
+         return best_k, best_est, best_dec
+ 
+     # ----- policy decisions -----
+ 
+     def choose_victim(self, cache_snapshot, new_obj) -> str:
+         """
+         Hybrid eviction with scan-aware bias and window sizing:
+         - Keep window near target: evict from W if it's above target; if below, prefer evicting from M1.
+         - Competitive admission: compare f(new) against sampled cold candidates from M1 and M2.
+         - Use lexicographic coldness (TinyLFU est, decayed score) when comparing across segments and W.
++        - EMA-based scan guard: when ema_miss is high, bias strongly toward evicting from the window.
+         """
+         self._ensure_capacity(cache_snapshot.capacity)
+         self._self_heal(cache_snapshot)
+ 
+         now = cache_snapshot.access_count
+ 
+         # Cool down scan bias gradually on each eviction decision
+         if self.scan_cooldown > 0:
+             self.scan_cooldown -= 1
++
++        em_high = self.ema_miss > 0.8
+ 
+         w_tgt, _, _ = self._targets()
+ 
+         # Candidates from segments
+         cand_w = self._lru(self.W)
+         cand_m1, f_m1, dec_m1 = self._sample_cold_candidate(self.M1, now)
+         cand_m2, f_m2, dec_m2 = self._sample_cold_candidate(self.M2, now)
+ 
+         f_new = self.sketch.estimate(new_obj.key)
+-        bias = 2 if self.scan_cooldown > 0 else 1
++        # Recent-phase boost for new item if seen in recent ring
++        if new_obj.key in self.recent_set:
++            f_new += 1
++
++        bias = 3 if (self.scan_cooldown > 0 or em_high) else 1
+ 
+         # Keep window near its target
+         if len(self.W) > w_tgt and cand_w is not None:
+             return cand_w
+         if len(self.W) < w_tgt:
+             # Pull from main to let window grow
+             if cand_m1 is not None:
+                 return cand_m1
+             if cand_m2 is not None:
+                 return cand_m2
++
++        # If scanning/heavy churn, favor window eviction unless new clearly beats a cold M1
++        if em_high and cand_w is not None:
++            if cand_m1 is not None and f_new >= (f_m1 or 0) + bias:
++                return cand_m1
++            return cand_w
+ 
+         # Competitive admission with bias toward protecting M2
+         if cand_m1 is not None and f_new >= (f_m1 or 0) + bias:
+             return cand_m1
+         if cand_m2 is not None and f_new >= (f_m2 or 0) + (bias + 1):
+             return cand_m2
+ 
+         # Choose the colder main candidate lexicographically
+         main_k, main_f, main_dec = None, None, None
+         if cand_m1 is not None and cand_m2 is not None:
+             if (f_m1 < (f_m2 or 1 << 30)) or (f_m1 == f_m2 and (dec_m1 or 0.0) <= (dec_m2 or 0.0)):
+                 main_k, main_f, main_dec = cand_m1, f_m1, dec_m1
+             else:
+                 main_k, main_f, main_dec = cand_m2, f_m2, dec_m2
+         elif cand_m1 is not None:
+             main_k, main_f, main_dec = cand_m1, f_m1, dec_m1
+         elif cand_m2 is not None:
+             main_k, main_f, main_dec = cand_m2, f_m2, dec_m2
+ 
+         # If both window and main have candidates, pick the lexicographically colder
+         if cand_w is not None and main_k is not None:
+             est_w = self.sketch.estimate(cand_w)
+             dec_w = self._decayed_score(cand_w, now)
+             if est_w < (main_f or 0) or (est_w == (main_f or 0) and dec_w <= (main_dec or 0.0)):
+                 return cand_w
+             else:
+                 return main_k
+ 
+         # If only one side has a candidate
+         if cand_w is not None:
+             return cand_w
+         if main_k is not None:
+             return main_k
+ 
+         # Last resort: pick any key from cache
+         return next(iter(cache_snapshot.cache))
+ 
+     def on_hit(self, cache_snapshot, obj):
+         """
+         Hit processing:
+         - Increment TinyLFU and LRFU-decayed score.
+         - W hit: refresh or early promote if sufficiently hot (stricter during scan).
+         - M1 hit: promote to M2.
+         - M2 hit: refresh in M2.
+         - If untracked but hit (desync): treat as warm and place into M2.
+         """
+         self._ensure_capacity(cache_snapshot.capacity)
+         now = cache_snapshot.access_count
+         key = obj.key
+ 
+         # Update TinyLFU and LRFU score
+         self.sketch.increment(key, 1)
+         s = self._decayed_score(key, now)
+         self.score[key] = s + 1.0
+ 
++        # EMA update for hit
++        self.ema_miss = self.ema_miss * (1.0 - self.ema_alpha)
++
++        # Update recent ring
++        if self.ring_max > 0 and key not in self.recent_set:
++            self.recent_set.add(key)
++            self.recent_ring.append(key)
++            while len(self.recent_ring) > self.ring_max:
++                old = self.recent_ring.popleft()
++                self.recent_set.discard(old)
++
+         # Any hit breaks a miss streak and cools scan bias slightly
+         self.miss_streak = 0
+         if self.scan_cooldown > 0:
+             self.scan_cooldown -= 1
++
++        em_high = self.ema_miss > 0.8
+ 
+         if key in self.W:
+             self.hits_w += 1
+             # Early promotion if strong frequency to avoid window churn
+             est = self.sketch.estimate(key)
+             dec = self._decayed_score(key, now)
+             thr_est = 3 if self.scan_cooldown > 0 else 2
+             thr_dec = 1.5 if self.scan_cooldown > 0 else 1.0
++            if em_high:
++                thr_est += 1
++                thr_dec += 0.5
+             if est >= thr_est or dec >= thr_dec:
+                 # Move from window to protected
+                 self.W.pop(key, None)
+                 self._touch(self.M2, key)
+                 self.prom_cnt += 1
+                 # Keep protected region within target using decayed-aware demotion
+                 _, _, prot_tgt = self._targets()
+                 if len(self.M2) > prot_tgt:
+                     demote, _, _ = self._sample_cold_candidate(self.M2, now)
+                     if demote is not None:
+                         self.M2.pop(demote, None)
+                         self._touch(self.M1, demote)
+                         self.demo_cnt += 1
+             else:
+                 self._touch(self.W, key)
+             self._maybe_tune(now)
+             return
+ 
+         if key in self.M1:
+             self.hits_main += 1
+             # Promote to protected
+             self.M1.pop(key, None)
+             self._touch(self.M2, key)
+             self.prom_cnt += 1
+             # Rebalance protected size if needed (decayed-aware demotion)
+             _, _, prot_tgt = self._targets()
+             if len(self.M2) > prot_tgt:
+                 demote, _, _ = self._sample_cold_candidate(self.M2, now)
+                 if demote is not None:
+                     self.M2.pop(demote, None)
+                     self._touch(self.M1, demote)
+                     self.demo_cnt += 1
+             self._maybe_tune(now)
+             return
+ 
+         if key in self.M2:
+             self.hits_main += 1
+             self.hits_m2 += 1
+             self._touch(self.M2, key)
+             self._maybe_tune(now)
+             return
+ 
+         # Desync: assume it's warm
+         self.hits_main += 1
+         self.hits_m2 += 1
+         self._touch(self.M2, key)
+         _, _, prot_tgt = self._targets()
+         if len(self.M2) > prot_tgt:
+             demote, _, _ = self._sample_cold_candidate(self.M2, now)
+             if demote is not None:
+                 self.M2.pop(demote, None)
+                 self._touch(self.M1, demote)
+                 self.demo_cnt += 1
+         self._maybe_tune(now)
+ 
+     def on_insert(self, cache_snapshot, obj):
+         """
+         Insert (on miss) processing:
+         - Initialize LRFU metadata modestly (to reduce scan pollution).
+         - Increment TinyLFU.
+         - Insert new key into window W (MRU).
+         - If W exceeds target, TinyLFU-gated move of W's LRU to M1 (admission path).
+         - Keep protected region within target by demoting a decayed-cold entry if needed.
+-        - Maintain scan detector state.
++        - Maintain scan detector state and EMA miss rate.
+         """
+         self._ensure_capacity(cache_snapshot.capacity)
+         now = cache_snapshot.access_count
+         key = obj.key
+         self.sketch.increment(key, 1)
+ 
+         # Initialize decayed metadata
+         self.last_time[key] = now
+         self.score[key] = 0.5
++
++        # EMA update for miss
++        self.ema_miss = self.ema_miss * (1.0 - self.ema_alpha) + self.ema_alpha * 1.0
++
++        # Update recent ring
++        if self.ring_max > 0 and key not in self.recent_set:
++            self.recent_set.add(key)
++            self.recent_ring.append(key)
++            while len(self.recent_ring) > self.ring_max:
++                old = self.recent_ring.popleft()
++                self.recent_set.discard(old)
+ 
+         # Update scan detector: count consecutive misses
+         self.miss_streak += 1
+         if self.miss_streak > (self.capacity or 1):
+             # Enter/extend scan-biased cooldown
+             self.scan_cooldown = max(self.scan_cooldown, self.capacity or 1)
+         else:
+             # Gradually cool down if not clearly scanning
+             if self.scan_cooldown > 0:
+                 self.scan_cooldown -= 1
+ 
+         # Ensure it's not tracked elsewhere
+         self.W.pop(key, None)
+         self.M1.pop(key, None)
+         self.M2.pop(key, None)
+ 
+         # Insert into window
+         self._touch(self.W, key)
+ 
+         # Rebalance: if W is beyond target, TinyLFU-gated move of W's LRU to M1 (admission path)
+         w_tgt, _, prot_tgt = self._targets()
+         if len(self.W) > w_tgt:
+             w_lru = self._lru(self.W)
+             if w_lru is not None and w_lru != key:
+                 cand_m1, f_m1, _ = self._sample_cold_candidate(self.M1, now)
+                 f_w = self.sketch.estimate(w_lru)
+-                bias = 2 if self.scan_cooldown > 0 else 1
++                # Recent-phase boost
++                if w_lru in self.recent_set:
++                    f_w += 1
++                em_high = self.ema_miss > 0.8
++                bias = 3 if (self.scan_cooldown > 0 or em_high) else 1
+                 # Admit into M1 only if at least as hot as a cold M1 candidate (with bias)
+                 if f_w >= (f_m1 or 0) + bias:
+                     self.W.pop(w_lru, None)
+                     self._touch(self.M1, w_lru)
+                 else:
+-                    # Keep at LRU to be evicted first; avoid refreshing to MRU
+-                    pass
++                    # Keep at LRU to be evicted first; avoid refreshing to MRU under scans
++                    if not em_high:
++                        pass  # leave as LRU without touching
+ 
+         # Keep protected region within target (decayed-aware demotion)
+         if len(self.M2) > prot_tgt:
+             demote, _, _ = self._sample_cold_candidate(self.M2, now)
+             if demote is not None:
+                 self.M2.pop(demote, None)
+                 self._touch(self.M1, demote)
+                 self.demo_cnt += 1
+ 
+         # Periodically tune window size
+         self._maybe_tune(now)
+ 
+     def on_evict(self, cache_snapshot, obj, evicted_obj):
+         """
+         Eviction post-processing:
+         - Remove evicted key from whichever segment it resides in and purge LRFU meta.
+         """
+         self._ensure_capacity(cache_snapshot.capacity)
+         k = evicted_obj.key
+         self.W.pop(k, None)
+         self.M1.pop(k, None)
+         self.M2.pop(k, None)
+         self.score.pop(k, None)
+         self.last_time.pop(k, None)
++        # Cleanup recent ring
++        if k in self.recent_set:
++            self.recent_set.discard(k)
++            try:
++                self.recent_ring.remove(k)
++            except ValueError:
++                pass
+ 
+ 
+ # Single policy instance reused across calls
+ _policy = _WTinyLFUPolicy()
+ 
+ 
+ def evict(cache_snapshot, obj):
+     """
+     Choose eviction victim key for the incoming obj.
+     """
+     return _policy.choose_victim(cache_snapshot, obj)
+ 
+ 
+ def update_after_hit(cache_snapshot, obj):
+     """
+     Update policy state after a cache hit on obj.
+     """
+     _policy.on_hit(cache_snapshot, obj)
+ 
+ 
+ def update_after_insert(cache_snapshot, obj):
+     """
+     Update policy state after a new obj is inserted into the cache.
+     """
+     _policy.on_insert(cache_snapshot, obj)
+ 
+ 
+ def update_after_evict(cache_snapshot, obj, evicted_obj):
+     """
+     Update policy state after evicting evicted_obj to make room for obj.
+     """
+     _policy.on_evict(cache_snapshot, obj, evicted_obj)
+ 
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

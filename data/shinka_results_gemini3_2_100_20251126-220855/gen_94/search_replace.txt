@@ -1,0 +1,95 @@
+<NAME>
+large_ghost_and_main_rescue
+</NAME>
+
+<DESCRIPTION>
+1.  **Extended Ghost Capacity (10x)**: Increases the ghost registry size from 2x to 10x capacity. This is critical for catching large looping patterns (like Trace 14) that exceed the cache size significantly.
+2.  **Rescued Item Boost**: When an item is rescued from the ghost registry (moved to Main), its frequency is initialized to 1 instead of 0. This gives it a "second chance" (one full cycle in the Main queue) to prove its utility, preventing immediate eviction if it lands at the tail.
+3.  **Main Eviction Tracking**: Items evicted from the Main queue are now also added to the ghost registry. This allows "demoted" popular items to be rescued if they are accessed again, acting as a safety net for the Main working set.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Lazy cleanup of ghost - Extended to 2x capacity
+    while len(s3_ghost) > 2 * capacity:
+        s3_ghost.pop(next(iter(s3_ghost)))
+=======
+    # Lazy cleanup of ghost - Extended to 10x capacity to capture large loops
+    while len(s3_ghost) > 10 * capacity:
+        s3_ghost.pop(next(iter(s3_ghost)))
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Update on Insert:
+    - If in Ghost, insert to Main (Recall).
+    - Else insert to Small (New).
+    - Reset freq to 0 (It must prove itself again).
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+    key = obj.key
+    s3_freq[key] = 0
+
+    if key in s3_ghost:
+        s3_main[key] = None
+        s3_ghost.pop(key)
+    else:
+        s3_small[key] = None
+=======
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Update on Insert:
+    - If in Ghost, insert to Main (Recall) with freq boost.
+    - Else insert to Small (New) with freq reset.
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+    key = obj.key
+
+    if key in s3_ghost:
+        s3_main[key] = None
+        s3_ghost.pop(key)
+        # Rescued items get a second chance (freq=1) to survive one eviction cycle
+        s3_freq[key] = 1
+    else:
+        s3_small[key] = None
+        s3_freq[key] = 0
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Update on Evict:
+    - Track Small evictions in Ghost.
+    - Cleanup Metadata.
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+    key = evicted_obj.key
+
+    if key in s3_small:
+        s3_small.pop(key)
+        s3_ghost[key] = None
+    elif key in s3_main:
+        s3_main.pop(key)
+
+    if key in s3_freq:
+        s3_freq.pop(key)
+=======
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Update on Evict:
+    - Track both Small and Main evictions in Ghost.
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+    key = evicted_obj.key
+
+    if key in s3_small:
+        s3_small.pop(key)
+        s3_ghost[key] = None
+    elif key in s3_main:
+        s3_main.pop(key)
+        # Also track Main evictions in Ghost to allow rescue of demoted items
+        s3_ghost[key] = None
+
+    if key in s3_freq:
+        s3_freq.pop(key)
+>>>>>>> REPLACE
+</DIFF>

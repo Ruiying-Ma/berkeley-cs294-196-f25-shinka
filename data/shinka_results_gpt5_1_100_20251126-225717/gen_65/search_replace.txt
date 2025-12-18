@@ -1,0 +1,413 @@
+<NAME>
+fresh_weighted_ghosts_time_bounded_promotion
+</NAME>
+
+<DESCRIPTION>
+I add three targeted improvements to reduce miss rates:
+1) Freshness-weighted ghost re-admission and p-updates: compute w = max(0, 1 − age/fresh_window), scale p-updates by (1+2w), damp B1 increases and amplify B2 decreases during scans; admit to T2 if w ≥ 0.5 else T1; seed frequency with 1 + round(4w).
+2) Time-bounded two-touch promotion: track first-touch timestamps and require the second touch within a window (TWO_TOUCH_WINDOW_RATIO × cap) to promote from T1 when locality is poor/scan or T1 is over target; otherwise keep in T1 MRU and reset the first-touch marker.
+3) Stronger scan-resistance in eviction: disable cross-segment override during scans; outside scans require a positive frequency gap (CROSS_EVICT_FREQ_MARGIN=1) to override segment choice.
+
+I add _first_touch_ts and _TWO_TOUCH_WINDOW_RATIO and clean markers on promotion/eviction. These changes improve adaptability to scans and respect reuse distance, reducing miss rates.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+# Fallback timestamp ledger and lightweight frequency
+m_key_timestamp = dict()        # key -> last access time (for tie-breaking)
+_freq = dict()                  # key -> small counter (saturating)
+_last_age_tick = 0
+=======
+# Fallback timestamp ledger and lightweight frequency
+m_key_timestamp = dict()        # key -> last access time (for tie-breaking)
+_freq = dict()                  # key -> small counter (saturating)
+_last_age_tick = 0
+# Track first-touch timestamps for time-bounded two-touch promotion in T1
+_first_touch_ts = dict()        # key -> first-touch access_count
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+# Tunables
+_P_INIT_RATIO = 0.30             # initial share for T1
+_FREQ_MAX = 7                    # 3-bit saturating counter
+_FRESH_WINDOW_RATIO = 0.5        # ghost freshness window = 0.5 * cap
+_SCAN_TRIGGER_INS = 0.7          # insert EWMA threshold
+_SCAN_TRIGGER_HIT = 0.15         # hit EWMA threshold
+_SCAN_WINDOW_MULT = 1.0          # scan window length ~= cap accesses
+_P_COOLDOWN_DIV = 10             # min spacing between non-ghost p-updates (~cap/10 accesses) for faster adaptation
+_CROSS_EVICT_FREQ_MARGIN = 0     # allow override on equal-or-better frequency if overall colder
+=======
+# Tunables
+_P_INIT_RATIO = 0.30             # initial share for T1
+_FREQ_MAX = 7                    # 3-bit saturating counter
+_FRESH_WINDOW_RATIO = 0.5        # ghost freshness window = 0.5 * cap
+_TWO_TOUCH_WINDOW_RATIO = 0.5    # time-bounded two-touch window as a fraction of cap
+_SCAN_TRIGGER_INS = 0.7          # insert EWMA threshold
+_SCAN_TRIGGER_HIT = 0.15         # hit EWMA threshold
+_SCAN_WINDOW_MULT = 1.0          # scan window length ~= cap accesses
+_P_COOLDOWN_DIV = 10             # min spacing between non-ghost p-updates (~cap/10 accesses) for faster adaptation
+_CROSS_EVICT_FREQ_MARGIN = 1     # require a positive frequency gap to override segment choice
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    # Cross-segment override: prefer globally colder by (freq asc, timestamp asc)
+    if cand_t1 is not None and cand_t2 is not None:
+=======
+    # Cross-segment override: prefer globally colder by (freq asc, timestamp asc)
+    if (not (cache_snapshot.access_count <= _scan_until)) and cand_t1 is not None and cand_t2 is not None:
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def update_after_hit(cache_snapshot, obj):
+    '''
+    On hit:
+    - Update EWMA and age frequencies.
+    - Increment frequency (saturating).
+    - Two-touch promotion from T1 when locality is poor (scan or low hit EWMA) or T1 is over target.
+    - Otherwise: first hit in T1 promotes to T2.
+    - Keep T2 within its ARC target via demotion.
+    - Remove any ghost entries for this key.
+    '''
+    _ensure_capacity(cache_snapshot)
+    _maybe_age(cache_snapshot)
+    _update_activity(True, cache_snapshot)
+
+    key = obj.key
+    now = cache_snapshot.access_count
+    m_key_timestamp[key] = now
+    _freq[key] = min(_FREQ_MAX, _freq.get(key, 0) + 1)
+
+    in_scan = now <= _scan_until
+    t1_over = len(_T1_probation) > int(round(_p_target))
+    poor_locality = (_hit_ewma < 0.2)
+
+    if key in _T2_protected:
+        _T2_protected.move_to_end(key, last=True)
+    elif key in _T1_probation:
+        require_two_touch = in_scan or t1_over or poor_locality
+        if require_two_touch and _freq.get(key, 0) < 2:
+            # Keep in T1 and move to MRU until proven by second touch
+            _T1_probation.move_to_end(key, last=True)
+        else:
+            # Promote to protected
+            _T1_probation.pop(key, None)
+            _T2_protected[key] = True
+    else:
+        # Metadata miss: treat as hot and place in T2
+        _T2_protected[key] = True
+
+    _demote_protected_if_needed(cache_snapshot, avoid_key=key)
+
+    # Ghost cleanup
+    if key in _B1_ghost:
+        _B1_ghost.pop(key, None)
+    if key in _B2_ghost:
+        _B2_ghost.pop(key, None)
+    _ghost_trim()
+=======
+def update_after_hit(cache_snapshot, obj):
+    '''
+    On hit:
+    - Update EWMA and age frequencies.
+    - Increment frequency (saturating).
+    - Two-touch promotion from T1 when locality is poor (scan or low hit EWMA) or T1 is over target.
+    - Otherwise: first hit in T1 promotes to T2.
+    - Keep T2 within its ARC target via demotion.
+    - Remove any ghost entries for this key.
+    '''
+    _ensure_capacity(cache_snapshot)
+    _maybe_age(cache_snapshot)
+    _update_activity(True, cache_snapshot)
+
+    key = obj.key
+    now = cache_snapshot.access_count
+    m_key_timestamp[key] = now
+    _freq[key] = min(_FREQ_MAX, _freq.get(key, 0) + 1)
+
+    in_scan = now <= _scan_until
+    t1_over = len(_T1_probation) > int(round(_p_target))
+    poor_locality = (_hit_ewma < 0.2)
+    fresh_window = max(1, int(_TWO_TOUCH_WINDOW_RATIO * _cap_est))
+
+    if key in _T2_protected:
+        _T2_protected.move_to_end(key, last=True)
+        _first_touch_ts.pop(key, None)
+    elif key in _T1_probation:
+        require_two_touch = in_scan or t1_over or poor_locality
+        if require_two_touch:
+            first_ts = _first_touch_ts.get(key)
+            within = (first_ts is not None) and ((now - first_ts) <= fresh_window)
+            if not within or _freq.get(key, 0) < 2:
+                # Keep in T1 and move to MRU until proven by timely second touch
+                _T1_probation.move_to_end(key, last=True)
+                _first_touch_ts[key] = now
+            else:
+                # Promote to protected
+                _T1_probation.pop(key, None)
+                _T2_protected[key] = True
+                _first_touch_ts.pop(key, None)
+        else:
+            # Promote immediately when locality is good
+            _T1_probation.pop(key, None)
+            _T2_protected[key] = True
+            _first_touch_ts.pop(key, None)
+    else:
+        # Metadata miss: treat as hot and place in T2
+        _T2_protected[key] = True
+        _first_touch_ts.pop(key, None)
+
+    _demote_protected_if_needed(cache_snapshot, avoid_key=key)
+
+    # Ghost cleanup
+    if key in _B1_ghost:
+        _B1_ghost.pop(key, None)
+    if key in _B2_ghost:
+        _B2_ghost.pop(key, None)
+    _ghost_trim()
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On miss and insert:
+    - Update EWMA and age frequencies.
+    - If key in ghosts: momentum-adjust p; fresh ghosts re-admit to T2 (seed freq), stale to T1.
+    - Else: insert to T1; during guard/scan or poor-locality, place at T1 LRU; gently lower p in these phases (with cooldown).
+    '''
+    _ensure_capacity(cache_snapshot)
+    _maybe_age(cache_snapshot)
+    _update_activity(False, cache_snapshot)
+
+    key = obj.key
+    now = cache_snapshot.access_count
+    m_key_timestamp[key] = now
+
+    in_b1 = key in _B1_ghost
+    in_b2 = key in _B2_ghost
+
+    fresh_window = max(1, int(_FRESH_WINDOW_RATIO * _cap_est))
+
+    if in_b1 or in_b2:
+        # Compute step based on opposing ghost sizes
+        if in_b1:
+            step = max(1.0, float(len(_B2_ghost)) / max(1.0, float(len(_B1_ghost))))
+            ev_ts = _B1_ghost.get(key, None)
+            age = (now - ev_ts) if isinstance(ev_ts, int) else (fresh_window + 1)
+            fresh = age <= fresh_window
+            _adjust_p(+1, step, now, freshness_scale=(1.2 if fresh else 1.0), force=True)
+            _B1_ghost.pop(key, None)
+            if fresh:
+                # Admit to T2 as recently valuable
+                _T2_protected[key] = True
+                _freq[key] = max(3, min(_FREQ_MAX, _freq.get(key, 0) + 2))
+                _demote_protected_if_needed(cache_snapshot, avoid_key=key)
+            else:
+                _T1_probation[key] = True
+                _freq[key] = _freq.get(key, 0)
+        else:
+            step = max(1.0, float(len(_B1_ghost)) / max(1.0, float(len(_B2_ghost))))
+            ev_ts = _B2_ghost.get(key, None)
+            age = (now - ev_ts) if isinstance(ev_ts, int) else (fresh_window + 1)
+            fresh = age <= fresh_window
+            _adjust_p(-1, step, now, freshness_scale=(1.2 if fresh else 1.0), force=True)
+            _B2_ghost.pop(key, None)
+            if fresh:
+                _T2_protected[key] = True
+                _freq[key] = max(3, min(_FREQ_MAX, _freq.get(key, 0) + 2))
+                _demote_protected_if_needed(cache_snapshot, avoid_key=key)
+            else:
+                _T1_probation[key] = True
+                _freq[key] = _freq.get(key, 0)
+    else:
+        # New key: insert into T1
+        _T1_probation[key] = True
+        _freq[key] = _freq.get(key, 0)
+        # Guard, scan and poor-locality handling: bias newcomer colder
+        t1_over = len(_T1_probation) > int(round(_p_target))
+        poor_locality = (_hit_ewma < 0.2)
+        if (_last_victim_strength >= _VICTIM_GUARD_THRESH) or (now <= _scan_until) or poor_locality or t1_over:
+            _T1_probation.move_to_end(key, last=False)
+            # Gently lower p in scan or poor-locality phases to keep pressure in T1 (cooldowned)
+            if (now <= _scan_until) or poor_locality:
+                _adjust_p(-1, max(1.0, 0.05 * float(_cap_est)), now, force=False)
+
+    # Avoid duplicates across structures
+    if key in _T1_probation and key in _T2_protected:
+        _T1_probation.pop(key, None)
+    if key in _B1_ghost:
+        _B1_ghost.pop(key, None)
+    if key in _B2_ghost:
+        _B2_ghost.pop(key, None)
+    _ghost_trim()
+=======
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On miss and insert:
+    - Update EWMA and age frequencies.
+    - If key in ghosts: momentum-adjust p using freshness weight w = max(0, 1 - age/fresh_window);
+      admit to T2 if w >= 0.5 else T1; seed freq with 1 + round(4w).
+    - Else: insert to T1; during guard/scan or poor-locality, place at T1 LRU; gently lower p in these phases (with cooldown).
+    '''
+    _ensure_capacity(cache_snapshot)
+    _maybe_age(cache_snapshot)
+    _update_activity(False, cache_snapshot)
+
+    key = obj.key
+    now = cache_snapshot.access_count
+    m_key_timestamp[key] = now
+
+    in_b1 = key in _B1_ghost
+    in_b2 = key in _B2_ghost
+
+    fresh_window = max(1, int(_FRESH_WINDOW_RATIO * _cap_est))
+    in_scan = now <= _scan_until
+
+    if in_b1 or in_b2:
+        # Compute step based on opposing ghost sizes and freshness weight
+        if in_b1:
+            step = max(1.0, float(len(_B2_ghost)) / max(1.0, float(len(_B1_ghost))))
+            ev_ts = _B1_ghost.get(key, None)
+            age = (now - ev_ts) if isinstance(ev_ts, int) else (fresh_window + 1)
+            w = max(0.0, 1.0 - float(age) / float(fresh_window))
+            step_scaled = step * (1.0 + 2.0 * w)
+            if in_scan:
+                step_scaled *= 0.5  # damp increases during scans
+            _adjust_p(+1, step_scaled, now, freshness_scale=(1.0 + w), force=True)
+            _B1_ghost.pop(key, None)
+            if w >= 0.5:
+                # Admit to T2 as recently valuable
+                _T2_protected[key] = True
+                _freq[key] = max(_freq.get(key, 0), 1 + int(round(4.0 * w)))
+                _first_touch_ts.pop(key, None)
+                _demote_protected_if_needed(cache_snapshot, avoid_key=key)
+            else:
+                _T1_probation[key] = True
+                _freq[key] = max(_freq.get(key, 0), 1 + int(round(4.0 * w)))
+                _first_touch_ts[key] = now
+        else:
+            step = max(1.0, float(len(_B1_ghost)) / max(1.0, float(len(_B2_ghost))))
+            ev_ts = _B2_ghost.get(key, None)
+            age = (now - ev_ts) if isinstance(ev_ts, int) else (fresh_window + 1)
+            w = max(0.0, 1.0 - float(age) / float(fresh_window))
+            step_scaled = step * (1.0 + 2.0 * w)
+            if in_scan:
+                step_scaled *= 1.2  # amplify decreases during scans
+            _adjust_p(-1, step_scaled, now, freshness_scale=(1.0 + w), force=True)
+            _B2_ghost.pop(key, None)
+            if w >= 0.5:
+                _T2_protected[key] = True
+                _freq[key] = max(_freq.get(key, 0), 1 + int(round(4.0 * w)))
+                _first_touch_ts.pop(key, None)
+                _demote_protected_if_needed(cache_snapshot, avoid_key=key)
+            else:
+                _T1_probation[key] = True
+                _freq[key] = max(_freq.get(key, 0), 1 + int(round(4.0 * w)))
+                _first_touch_ts[key] = now
+    else:
+        # New key: insert into T1
+        _T1_probation[key] = True
+        _freq[key] = _freq.get(key, 0)
+        _first_touch_ts[key] = now
+        # Guard, scan and poor-locality handling: bias newcomer colder
+        t1_over = len(_T1_probation) > int(round(_p_target))
+        poor_locality = (_hit_ewma < 0.2)
+        if (_last_victim_strength >= _VICTIM_GUARD_THRESH) or (now <= _scan_until) or poor_locality or t1_over:
+            _T1_probation.move_to_end(key, last=False)
+            # Gently lower p in scan or poor-locality phases to keep pressure in T1 (cooldowned)
+            if (now <= _scan_until) or poor_locality:
+                _adjust_p(-1, max(1.0, 0.05 * float(_cap_est)), now, force=False)
+
+    # Avoid duplicates across structures
+    if key in _T1_probation and key in _T2_protected:
+        _T1_probation.pop(key, None)
+    if key in _B1_ghost:
+        _B1_ghost.pop(key, None)
+    if key in _B2_ghost:
+        _B2_ghost.pop(key, None)
+    _ghost_trim()
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    After eviction:
+    - Remove from resident segment and put into the appropriate ghost with timestamp.
+    - Track victim strength and set a short admission guard when a strong T2 victim is evicted.
+    - Clean frequency and timestamp entries.
+    '''
+    _ensure_capacity(cache_snapshot)
+    key = evicted_obj.key
+    now = cache_snapshot.access_count
+
+    was_t1 = key in _T1_probation
+    was_t2 = key in _T2_protected
+
+    fval = _freq.get(key, 0)
+    strength = float(fval) + (2.0 if was_t2 else 0.0)
+    global _last_victim_strength, _guard_until
+    _last_victim_strength = strength
+
+    if was_t1:
+        _T1_probation.pop(key, None)
+        _B1_ghost[key] = now
+    elif was_t2:
+        _T2_protected.pop(key, None)
+        _B2_ghost[key] = now
+        if fval >= 2:
+            _guard_until = now + max(1, _cap_est // 2)
+    else:
+        # Unknown residency; default to B1 ghost
+        _B1_ghost[key] = now
+
+    m_key_timestamp.pop(key, None)
+    _freq.pop(key, None)
+    _ghost_trim()
+=======
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    After eviction:
+    - Remove from resident segment and put into the appropriate ghost with timestamp.
+    - Track victim strength and set a short admission guard when a strong T2 victim is evicted.
+    - Clean frequency and timestamp entries.
+    '''
+    _ensure_capacity(cache_snapshot)
+    key = evicted_obj.key
+    now = cache_snapshot.access_count
+
+    was_t1 = key in _T1_probation
+    was_t2 = key in _T2_protected
+
+    fval = _freq.get(key, 0)
+    strength = float(fval) + (2.0 if was_t2 else 0.0)
+    global _last_victim_strength, _guard_until
+    _last_victim_strength = strength
+
+    if was_t1:
+        _T1_probation.pop(key, None)
+        _B1_ghost[key] = now
+    elif was_t2:
+        _T2_protected.pop(key, None)
+        _B2_ghost[key] = now
+        if fval >= 2:
+            _guard_until = now + max(1, _cap_est // 2)
+    else:
+        # Unknown residency; default to B1 ghost
+        _B1_ghost[key] = now
+
+    m_key_timestamp.pop(key, None)
+    _freq.pop(key, None)
+    _first_touch_ts.pop(key, None)
+    _ghost_trim()
+>>>>>>> REPLACE
+
+</DIFF>

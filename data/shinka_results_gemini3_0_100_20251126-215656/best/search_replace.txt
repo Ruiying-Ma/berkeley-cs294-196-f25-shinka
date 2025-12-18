@@ -1,0 +1,209 @@
+<NAME>
+s3_fifo_demotion_decay
+</NAME>
+
+<DESCRIPTION>
+Implement S3-FIFO with two major enhancements:
+1. **Conditional Demotion**: Evicted items from the Main queue (protected) are demoted to the Small queue (probation) instead of being discarded. This gives them a second chance to prove utility against new content, improving retention of working sets that cycle slower than the Main queue scan.
+2. **Frequency Decay**: Instead of a binary access bit, use a frequency counter (capped at 3). Hits increment frequency. Eviction from Main decrements frequency (decay) rather than resetting immediately. This provides hysteresis, making the Main queue "stickier" for frequently accessed items and preventing popular items from being flushed by transient activity.
+3. **Ghost Registry**: Track evicted Small items to promote them to Main on re-access (anti-scan loop detection). Ghost size set to 2x capacity.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+from collections import OrderedDict
+
+# Global metadata structures
+# s_queue: Small FIFO queue (probationary)
+# m_queue: Main FIFO queue (protected)
+# ghost_registry: Ghost FIFO queue (history of evicted probationary items)
+# accessed_bits: Set of keys accessed while in cache (simulating reference bits)
+
+s_queue = OrderedDict()
+m_queue = OrderedDict()
+ghost_registry = OrderedDict()
+accessed_bits = set()
+
+def evict(cache_snapshot, obj):
+    '''
+    Selects a victim using S3-FIFO policy.
+    Iterates through S and M queues to find a candidate without an active access bit.
+    Promotes/Re-inserts items with access bits.
+    '''
+    # Target size for the small queue (10% of capacity)
+    s_capacity = max(int(cache_snapshot.capacity * 0.1), 1)
+
+    while True:
+        # Check S queue first if it exceeds capacity or if M is empty
+        if len(s_queue) > s_capacity or (len(s_queue) > 0 and len(m_queue) == 0):
+            candidate_key, _ = s_queue.popitem(last=False) # Pop from head (FIFO)
+
+            if candidate_key in accessed_bits:
+                # Second chance: Move to M
+                accessed_bits.discard(candidate_key)
+                m_queue[candidate_key] = None
+            else:
+                # Victim found in S
+                # Add to ghost registry
+                ghost_registry[candidate_key] = None
+                # Cap ghost size to cache capacity
+                if len(ghost_registry) > cache_snapshot.capacity:
+                    ghost_registry.popitem(last=False)
+                return candidate_key
+
+        else:
+            # Check M queue
+            if not m_queue:
+                # Should not be reached if cache is not empty
+                # Fallback to S if M is empty
+                if s_queue:
+                        k, _ = s_queue.popitem(last=False)
+                        return k
+                # Extreme fallback
+                return next(iter(cache_snapshot.cache))
+
+            candidate_key, _ = m_queue.popitem(last=False) # Pop from head
+
+            if candidate_key in accessed_bits:
+                # Second chance: Re-insert at tail of M
+                accessed_bits.discard(candidate_key)
+                m_queue[candidate_key] = None
+            else:
+                # Victim found in M
+                # Do not add to ghost (only S evictions go to ghost)
+                return candidate_key
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    Mark the object as accessed.
+    '''
+    accessed_bits.add(obj.key)
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Insert new object into S or M based on ghost history.
+    '''
+    if obj.key in ghost_registry:
+        # Promote directly to Main queue
+        m_queue[obj.key] = None
+        del ghost_registry[obj.key]
+    else:
+        # Insert into Small queue
+        s_queue[obj.key] = None
+
+    # Reset access bit on insert (usually assumed 0 freq initially)
+    accessed_bits.discard(obj.key)
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Cleanup. Most logic handled in evict, but ensure consistency.
+    '''
+    # The evicted object was already removed from our queues in `evict`.
+    # Just ensure it's cleared from accessed bits if it lingered.
+    accessed_bits.discard(evicted_obj.key)
+=======
+from collections import OrderedDict
+
+# Global metadata structures
+# s_queue: Small FIFO queue (probationary)
+# m_queue: Main FIFO queue (protected)
+# ghost_registry: Ghost FIFO queue (history of evicted probationary items)
+# access_counts: Dictionary mapping keys to frequency counters (0-3)
+
+s_queue = OrderedDict()
+m_queue = OrderedDict()
+ghost_registry = OrderedDict()
+access_counts = {}
+
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO eviction with Demotion and Frequency Decay.
+    - S items with hits -> M (Frequency Reset)
+    - M items with hits -> M (Frequency Decay)
+    - M items without hits -> Demote to S (Second chance)
+    - S items without hits -> Evict (Ghost)
+    '''
+    s_capacity = max(int(cache_snapshot.capacity * 0.1), 1)
+
+    while True:
+        # 1. Check Small Queue (Probation)
+        # Prioritize clearing S if it's too big, or if M is empty
+        if len(s_queue) > s_capacity or not m_queue:
+            if not s_queue:
+                # If S is empty but we are here, M must be empty too (or we'd be in else)
+                if m_queue:
+                    # Should not happen given condition, but safety fallback to M
+                    pass
+                else:
+                    break # Both empty
+            else:
+                candidate_key, _ = s_queue.popitem(last=False)
+
+                freq = access_counts.get(candidate_key, 0)
+                if freq > 0:
+                    # Promote to Main
+                    m_queue[candidate_key] = None
+                    access_counts[candidate_key] = 0 # Reset on promotion
+                else:
+                    # Evict from S -> Ghost
+                    ghost_registry[candidate_key] = None
+                    # Ghost management (2x capacity for better loop detection)
+                    if len(ghost_registry) > cache_snapshot.capacity * 2:
+                        ghost_registry.popitem(last=False)
+
+                    if candidate_key in access_counts:
+                        del access_counts[candidate_key]
+                    return candidate_key
+                continue
+
+        # 2. Check Main Queue (Protected)
+        # S is within capacity, check M
+        candidate_key, _ = m_queue.popitem(last=False)
+
+        freq = access_counts.get(candidate_key, 0)
+        if freq > 0:
+            # Re-insert in Main with decay
+            m_queue[candidate_key] = None
+            access_counts[candidate_key] = freq - 1
+        else:
+            # Demote to Small (Probation)
+            # This allows M items to be compared against new S items before dying
+            s_queue[candidate_key] = None
+            access_counts[candidate_key] = 0
+            # Loop continues, and since S grew, we might check S next
+
+    # Fallback
+    if cache_snapshot.cache:
+        return next(iter(cache_snapshot.cache))
+    return None
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    Increment frequency on hit, capped at 3.
+    '''
+    curr = access_counts.get(obj.key, 0)
+    access_counts[obj.key] = min(curr + 1, 3)
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Insert new object. Ghost hits go to Main, others to Small.
+    '''
+    if obj.key in ghost_registry:
+        # Ghost Hit: Promote to Main
+        m_queue[obj.key] = None
+        access_counts[obj.key] = 0
+        del ghost_registry[obj.key]
+    else:
+        # New Insert: Start in Small
+        s_queue[obj.key] = None
+        access_counts[obj.key] = 0
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Cleanup metadata.
+    '''
+    k = evicted_obj.key
+    if k in access_counts:
+        del access_counts[k]
+>>>>>>> REPLACE
+</DIFF>

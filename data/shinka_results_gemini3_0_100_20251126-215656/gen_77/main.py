@@ -1,0 +1,148 @@
+# EVOLVE-BLOCK-START
+"""
+Smart S3-FIFO (SmartS3FIFO) v2
+Improvements:
+- Adaptive Sizing: Increased S queue allocation (20%) to absorb scans better.
+- Extended Ghost: Larger history (4x) to catch longer loops.
+- Ghost Rescue Bonus: Items rescued from Ghost enter M with a 'warm' status (freq=1).
+- Global Reset: Handles sequential trace execution safely.
+"""
+
+from collections import OrderedDict
+
+# Global State
+s_queue = OrderedDict()       # Small/Probationary Queue
+m_queue = OrderedDict()       # Main/Protected Queue
+ghost_registry = OrderedDict() # History of S evictions
+freq_map = {}                 # Frequency counter (0-3)
+
+def check_reset(cache_snapshot):
+    """Reset globals if a new trace is detected."""
+    # Heuristic: cache access count is low (start of trace)
+    if cache_snapshot.access_count <= 1:
+         s_queue.clear()
+         m_queue.clear()
+         ghost_registry.clear()
+         freq_map.clear()
+
+def evict(cache_snapshot, obj):
+    '''
+    Selects a victim.
+    Policy:
+    - S_Queue target: 20% of capacity.
+    - Ghost Limit: 4x capacity.
+    - Eviction Preference:
+      - If S is overflowing (>20%) or M is empty: Evict from S.
+      - Else: Evict from M.
+    '''
+    capacity = cache_snapshot.capacity
+    # Increased S target to 20%
+    s_target = max(int(capacity * 0.2), 1)
+    # Increased Ghost limit to 4x
+    ghost_limit = capacity * 4
+
+    while True:
+        # Determine which queue to operate on
+        # Priority: Clean S if it's too big or M is empty (need to maintain fullness)
+        force_s = len(s_queue) > s_target or len(m_queue) == 0
+
+        if force_s:
+            if not s_queue:
+                # M must have items if cache is full and S is empty
+                if m_queue:
+                    force_s = False
+                else:
+                    # Should unlikely happen
+                    return next(iter(cache_snapshot.cache))
+
+            if force_s:
+                candidate, _ = s_queue.popitem(last=False) # FIFO
+                cnt = freq_map.get(candidate, 0)
+
+                if cnt > 0:
+                    # Accessed in S -> Promote to M
+                    m_queue[candidate] = None
+                    freq_map[candidate] = 0 # Reset freq (Standard S3-FIFO)
+                else:
+                    # Victim in S
+                    ghost_registry[candidate] = None
+                    if len(ghost_registry) > ghost_limit:
+                        ghost_registry.popitem(last=False)
+                    return candidate
+
+        if not force_s:
+            # Clean M
+            if not m_queue:
+                continue
+
+            candidate, _ = m_queue.popitem(last=False) # FIFO
+            cnt = freq_map.get(candidate, 0)
+
+            if cnt > 0:
+                # Accessed in M -> Reinsert at tail (Second Chance)
+                m_queue[candidate] = None
+                freq_map[candidate] = 0 # Reset freq
+            else:
+                # Cold in M -> Conditional Demotion
+                # If S has room (below target), demote to S.
+                if len(s_queue) < s_target:
+                    s_queue[candidate] = None
+                    # Freq remains 0
+                else:
+                    # S is full. Strict eviction.
+                    return candidate
+
+def update_after_hit(cache_snapshot, obj):
+    '''Increment frequency, cap at 3.'''
+    curr = freq_map.get(obj.key, 0)
+    freq_map[obj.key] = min(curr + 1, 3)
+
+def update_after_insert(cache_snapshot, obj):
+    '''Insert based on Ghost history.'''
+    check_reset(cache_snapshot)
+
+    key = obj.key
+    # Initial frequency is 0
+    freq_map[key] = 0
+
+    if key in ghost_registry:
+        # Ghost hit -> Insert to M
+        m_queue[key] = None
+        del ghost_registry[key]
+        # Bonus: Give it a head start so it isn't immediately evicted from M if cold
+        # This helps loops persist in M
+        freq_map[key] = 1
+    else:
+        # New -> Insert to S
+        s_queue[key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''Cleanup metadata.'''
+    key = evicted_obj.key
+    if key in freq_map:
+        del freq_map[key]
+    if key in s_queue:
+        del s_queue[key]
+    if key in m_queue:
+        del m_queue[key]
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

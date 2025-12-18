@@ -1,0 +1,251 @@
+--- a/original.py
++++ b/original.py
+@@ -1,129 +1,172 @@
+ # EVOLVE-BLOCK-START
+ """Cache eviction algorithm for optimizing hit rates across multiple workloads"""
++from collections import deque
+ 
+-# LFU-DA State with Ghost History
++# S3-FIFO State
+ algo_state = {
+-    'priority': {},      # key -> priority (float)
+-    'freq': {},          # key -> frequency (int)
+-    'last_access': {},   # key -> last access timestamp (int)
+-    'ghost_freq': {},    # key -> frequency (int) of evicted items
+-    'L': 0.0,            # Aging factor
++    'S': deque(),        # Small FIFO queue (approx 10% cache)
++    'M': deque(),        # Main FIFO queue (approx 90% cache)
++    'ghost': {},         # Ghost cache (dict for FIFO ordering)
++    'accessed': set(),   # Track accessed items (1-bit clock)
++    'location': {},      # Map key -> 'S' or 'M'
+     'max_time': 0        # Track time to detect trace resets
+ }
+ 
+ def _check_reset(current_time):
+     # If time goes backwards, we are likely processing a new trace
+     if current_time < algo_state['max_time']:
+-        algo_state['priority'].clear()
+-        algo_state['freq'].clear()
+-        algo_state['last_access'].clear()
+-        algo_state['ghost_freq'].clear()
+-        algo_state['L'] = 0.0
++        algo_state['S'].clear()
++        algo_state['M'].clear()
++        algo_state['ghost'].clear()
++        algo_state['accessed'].clear()
++        algo_state['location'].clear()
+         algo_state['max_time'] = 0
+     algo_state['max_time'] = current_time
+ 
+ def evict(cache_snapshot, obj):
+     '''
+-    LFU-DA Eviction:
+-    Choose the item with minimum priority.
+-    Tie-break using LRU (minimum last_access).
++    S3-FIFO Eviction Logic:
++    - Maintains a small FIFO (S) and a main FIFO (M).
++    - New items go to S.
++    - Eviction candidates are chosen from S (if full) or M.
++    - Items in S with access bit set move to M.
++    - Items in M with access bit set get reinserted (Second Chance).
+     '''
+-    # Find candidate with min priority, break ties with min last_access (LRU)
++    S = algo_state['S']
++    M = algo_state['M']
++    accessed = algo_state['accessed']
++    location = algo_state['location']
++    
++    capacity = cache_snapshot.capacity
++    target_S_size = max(1, int(capacity * 0.1))
++    
+     victim = None
+-    min_p = float('inf')
+-    min_la = float('inf')
+-
+-    P = algo_state['priority']
+-    LA = algo_state['last_access']
+-
+-    for key in cache_snapshot.cache:
+-        p = P.get(key, 0.0)
+-        la = LA.get(key, 0)
+-
+-        if p < min_p:
+-            min_p = p
+-            min_la = la
+-            victim = key
+-        elif p == min_p:
+-            if la < min_la:
+-                min_la = la
+-                victim = key
++    
++    # Loop until a victim is found. 
++    # This loop modifies the queues by moving "saved" items.
++    while victim is None:
++        # Determine which queue to evict from
++        evict_from_S = False
++        if len(S) > target_S_size:
++            evict_from_S = True
++        elif len(M) == 0:
++            evict_from_S = True
++        
++        if evict_from_S:
++            if not S: break # Should not happen if cache not empty
++            
++            candidate = S[0] # Peek head (oldest)
++            if candidate in accessed:
++                # Been accessed: Promote to M
++                S.popleft()
++                M.append(candidate)
++                location[candidate] = 'M'
++                accessed.remove(candidate)
++            else:
++                # Not accessed: Evict
++                victim = candidate
++        else:
++            if not M: break
++            
++            candidate = M[0] # Peek head (oldest)
++            if candidate in accessed:
++                # Been accessed: Reinsert in M (Second Chance)
++                M.popleft()
++                M.append(candidate)
++                # location is already 'M'
++                accessed.remove(candidate)
++            else:
++                # Not accessed: Evict
++                victim = candidate
+ 
+     return victim
+ 
+ def update_after_hit(cache_snapshot, obj):
+     '''
+-    Hit: F = F + 1, P = F + L
++    Hit: Mark object as accessed.
++    '''
++    _check_reset(cache_snapshot.access_count)
++    algo_state['accessed'].add(obj.key)
++
++def update_after_insert(cache_snapshot, obj):
++    '''
++    Insert: Place in S or M (if ghost).
+     '''
+     _check_reset(cache_snapshot.access_count)
+     key = obj.key
+-    # Update frequency
+-    freq = algo_state['freq'].get(key, 0) + 1
+-    algo_state['freq'][key] = freq
+-    # Update priority
+-    algo_state['priority'][key] = freq + algo_state['L']
+-    # Update access time (for tie breaking)
+-    algo_state['last_access'][key] = cache_snapshot.access_count
+-
+-def update_after_insert(cache_snapshot, obj):
+-    '''
+-    Insert: F = 1 (or restored from ghost), P = F + L
+-    '''
+-    _check_reset(cache_snapshot.access_count)
+-    key = obj.key
+-
+-    # Restore frequency if in ghost
+-    freq = 1
+-    if key in algo_state['ghost_freq']:
+-        freq = algo_state['ghost_freq'].pop(key) + 1
+-
+-    algo_state['freq'][key] = freq
+-    algo_state['priority'][key] = freq + algo_state['L']
+-    algo_state['last_access'][key] = cache_snapshot.access_count
++    
++    # If previously evicted from M (ghost), restore to M
++    if key in algo_state['ghost']:
++        algo_state['M'].append(key)
++        algo_state['location'][key] = 'M'
++        del algo_state['ghost'][key]
++    else:
++        # New item goes to S
++        algo_state['S'].append(key)
++        algo_state['location'][key] = 'S'
++    
++    # Start with accessed bit 0 (unless it was a hit/insert race, but usually 0)
++    # We explicitly remove it to be safe, though usually not present.
++    if key in algo_state['accessed']:
++        algo_state['accessed'].remove(key)
+ 
+ def update_after_evict(cache_snapshot, obj, evicted_obj):
+     '''
+-    Evict: Update L, move freq to ghost.
++    Evict: Remove victim from queues and manage ghost.
+     '''
+-    # Note: _check_reset not needed here as it usually follows evict/insert sequence
+     key = evicted_obj.key
+-    if key in algo_state['priority']:
+-        # L becomes the priority of the victim
+-        algo_state['L'] = algo_state['priority'][key]
+-        del algo_state['priority'][key]
++    loc = algo_state['location'].get(key)
++    
++    # Remove from S or M
++    if loc == 'S':
++        # Optimize: usually at head
++        if algo_state['S'] and algo_state['S'][0] == key:
++            algo_state['S'].popleft()
++        else:
++            try: algo_state['S'].remove(key)
++            except ValueError: pass
++        # Evicted from S -> No ghost (scan filter)
++        
++    elif loc == 'M':
++        if algo_state['M'] and algo_state['M'][0] == key:
++            algo_state['M'].popleft()
++        else:
++            try: algo_state['M'].remove(key)
++            except ValueError: pass
++        
++        # Evicted from M -> Add to ghost
++        algo_state['ghost'][key] = True
++        
++        # Maintain ghost size <= capacity
++        if len(algo_state['ghost']) > cache_snapshot.capacity:
++            # FIFO eviction from ghost
++            oldest = next(iter(algo_state['ghost']))
++            del algo_state['ghost'][oldest]
+ 
+-    if key in algo_state['freq']:
+-        # Move frequency to ghost
+-        algo_state['ghost_freq'][key] = algo_state['freq'][key]
+-        del algo_state['freq'][key]
+-
+-    if key in algo_state['last_access']:
+-        del algo_state['last_access'][key]
+-
+-    # Limit ghost size to cache capacity
+-    capacity = cache_snapshot.capacity
+-    while len(algo_state['ghost_freq']) > capacity:
+-        # Remove oldest inserted (LRU of ghost)
+-        algo_state['ghost_freq'].pop(next(iter(algo_state['ghost_freq'])))
++    # Cleanup metadata
++    if key in algo_state['location']:
++        del algo_state['location'][key]
++    if key in algo_state['accessed']:
++        algo_state['accessed'].remove(key)
+ 
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

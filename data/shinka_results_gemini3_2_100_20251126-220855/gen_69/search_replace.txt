@@ -1,0 +1,128 @@
+<NAME>
+ghost_tracking_boost
+</NAME>
+
+<DESCRIPTION>
+1. **Extended Ghost Capacity**: Increased to 3x cache size to track larger loops (Trace 14).
+2. **Main Eviction Tracking**: Now adds items evicted from Main to the Ghost registry. This is crucial for loops where items cycle through Main -> Evict -> Small -> Main. By tracking Main evictions, we can identify these items as "Recalls" sooner.
+3. **Frequency Boost on Recall**: When an item is recalled from Ghost (hit), it is initialized with `freq=1` instead of `0`. This gives it priority in the Main queue over "New" items (which start at `0`), allowing the working set to latch into the cache and displace one-time scans.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    Randomized S3-FIFO Eviction Policy:
+    - Structure: Small (10%) + Main (90%) + Ghost (200%).
+    - Key Innovation: Probabilistic Survival.
+      - Standard S3-FIFO fails on loops > cache size because items flush out before reuse.
+      - We introduce a 1% chance for items to survive eviction (both from Small and Main).
+      - This breaks synchronization in loops, allowing a subset of items to stay, get hit,
+        increase frequency, and establish a protected working set.
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+
+    capacity = cache_snapshot.capacity
+    s_capacity = max(1, int(capacity * 0.1))
+
+    # Lazy cleanup of ghost - Extended to 2x capacity
+    while len(s3_ghost) > 2 * capacity:
+        s3_ghost.pop(next(iter(s3_ghost)))
+
+    while True:
+=======
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO with Extended Ghost and Frequency Boost:
+    - Structure: Small (10%) + Main (90%) + Ghost (300%).
+    - Ghost: Tracks evictions from both Small and Main.
+    - Recall Policy: Ghost hits promote to Main with Bonus Frequency (1).
+    - Probabilistic Survival: Retained (1%) to help with synchronization.
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+
+    capacity = cache_snapshot.capacity
+    s_capacity = max(1, int(capacity * 0.1))
+
+    # Lazy cleanup of ghost - Extended to 3x capacity
+    while len(s3_ghost) > 3 * capacity:
+        s3_ghost.pop(next(iter(s3_ghost)))
+
+    while True:
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Update on Insert:
+    - If in Ghost, insert to Main (Recall).
+    - Else insert to Small (New).
+    - Reset freq to 0 (It must prove itself again).
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+    key = obj.key
+    s3_freq[key] = 0
+
+    if key in s3_ghost:
+        s3_main[key] = None
+        s3_ghost.pop(key)
+    else:
+        s3_small[key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Update on Evict:
+    - Track Small evictions in Ghost.
+    - Cleanup Metadata.
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+    key = evicted_obj.key
+
+    if key in s3_small:
+        s3_small.pop(key)
+        s3_ghost[key] = None
+    elif key in s3_main:
+        s3_main.pop(key)
+
+    if key in s3_freq:
+        s3_freq.pop(key)
+=======
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Update on Insert:
+    - If in Ghost, insert to Main (Recall) with Frequency Boost.
+    - Else insert to Small (New).
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+    key = obj.key
+
+    if key in s3_ghost:
+        # Recall from Ghost -> Main
+        # Give it a frequency boost (1) so it beats new items (0) in Main eviction
+        s3_freq[key] = 1
+        s3_main[key] = None
+        s3_ghost.pop(key)
+    else:
+        # New -> Small
+        s3_freq[key] = 0
+        s3_small[key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Update on Evict:
+    - Track evictions from BOTH Small and Main in Ghost.
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+    key = evicted_obj.key
+
+    if key in s3_small:
+        s3_small.pop(key)
+        s3_ghost[key] = None
+    elif key in s3_main:
+        s3_main.pop(key)
+        # Also track Main evictions
+        s3_ghost[key] = None
+
+    if key in s3_freq:
+        s3_freq.pop(key)
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,192 @@
+<NAME>
+s3_optimize_loops_and_persistence
+</NAME>
+
+<DESCRIPTION>
+This update introduces several mechanisms to address thrashing (Trace 14) and improve overall hit rates:
+1.  **Extended Ghost Registry**: Increases ghost capacity to 2x cache size to better detect loops that exceed cache size.
+2.  **Probabilistic LIFO Leak**: In the probationary 'Small' queue, introduces a ~3% chance to use FIFO eviction instead of LIFO. This breaks pathological synchronization in loops larger than the cache, allowing some new items to survive probation and be promoted.
+3.  **Lower Promotion Threshold**: Reduces the promotion threshold from `freq > 1` to `freq > 0`. This ensures that any item receiving at least one hit in probation (proving utility over a scan) is promoted to Main, mimicking Segmented LRU behavior.
+4.  **Main Queue Second Chance**: Implements a Second Chance mechanism for the Main queue eviction. High-frequency items at the LRU position are given a reprieve (moved to MRU with decayed frequency) rather than being evicted immediately.
+5.  **Decayed Frequency Restoration**: When a ghost item is re-inserted, its frequency is restored but decayed (halved). This prevents historically popular but currently stale items from dominating the cache indefinitely.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    if not s3_config:
+        cap = cache_snapshot.capacity
+        # Small queue size target (10%)
+        s3_config['small_target'] = max(1, int(cap * 0.1))
+        # Aging interval (once per capacity accesses)
+        s3_config['aging_interval'] = cap
+=======
+    if not s3_config:
+        cap = cache_snapshot.capacity
+        # Small queue size target (10%)
+        s3_config['small_target'] = max(1, int(cap * 0.1))
+        # Aging interval (once per capacity accesses)
+        s3_config['aging_interval'] = cap
+        # Ghost registry size target (2x capacity for better loop detection)
+        s3_config['ghost_target'] = cap * 2
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    S3-LIFO-LRU Eviction:
+    - Ages frequencies periodically.
+    - Favors evicting from Small (LIFO) to protect Main and filter scan/loops.
+    - Promotes from Small to Main if freq > 1.
+    - Fallback to Main (LRU).
+    '''
+    _reset_state(cache_snapshot)
+
+    # Aging Logic
+    if cache_snapshot.access_count % s3_config['aging_interval'] == 0:
+        _age_freqs()
+
+    target_small = s3_config['small_target']
+
+    # 1. Try evicting from Small if it's over budget or if Main is empty
+    # We use a loop to handle promotions
+    while len(s3_small) > target_small or (not s3_main and s3_small):
+        # LIFO Eviction: Inspect tail (newest)
+        victim_key, _ = s3_small.popitem(last=True)
+
+        # Check Promotion (freq > 1)
+        if s3_freq.get(victim_key, 0) > 1:
+            # Promote to Main (MRU)
+            s3_main[victim_key] = 1
+            s3_main.move_to_end(victim_key)
+            # Remove from freq map (optional, or keep for history)
+            # We keep it in s3_freq for continuity
+        else:
+            # Victim found. Put back for update_after_evict (or just return)
+            # We must return a key that is present in the cache.
+            # We popped it, so we must push it back to be consistent with external view
+            s3_small[victim_key] = 1
+            # move_to_end(last=True) is implied by assignment for new key
+            return victim_key
+
+    # 2. If Small is safe, evict from Main (LRU)
+    if s3_main:
+        return next(iter(s3_main))
+
+    # Fallback (should be covered)
+    if s3_small:
+        return next(iter(s3_small))
+    return None
+=======
+def evict(cache_snapshot, obj):
+    '''
+    S3-LIFO-LRU Eviction with Anti-Thrashing and Second Chance:
+    - Ages frequencies periodically.
+    - Favors evicting from Small (Probationary) using LIFO with probabilistic FIFO leak.
+    - Promotes from Small to Main if freq > 0 (at least one hit).
+    - Evicts from Main (Protected) using LRU with Second Chance.
+    '''
+    _reset_state(cache_snapshot)
+
+    # Aging Logic
+    if cache_snapshot.access_count % s3_config['aging_interval'] == 0:
+        _age_freqs()
+
+    target_small = s3_config['small_target']
+
+    # 1. Try evicting from Small if it's over budget or if Main is empty
+    while len(s3_small) > target_small or (not s3_main and s3_small):
+        # Anti-Thrashing: Probabilistic FIFO leak (approx 3%)
+        # Allows some new items to traverse the probationary queue instead of immediate LIFO eviction.
+        is_fifo_leak = (cache_snapshot.access_count & 0x1F) == 0
+
+        if is_fifo_leak:
+            victim_key, _ = s3_small.popitem(last=False) # FIFO (oldest)
+        else:
+            victim_key, _ = s3_small.popitem(last=True)  # LIFO (newest)
+
+        # Check Promotion (freq > 0 means at least 1 hit in probation)
+        if s3_freq.get(victim_key, 0) > 0:
+            # Promote to Main (MRU)
+            s3_main[victim_key] = 1
+            s3_main.move_to_end(victim_key)
+        else:
+            # Victim found. Put back to ensure consistency for update_after_evict
+            s3_small[victim_key] = 1
+            return victim_key
+
+    # 2. If Small is safe, evict from Main (LRU with Second Chance)
+    if s3_main:
+        # Give a Second Chance to high-frequency items in LRU position
+        # Check up to 4 candidates to avoid deep scans
+        for _ in range(4):
+            victim_key = next(iter(s3_main))
+            freq = s3_freq.get(victim_key, 0)
+
+            # If freq is decent (e.g. >= 2), give second chance
+            if freq >= 2:
+                s3_main.move_to_end(victim_key) # Move to MRU
+                s3_freq[victim_key] >>= 1       # Decay frequency
+            else:
+                return victim_key
+
+        # Fallback if all candidates had high freq
+        return next(iter(s3_main))
+
+    # Fallback (should be covered)
+    if s3_small:
+        return next(iter(s3_small))
+    return None
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On Insert:
+    - Ghost Hit: Restore freq, Promote to Main.
+    - New: Insert to Small (Probation).
+    '''
+    _reset_state(cache_snapshot)
+    key = obj.key
+
+    if key in s3_ghost:
+        # Restore frequency
+        restored_freq = s3_ghost.pop(key)
+        s3_freq[key] = restored_freq
+        # Promote to Main immediately
+        s3_main[key] = 1
+        s3_main.move_to_end(key)
+    else:
+        # New Item -> Small
+        s3_small[key] = 1
+        s3_freq[key] = 0
+=======
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On Insert:
+    - Ghost Hit: Restore freq (decayed), Promote to Main.
+    - New: Insert to Small (Probation).
+    '''
+    _reset_state(cache_snapshot)
+    key = obj.key
+
+    if key in s3_ghost:
+        # Restore frequency with decay to prevent stale dominance
+        restored_freq = s3_ghost.pop(key)
+        s3_freq[key] = max(0, restored_freq // 2)
+        # Promote to Main immediately
+        s3_main[key] = 1
+        s3_main.move_to_end(key)
+    else:
+        # New Item -> Small
+        s3_small[key] = 1
+        s3_freq[key] = 0
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Maintain Ghost size
+    if len(s3_ghost) > capacity:
+        s3_ghost.popitem(last=False) # Remove oldest ghost
+=======
+    # Maintain Ghost size
+    ghost_target = s3_config.get('ghost_target', capacity)
+    if len(s3_ghost) > ghost_target:
+        s3_ghost.popitem(last=False) # Remove oldest ghost
+>>>>>>> REPLACE
+</DIFF>

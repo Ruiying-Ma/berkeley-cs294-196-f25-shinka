@@ -1,0 +1,294 @@
+# EVOLVE-BLOCK-START
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+
+# HeatGuard SLRU-F:
+# - Two live segments: probation (recent, unproven) and protected (reused/frequent).
+# - Eviction chooses the minimum "heat" item from a segment selected via adaptive quota.
+# - Heat = segment-aware blend of decayed LFU score and age.
+# - Ghost feedback (ARC-like) adapts protected target size.
+# - Admission guard: seed new items based on ghost info and last victim's merit to curb pollution.
+
+from math import pow
+
+# Timestamps and membership
+m_ts = dict()                 # key -> last access timestamp
+m_probation = set()           # probation members
+m_protected = set()           # protected members
+
+# Decayed LFU (lazy per-key)
+m_freq = dict()               # key -> decayed score
+m_freq_ts = dict()            # key -> last score update time
+m_half_life = None            # decay half-life (in accesses)
+
+# Ghosts and adaptation
+m_ghost_probation = dict()    # key -> last eviction time from probation
+m_ghost_protected = dict()    # key -> last eviction time from protected
+m_target_protected = None     # desired protected size
+m_last_capacity = None        # remember last seen capacity
+m_adjust_step = 1             # step for adapting target size
+
+# Admission guard
+m_last_victim_score = 0.0     # decayed score of last evicted victim
+
+
+def _ensure_params(cache_snapshot):
+    global m_last_capacity, m_target_protected, m_half_life, m_adjust_step
+    cap = cache_snapshot.capacity or max(len(cache_snapshot.cache), 1)
+    if cap <= 0:
+        cap = max(len(cache_snapshot.cache), 1)
+    if m_last_capacity != cap or m_target_protected is None:
+        m_last_capacity = cap
+        m_target_protected = max(1, int(0.5 * cap))
+        m_half_life = max(20, int(1.5 * cap))  # decay horizon tied to capacity
+        m_adjust_step = max(1, cap // 32)
+
+
+def _trim_ghosts(capacity):
+    global m_ghost_probation, m_ghost_protected
+    def trim(ghost):
+        if len(ghost) <= capacity:
+            return
+        over = len(ghost) - capacity
+        # Remove oldest ghosts
+        for _ in range(over):
+            kmin = min(ghost, key=lambda k: ghost[k])
+            ghost.pop(kmin, None)
+    trim(m_ghost_probation)
+    trim(m_ghost_protected)
+
+
+def _decayed_score(key, now):
+    # Lazily apply exponential decay: s *= 0.5 ** (dt / half_life)
+    s = m_freq.get(key, 0.0)
+    t = m_freq_ts.get(key, now)
+    dt = now - t
+    if dt > 0 and m_half_life and m_half_life > 0:
+        # Use pow for fractional exponents
+        decay = pow(0.5, dt / float(m_half_life))
+        s *= decay
+    return s
+
+
+def _set_score(key, score, now):
+    m_freq[key] = score
+    m_freq_ts[key] = now
+
+
+def _heat(key, seg, now, cap):
+    # Compute keep-heat; eviction removes the minimum heat.
+    score = _decayed_score(key, now)
+    age = now - m_ts.get(key, now)
+    lam = 1.0 / max(1, cap)
+    if seg == 'prob':
+        # Emphasize recency; small credit for score
+        return 0.6 * score - 1.2 * lam * age
+    else:
+        # Protected: emphasize frequency; still consider recency
+        return 1.2 * score - 0.6 * lam * age
+
+
+def _clean_metadata(keys_in_cache):
+    # Keep our structures aligned with the real cache
+    if m_probation:
+        m_probation.intersection_update(keys_in_cache)
+    if m_protected:
+        m_protected.intersection_update(keys_in_cache)
+    for k in list(m_ts.keys()):
+        if k not in keys_in_cache:
+            m_ts.pop(k, None)
+            m_probation.discard(k)
+            m_protected.discard(k)
+            m_freq.pop(k, None)
+            m_freq_ts.pop(k, None)
+
+
+def _demote_until_quota(now):
+    # Demote coldest protected until quota satisfied
+    cap = m_last_capacity or 1
+    while m_target_protected is not None and len(m_protected) > m_target_protected and m_protected:
+        # Pick the coldest by heat among protected for demotion
+        dk = min(m_protected, key=lambda k: (_heat(k, 'prot', now, cap), m_ts.get(k, -1)))
+        m_protected.discard(dk)
+        m_probation.add(dk)
+
+
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    global m_ts, m_probation, m_protected
+    _ensure_params(cache_snapshot)
+
+    keys_in_cache = set(cache_snapshot.cache.keys())
+    _clean_metadata(keys_in_cache)
+
+    now = cache_snapshot.access_count
+    cap = m_last_capacity or max(len(cache_snapshot.cache), 1)
+
+    probation_candidates = m_probation & keys_in_cache
+    protected_candidates = m_protected & keys_in_cache
+
+    # Choose source segment using adaptive quota (ARC-like)
+    target_probation = max(0, cap - (m_target_protected or 0))
+    choose_probation = bool(probation_candidates) and (len(probation_candidates) > target_probation or not protected_candidates)
+
+    if choose_probation and probation_candidates:
+        return min(probation_candidates, key=lambda k: (_heat(k, 'prob', now, cap), m_ts.get(k, -1)))
+    if protected_candidates:
+        return min(protected_candidates, key=lambda k: (_heat(k, 'prot', now, cap), m_ts.get(k, -1)))
+
+    # Fallback: global coldest
+    if keys_in_cache:
+        # If segmentation isn't available yet, use probation-like heat
+        return min(keys_in_cache, key=lambda k: (_heat(k, 'prob', now, cap), m_ts.get(k, -1)))
+    return None
+
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_ts, m_probation, m_protected, m_target_protected
+    _ensure_params(cache_snapshot)
+    now = cache_snapshot.access_count
+    key = obj.key
+
+    # Update recency
+    m_ts[key] = now
+
+    # Increase decayed frequency lazily
+    s = _decayed_score(key, now) + 1.0
+    _set_score(key, s, now)
+
+    # Promote if in probation; otherwise ensure protected membership exists
+    if key in m_probation:
+        m_probation.discard(key)
+        m_protected.add(key)
+        # Reward successful reuse by nudging protected target upward
+        cap = m_last_capacity or 1
+        m_target_protected = min(cap, max(1, m_target_protected + m_adjust_step))
+    elif key not in m_protected:
+        # If metadata missing (shouldn't happen on hit), give it protection
+        m_protected.add(key)
+
+    # Enforce protected quota via demotion of coldest protected
+    _demote_until_quota(now)
+
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_ts, m_probation, m_protected, m_ghost_probation, m_ghost_protected, m_target_protected, m_last_victim_score
+    _ensure_params(cache_snapshot)
+    now = cache_snapshot.access_count
+    key = obj.key
+    cap = m_last_capacity or 1
+
+    # Ghost-based adaptation and seeding
+    was_gp = key in m_ghost_probation
+    was_gr = key in m_ghost_protected
+
+    if was_gp:
+        # Favor recency
+        m_target_protected = max(1, m_target_protected - m_adjust_step)
+        m_ghost_probation.pop(key, None)
+    elif was_gr:
+        # Favor frequency
+        m_target_protected = min(cap, m_target_protected + m_adjust_step)
+        m_ghost_protected.pop(key, None)
+
+    # Insert into probation
+    m_ts[key] = now
+    m_protected.discard(key)
+    m_probation.add(key)
+
+    # Admission guard: base score depends on ghost status and last victim merit
+    base = 0.05
+    if was_gr:
+        base = max(base, 1.4)
+    elif was_gp:
+        base = max(base, 0.6)
+    else:
+        # If we just evicted a strong item, down-seed newcomers
+        if m_last_victim_score > 2.0:
+            base = 0.0
+    _set_score(key, base, now)
+
+    # Enforce target on protected
+    _demote_until_quota(now)
+
+    # Keep ghost lists bounded
+    _trim_ghosts(cap)
+
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    global m_ts, m_probation, m_protected, m_ghost_probation, m_ghost_protected, m_freq, m_freq_ts, m_last_victim_score
+    _ensure_params(cache_snapshot)
+    evk = evicted_obj.key
+    now = cache_snapshot.access_count
+    cap = m_last_capacity or 1
+
+    # Compute victim's merit before removal
+    victim_score = _decayed_score(evk, now)
+    m_last_victim_score = victim_score
+
+    # Determine segment and record ghost
+    if evk in m_protected:
+        m_ghost_protected[evk] = now
+    else:
+        # Unknown or probation treated as probation ghost
+        m_ghost_probation[evk] = now
+
+    # Purge all metadata
+    m_ts.pop(evk, None)
+    m_probation.discard(evk)
+    m_protected.discard(evk)
+    m_freq.pop(evk, None)
+    m_freq_ts.pop(evk, None)
+
+    # Trim ghosts
+    _trim_ghosts(cap)
+
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

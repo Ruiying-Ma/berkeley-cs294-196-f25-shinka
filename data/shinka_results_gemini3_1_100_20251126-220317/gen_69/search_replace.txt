@@ -1,0 +1,48 @@
+<NAME>
+slower_aging
+</NAME>
+
+<DESCRIPTION>
+Increase the frequency aging interval from 5x to 10x the cache capacity in both `update_after_hit` and `update_after_insert`. By slowing down the decay of the frequency sketch, the algorithm retains historical popularity information for a longer period. This aligns with the expert recommendation to reinforce the cache's ability to "lock on" to high-value items (rigidity) and resist churn from transient scans or loops, while the existing low saturation cap (15) prevents the counters from running away.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Aging (Frequency Halving)
+    if algo_state['access_count'] >= cache_snapshot.capacity * 5:
+        to_rem = []
+        for k in f:
+            f[k] //= 2
+            if f[k] == 0: to_rem.append(k)
+        for k in to_rem: del f[k]
+        algo_state['access_count'] = 0
+=======
+    # Aging (Frequency Halving)
+    if algo_state['access_count'] >= cache_snapshot.capacity * 10:
+        to_rem = []
+        for k in f:
+            f[k] //= 2
+            if f[k] == 0: to_rem.append(k)
+        for k in to_rem: del f[k]
+        algo_state['access_count'] = 0
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Aging
+    if algo_state['access_count'] >= cache_snapshot.capacity * 5:
+        to_rem = []
+        for k in f:
+            f[k] //= 2
+            if f[k] == 0: to_rem.append(k)
+        for k in to_rem: del f[k]
+        algo_state['access_count'] = 0
+=======
+    # Aging
+    if algo_state['access_count'] >= cache_snapshot.capacity * 10:
+        to_rem = []
+        for k in f:
+            f[k] //= 2
+            if f[k] == 0: to_rem.append(k)
+        for k in to_rem: del f[k]
+        algo_state['access_count'] = 0
+>>>>>>> REPLACE
+</DIFF>

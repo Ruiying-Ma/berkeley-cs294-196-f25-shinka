@@ -1,0 +1,156 @@
+<NAME>
+segment_aware_duel_and_dk_tuning
+</NAME>
+
+<DESCRIPTION>
+1.  **Segment-Aware Duel**: The eviction policy now distinguishes between victims from the **Probation** segment and the **Protected** segment of the Main cache.
+    -   If the victim is from **Probation**, the policy is more permissive to new items from the Window: if the Window candidate has a frequency equal to or greater than the Probation victim (`fw >= fm`), the Probation victim is evicted. This facilitates turnover and allows new potentially popular items to establish themselves.
+    -   If the victim is from **Protected**, the policy is conservative: the Window candidate must have a strictly higher frequency (`fw > fm`) to displace the Protected item. This stabilizes the core working set.
+    -   This removes the global `+1` bias which was overly protective for Probation items.
+2.  **Doorkeeper Tuning**: The Doorkeeper reset threshold is increased from `2 * capacity` to `5 * capacity`. This reduces the frequency of resets, allowing the filter to maintain "seen once" information for longer periods, which is beneficial for handling larger scans and preventing one-hit wonders from polluting the frequency sketch too easily.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def _update_freq(key, capacity):
+    state = algo_state
+
+    # Aging Mechanism
+    state['aging_counter'] += 1
+    # Age frequencies every 5x capacity to adapt to phase changes
+    if state['aging_counter'] >= capacity * 5:
+        state['aging_counter'] = 0
+        # Halve frequencies
+        rem = []
+        for k, v in state['freq'].items():
+            nv = v // 2
+            if nv == 0: rem.append(k)
+            else: state['freq'][k] = nv
+        for k in rem: del state['freq'][k]
+
+    # Doorkeeper Management
+    # Reset Doorkeeper when it grows too large to maintain filter effectiveness
+    if len(state['doorkeeper']) > capacity * 2:
+        state['doorkeeper'].clear()
+
+    # Frequency Update
+=======
+def _update_freq(key, capacity):
+    state = algo_state
+
+    # Aging Mechanism
+    state['aging_counter'] += 1
+    # Age frequencies every 5x capacity to adapt to phase changes
+    if state['aging_counter'] >= capacity * 5:
+        state['aging_counter'] = 0
+        # Halve frequencies
+        rem = []
+        for k, v in state['freq'].items():
+            nv = v // 2
+            if nv == 0: rem.append(k)
+            else: state['freq'][k] = nv
+        for k in rem: del state['freq'][k]
+
+    # Doorkeeper Management
+    # Reset Doorkeeper when it grows too large to maintain filter effectiveness
+    # Increased to 5x to prevent forgetting recent one-hit wonders too quickly
+    if len(state['doorkeeper']) > capacity * 5:
+        state['doorkeeper'].clear()
+
+    # Frequency Update
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    _check_reset(cache_snapshot)
+    state = algo_state
+    capacity = cache_snapshot.capacity
+    w_cap = max(1, int(capacity * 0.01))
+
+    # Identify Candidates (LRU is at the beginning of OrderedDict)
+    cand_w_key = next(iter(state['window'])) if state['window'] else None
+    cand_m_key = None
+    if state['probation']:
+        cand_m_key = next(iter(state['probation']))
+    elif state['protected']:
+        cand_m_key = next(iter(state['protected']))
+
+    # Fail-safe
+    if cand_w_key is None and cand_m_key is None:
+        return None
+    if cand_w_key is None:
+        return cand_m_key
+    if cand_m_key is None:
+        return cand_w_key
+
+    fw = _get_freq(cand_w_key)
+    fm = _get_freq(cand_m_key)
+
+    # 1. Window Growing Phase
+    # Ideally, we evict Main to let Window grow.
+    # Exception: If Main victim is valuable (fm > fw), sacrifice Window instead.
+    if state['w_size'] < w_cap:
+        if fm > fw:
+            return cand_w_key
+        return cand_m_key
+
+    # 2. Window Full - Duel
+    # Bias towards Main: Evict Window unless Window candidate is strictly better + bias.
+    # This protects established Main items from churn.
+    if fw > fm + 1:
+        return cand_m_key
+    else:
+        return cand_w_key
+=======
+def evict(cache_snapshot, obj):
+    _check_reset(cache_snapshot)
+    state = algo_state
+    capacity = cache_snapshot.capacity
+    w_cap = max(1, int(capacity * 0.01))
+
+    # Identify Candidates (LRU is at the beginning of OrderedDict)
+    cand_w_key = next(iter(state['window'])) if state['window'] else None
+
+    cand_m_key = None
+    is_probation = False
+    if state['probation']:
+        cand_m_key = next(iter(state['probation']))
+        is_probation = True
+    elif state['protected']:
+        cand_m_key = next(iter(state['protected']))
+        is_probation = False
+
+    # Fail-safe
+    if cand_w_key is None and cand_m_key is None:
+        return None
+    if cand_w_key is None:
+        return cand_m_key
+    if cand_m_key is None:
+        return cand_w_key
+
+    fw = _get_freq(cand_w_key)
+    fm = _get_freq(cand_m_key)
+
+    # 1. Window Growing Phase
+    # Ideally, we evict Main to let Window grow.
+    # Exception: If Main victim is valuable (fm > fw), sacrifice Window instead.
+    if state['w_size'] < w_cap:
+        if fm > fw:
+            return cand_w_key
+        return cand_m_key
+
+    # 2. Window Full - Duel
+    # Segment-Aware Duel:
+    # If Victim is Probation: Allow turnover. If Window is at least as good (fw >= fm), evict Probation.
+    # If Victim is Protected: Be conservative. Only evict if Window is strictly better (fw > fm).
+    if is_probation:
+        if fw >= fm:
+            return cand_m_key
+        else:
+            return cand_w_key
+    else:
+        if fw > fm:
+            return cand_m_key
+        else:
+            return cand_w_key
+>>>>>>> REPLACE
+</DIFF>

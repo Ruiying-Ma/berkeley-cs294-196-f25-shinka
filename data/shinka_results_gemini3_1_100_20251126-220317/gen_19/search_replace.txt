@@ -1,0 +1,317 @@
+The user wants to improve the cache eviction algorithm to maximize the hit rate across 48 traces.
+The current best-performing algorithms (W-TinyLFU, ARC) have a score around 0.25.
+A significant weakness in previous implementations (especially ARC) was the performance on traces 14-19 (hit rate ~0.0), which are likely scan or loop traces larger than the cache.
+LIRS (Low Inter-reference Recency Set) is a state-of-the-art algorithm known for its robustness against scans and loops (using IRR - Inter-Reference Recency) while maintaining high hit rates on LRU-friendly workloads. It uses a stack `S` to track history and a queue `Q` for resident HIR (High IRR) items.
+
+I will replace the current W-TinyLFU implementation with a LIRS implementation.
+
+Key components of the LIRS implementation:
+1.  **Stack S**: Tracks LIR (hot) and HIR (cold/test) blocks with their recency. Implemented as an `OrderedDict` where keys map to status ('LIR' or 'HIR').
+2.  **Queue Q**: Tracks resident HIR blocks for eviction candidates. Implemented as an `OrderedDict`.
+3.  **Non-resident Set**: Tracks keys that are in Stack S (for history/IRR calculation) but not in the cache.
+4.  **Pruning**: The `_prune_stack` helper removes HIR blocks from the bottom of S, ensuring the bottom is always a LIR block (crucial for LIRS correctness).
+5.  **LIR Capacity**: Set to 99% of cache capacity (allowing 1% for HIR blocks in Q). This maximizes the "hot" set while keeping a small window for new items to prove themselves.
+
+This implementation should improve performance on the problematic scan traces while maintaining good performance on others.
+
+<NAME>
+lirs_implementation
+</NAME>
+
+<DESCRIPTION>
+Implementing the LIRS (Low Inter-reference Recency Set) cache eviction algorithm. LIRS effectively addresses the shortcomings of LRU by separating the cache into a large "LIR" (Low IRR) set for hot items and a small "HIR" (High IRR) set for cold items/scans. It uses a stack S to track history and IRR, and a queue Q for resident HIR items. This should improve performance on loop and scan traces (Trace 14-19) while maintaining high hit rates on others.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+from collections import OrderedDict
+
+# W-TinyLFU inspired State
+algo_state = {
+    'window': OrderedDict(),    # Window Cache (SLRU or LRU)
+    'probation': OrderedDict(), # Main Cache - Probation (SLRU)
+    'protected': OrderedDict(), # Main Cache - Protected (SLRU)
+    'freq': {},                 # Frequency Counter
+    'freq_count': 0,            # Total increments for reset
+    'max_time': 0
+}
+
+def _check_reset(current_time):
+    if current_time < algo_state['max_time']:
+        algo_state['window'].clear()
+        algo_state['probation'].clear()
+        algo_state['protected'].clear()
+        algo_state['freq'].clear()
+        algo_state['freq_count'] = 0
+        algo_state['max_time'] = 0
+    algo_state['max_time'] = current_time
+
+def evict(cache_snapshot, obj):
+    '''
+    W-TinyLFU Eviction Logic
+    '''
+    window = algo_state['window']
+    probation = algo_state['probation']
+    protected = algo_state['protected']
+    freq = algo_state['freq']
+
+    capacity = cache_snapshot.capacity
+    w_cap = max(1, int(capacity * 0.05)) # 5% Window
+
+    # Candidates
+    candidate_w = next(iter(window)) if window else None
+
+    # Main Candidate: Probation LRU, else Protected LRU
+    candidate_m = None
+    if probation:
+        candidate_m = next(iter(probation))
+    elif protected:
+        candidate_m = next(iter(protected))
+
+    victim = None
+
+    # 1. If Window needs space (is below target), grow it by evicting Main
+    # (Unless Main is empty, then evict Window)
+    if len(window) < w_cap and candidate_m:
+        victim = candidate_m
+    elif not candidate_m:
+        victim = candidate_w
+    elif not candidate_w:
+        victim = candidate_m
+    else:
+        # 2. Window is full. Duel.
+        # Compare frequency
+        fw = freq.get(candidate_w, 0)
+        fm = freq.get(candidate_m, 0)
+
+        # Tie-breaker: Prefer Main (Incumbent) -> Evict Window
+        # This provides scan and loop resistance
+        if fw > fm:
+            victim = candidate_m
+        else:
+            victim = candidate_w
+
+    return victim
+
+def update_after_hit(cache_snapshot, obj):
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+    window = algo_state['window']
+    probation = algo_state['probation']
+    protected = algo_state['protected']
+    freq = algo_state['freq']
+
+    # Frequency
+    freq[key] = freq.get(key, 0) + 1
+    algo_state['freq_count'] += 1
+    if algo_state['freq_count'] >= cache_snapshot.capacity * 10:
+        to_remove = []
+        for k in freq:
+            freq[k] //= 2
+            if freq[k] == 0: to_remove.append(k)
+        for k in to_remove: del freq[k]
+        algo_state['freq_count'] = 0
+
+    # Cache Maintenance
+    if key in window:
+        window.move_to_end(key)
+    elif key in protected:
+        protected.move_to_end(key)
+    elif key in probation:
+        # Promote
+        del probation[key]
+        protected[key] = None
+
+        # Enforce Protected Limit
+        w_cap = max(1, int(cache_snapshot.capacity * 0.05))
+        m_cap = cache_snapshot.capacity - w_cap
+        p_cap = int(m_cap * 0.8) # 80% of Main
+
+        while len(protected) > p_cap:
+            k, _ = protected.popitem(last=False)
+            probation[k] = None # Move to Probation MRU
+            probation.move_to_end(k)
+
+def update_after_insert(cache_snapshot, obj):
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+    freq = algo_state['freq']
+
+    # Frequency
+    freq[key] = freq.get(key, 0) + 1
+    algo_state['freq_count'] += 1
+    if algo_state['freq_count'] >= cache_snapshot.capacity * 10:
+        to_remove = []
+        for k in freq:
+            freq[k] //= 2
+            if freq[k] == 0: to_remove.append(k)
+        for k in to_remove: del freq[k]
+        algo_state['freq_count'] = 0
+
+    # Insert to Window MRU
+    algo_state['window'][key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    v_key = evicted_obj.key
+    window = algo_state['window']
+    probation = algo_state['probation']
+    protected = algo_state['protected']
+
+    if v_key in window:
+        del window[v_key]
+    elif v_key in probation:
+        del probation[v_key]
+    elif v_key in protected:
+        del protected[v_key]
+
+    # Check for Window promotion
+    # If we evicted Main, and Window is now > Cap (it wasn't evicted), move Window LRU to Probation
+    w_cap = max(1, int(cache_snapshot.capacity * 0.05))
+    if len(window) > w_cap:
+        k, _ = window.popitem(last=False)
+        probation[k] = None # To Probation MRU
+        probation.move_to_end(k)
+=======
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+from collections import OrderedDict
+
+# LIRS State
+algo_state = {
+    'S': OrderedDict(),       # Stack S: Key -> Type ('LIR' or 'HIR')
+    'Q': OrderedDict(),       # Queue Q: Key -> None (Resident HIR)
+    'non_resident': set(),    # Set of keys in S but not in cache (Non-resident HIR)
+    'LIR_count': 0,           # Number of LIR entries
+    'max_time': 0
+}
+
+def _check_reset(current_time):
+    if current_time < algo_state['max_time']:
+        algo_state['S'].clear()
+        algo_state['Q'].clear()
+        algo_state['non_resident'].clear()
+        algo_state['LIR_count'] = 0
+        algo_state['max_time'] = 0
+    algo_state['max_time'] = current_time
+
+def _prune_stack():
+    S = algo_state['S']
+    nr = algo_state['non_resident']
+    # Remove HIRs from bottom of S
+    while S:
+        k, status = next(iter(S.items()))
+        if status == 'LIR':
+            break
+        # It's HIR.
+        if k in nr:
+            nr.remove(k)
+        S.popitem(last=False) # Remove from bottom
+
+def evict(cache_snapshot, obj):
+    '''
+    LIRS Eviction:
+    Evict from Q (Resident HIR).
+    If Q empty, evict from LIR (demote first).
+    '''
+    Q = algo_state['Q']
+    S = algo_state['S']
+
+    victim = None
+    if Q:
+        victim = next(iter(Q))
+    else:
+        # Q is empty, evict bottom LIR
+        if S:
+            victim, _ = next(iter(S.items()))
+
+    return victim
+
+def update_after_hit(cache_snapshot, obj):
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+    S = algo_state['S']
+    Q = algo_state['Q']
+
+    # Check if in Q (Resident HIR)
+    if key in Q:
+        # Resident HIR
+        if key in S:
+            # Hot HIR -> Promote to LIR
+            del Q[key]
+            S.move_to_end(key)
+            S[key] = 'LIR'
+            algo_state['LIR_count'] += 1
+
+            # Enforce LIR capacity
+            target_lir = max(1, int(cache_snapshot.capacity * 0.99))
+            if algo_state['LIR_count'] > target_lir:
+                 _prune_stack()
+                 if S:
+                     k, status = next(iter(S.items()))
+                     if status == 'LIR':
+                         S[k] = 'HIR'
+                         Q[k] = None
+                         algo_state['LIR_count'] -= 1
+                         _prune_stack()
+        else:
+            # Cold HIR -> Update recency, stays HIR
+            S[key] = 'HIR'
+            Q.move_to_end(key)
+    else:
+        # LIR hit
+        if key in S:
+            S.move_to_end(key)
+            _prune_stack()
+        else:
+            # Should be in S if LIR. Edge case recovery.
+            S[key] = 'LIR'
+            S.move_to_end(key)
+
+def update_after_insert(cache_snapshot, obj):
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+    S = algo_state['S']
+    Q = algo_state['Q']
+    nr = algo_state['non_resident']
+
+    if key in S:
+        # Was Non-Resident HIR -> Promote to LIR
+        if key in nr: nr.remove(key)
+
+        S.move_to_end(key)
+        S[key] = 'LIR'
+        algo_state['LIR_count'] += 1
+
+        target_lir = max(1, int(cache_snapshot.capacity * 0.99))
+        if algo_state['LIR_count'] > target_lir:
+             _prune_stack()
+             if S:
+                 k, status = next(iter(S.items()))
+                 if status == 'LIR':
+                     S[k] = 'HIR'
+                     Q[k] = None
+                     algo_state['LIR_count'] -= 1
+                     _prune_stack()
+    else:
+        # New item -> Resident HIR
+        S[key] = 'HIR'
+        Q[key] = None # Insert at end (MRU) of Q
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    v_key = evicted_obj.key
+    S = algo_state['S']
+    Q = algo_state['Q']
+    nr = algo_state['non_resident']
+
+    if v_key in Q:
+        del Q[v_key]
+
+    if v_key in S:
+        if S[v_key] == 'LIR':
+             algo_state['LIR_count'] -= 1
+        S[v_key] = 'HIR'
+        nr.add(v_key)
+        _prune_stack()
+>>>>>>> REPLACE
+
+</DIFF>

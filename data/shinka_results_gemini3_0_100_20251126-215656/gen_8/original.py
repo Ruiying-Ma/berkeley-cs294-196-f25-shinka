@@ -1,0 +1,103 @@
+# EVOLVE-BLOCK-START
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+
+m_key_timestamp = dict()
+m_key_frequency = dict()
+
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    Uses Hyperbolic Caching: Score = Frequency / (CurrentTime - LastAccessTime).
+    Evicts the object with the lowest score.
+    '''
+    current_time = cache_snapshot.access_count
+
+    # Find key with minimum hyperbolic score
+    # We compare f1/a1 < f2/a2 <=> f1*a2 < f2*a1 to avoid division and floats
+
+    min_key = None
+    min_freq = -1
+    min_age = -1
+
+    for key in cache_snapshot.cache:
+        # Safety check, though keys in cache should be in m_key_timestamp
+        if key not in m_key_timestamp: continue
+
+        freq = m_key_frequency.get(key, 1)
+        last_access = m_key_timestamp[key]
+        age = current_time - last_access
+        if age <= 0: age = 1
+
+        if min_key is None:
+            min_key = key
+            min_freq = freq
+            min_age = age
+        else:
+            # Compare current (freq, age) with min (min_freq, min_age)
+            # freq / age < min_freq / min_age  <=> freq * min_age < min_freq * age
+            val1 = freq * min_age
+            val2 = min_freq * age
+
+            if val1 < val2:
+                min_key = key
+                min_freq = freq
+                min_age = age
+            elif val1 == val2:
+                # Tie-breaker: LRU (oldest timestamp => largest age)
+                if age > min_age:
+                    min_key = key
+                    min_freq = freq
+                    min_age = age
+
+    return min_key
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    Update metadata after hit: update timestamp and increment frequency.
+    '''
+    global m_key_timestamp, m_key_frequency
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+    m_key_frequency[obj.key] = m_key_frequency.get(obj.key, 0) + 1
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Update metadata after insert: set timestamp, init or increment frequency (Ghost).
+    '''
+    global m_key_timestamp, m_key_frequency
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+    # Keep frequency history if available (Ghost Cache behavior)
+    if obj.key in m_key_frequency:
+        m_key_frequency[obj.key] += 1
+    else:
+        m_key_frequency[obj.key] = 1
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Update metadata after evict: remove timestamp, keep frequency.
+    '''
+    global m_key_timestamp
+    if evicted_obj.key in m_key_timestamp:
+        m_key_timestamp.pop(evicted_obj.key)
+    # We purposefully do NOT remove from m_key_frequency to retain history
+
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

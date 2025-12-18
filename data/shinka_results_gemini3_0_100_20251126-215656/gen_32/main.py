@@ -1,0 +1,172 @@
+# EVOLVE-BLOCK-START
+"""
+Dynamic S3-FIFO (DynS3FIFO)
+An enhanced S3-FIFO algorithm with dynamic partition sizing (ARC-like adaptation).
+Features:
+1. Two queues: Small (S) and Main (M).
+2. Ghost registries for both queues to track evicted items.
+3. Dynamic S-queue sizing based on ghost hits (marginal utility).
+4. Strict promotion: S -> M only on eviction + access bit.
+5. Large ghost history (2x capacity) to catch larger loops.
+"""
+
+from collections import OrderedDict
+
+# Global State
+small_q = OrderedDict()       # Probationary queue (FIFO)
+main_q = OrderedDict()        # Protected queue (FIFO)
+ghost_s = OrderedDict()       # Ghost S (History of S evictions)
+ghost_m = OrderedDict()       # Ghost M (History of M evictions)
+freq_map = {}                 # Frequency map for hits
+demoted_set = set()           # Tracks items demoted M->S
+s_dist = 0.1                  # Target fraction for S queue
+last_access_count = 0         # For detecting trace changes
+
+def check_reset(cache_snapshot):
+    """Detects new trace and resets globals."""
+    global small_q, main_q, ghost_s, ghost_m, freq_map, demoted_set, s_dist, last_access_count
+
+    current_acc = cache_snapshot.access_count
+    if current_acc < last_access_count or (len(cache_snapshot.cache) <= 1 and len(small_q) > 1):
+        small_q.clear()
+        main_q.clear()
+        ghost_s.clear()
+        ghost_m.clear()
+        freq_map.clear()
+        demoted_set.clear()
+        s_dist = 0.1
+        last_access_count = 0
+
+    last_access_count = current_acc
+
+def evict(cache_snapshot, obj):
+    '''
+    Selects a victim using Frequency-Based S3-FIFO with Demotion and Persistent Frequency.
+    - Demotes cold M items to S.
+    - Maintains frequency in ghosts to identify recurring patterns (loops).
+    '''
+    global s_dist
+
+    capacity = cache_snapshot.capacity
+    s_target = max(1, int(capacity * s_dist))
+    ghost_limit = max(capacity, int(2 * capacity))
+
+    while True:
+        # Prefer evicting from S if over target or M empty
+        evict_s = (len(small_q) > s_target) or (len(main_q) == 0)
+
+        if evict_s:
+            if not small_q:
+                evict_s = False
+            else:
+                key, _ = small_q.popitem(last=False)
+                cnt = freq_map.get(key, 0)
+
+                if cnt > 0:
+                    # Accessed in S -> Promote to Main
+                    freq_map[key] = 0
+                    main_q[key] = None
+                    demoted_set.discard(key)
+                else:
+                    # Cold in S -> Evict
+                    if key in demoted_set:
+                        ghost_m[key] = None
+                        if len(ghost_m) > ghost_limit:
+                            k, _ = ghost_m.popitem(last=False)
+                            if k in freq_map: del freq_map[k]
+                        demoted_set.discard(key)
+                    else:
+                        ghost_s[key] = None
+                        if len(ghost_s) > ghost_limit:
+                            k, _ = ghost_s.popitem(last=False)
+                            if k in freq_map: del freq_map[k]
+                    return key
+
+        if not evict_s:
+            if not main_q:
+                return next(iter(cache_snapshot.cache))
+
+            key, _ = main_q.popitem(last=False)
+            cnt = freq_map.get(key, 0)
+
+            if cnt > 0:
+                # Accessed in M -> Reinsert M
+                freq_map[key] = 0
+                main_q[key] = None
+            else:
+                # Cold in M -> Demote to S
+                freq_map[key] = 0
+                small_q[key] = None
+                demoted_set.add(key)
+                # Loop continues
+
+def update_after_hit(cache_snapshot, obj):
+    check_reset(cache_snapshot)
+    curr = freq_map.get(obj.key, 0)
+    freq_map[obj.key] = min(curr + 1, 10)
+
+def update_after_insert(cache_snapshot, obj):
+    check_reset(cache_snapshot)
+
+    global s_dist
+    key = obj.key
+    capacity = cache_snapshot.capacity
+
+    # Restore frequency if in ghost, else 0
+    if key in ghost_s or key in ghost_m:
+        freq_map[key] = freq_map.get(key, 0) + 1
+    else:
+        freq_map[key] = 0
+
+    demoted_set.discard(key)
+
+    delta = 1.0 / capacity if capacity > 0 else 0.01
+
+    if key in ghost_s:
+        # S too small
+        s_dist = min(0.9, s_dist + delta)
+        # Rescue to M
+        main_q[key] = None
+        del ghost_s[key]
+
+    elif key in ghost_m:
+        # M too small
+        s_dist = max(0.01, s_dist - delta)
+        # Rescue to M
+        main_q[key] = None
+        del ghost_m[key]
+
+    else:
+        # New -> Small
+        small_q[key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    key = evicted_obj.key
+    # Persist freq_map for ghosts
+    if key in demoted_set:
+        demoted_set.discard(key)
+    if key in small_q:
+        del small_q[key]
+    if key in main_q:
+        del main_q[key]
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

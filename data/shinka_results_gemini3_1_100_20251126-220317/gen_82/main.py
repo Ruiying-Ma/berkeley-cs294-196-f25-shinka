@@ -1,0 +1,222 @@
+# EVOLVE-BLOCK-START
+"""
+W-TinyLFU with Enhanced Incumbency Bias and Demotion Protection
+Improvements:
+1. Re-introduced "Probation Hits" logic (2 hits to promote from Probation) to filter weak items.
+2. Demoted items get "Second Chance" credit (immediate promotion eligibility) and strong bias in eviction.
+3. Window hits promote to Probation immediately (fast-track).
+4. Doorkeeper reset based on size, decoupled from aging.
+5. Frequency aging at 5x capacity.
+"""
+
+from collections import OrderedDict
+
+class WTinyLFUState:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        # Configuration
+        # 1% Window, but at least 1 slot
+        self.window_size = max(1, int(capacity * 0.01))
+        # SLRU Main Cache (99%) split 80% Protected, 20% Probation
+        self.protected_size = int((capacity - self.window_size) * 0.8)
+        
+        # Cache Segments
+        self.window = OrderedDict()
+        self.probation = OrderedDict()
+        self.protected = OrderedDict()
+        
+        # Metadata
+        self.freq = {}
+        self.doorkeeper = set()
+        self.probation_hits = set() # Items in probation that have been hit once
+        self.demoted = set()        # Items demoted from protected
+        
+        self.access_count = 0
+        
+        # Parameters
+        self.max_freq = 15
+        self.aging_interval = capacity * 5
+        self.doorkeeper_limit = max(1000, capacity * 2)
+
+    def get_freq(self, key):
+        count = self.freq.get(key, 0)
+        if key in self.doorkeeper:
+            count += 1
+        return count
+
+    def record_access(self, key):
+        self.access_count += 1
+        
+        # Doorkeeper & Frequency logic
+        if key not in self.doorkeeper:
+            self.doorkeeper.add(key)
+        else:
+            v = self.freq.get(key, 0)
+            if v < self.max_freq:
+                self.freq[key] = v + 1
+                
+        # Aging
+        if self.access_count % self.aging_interval == 0:
+            self.age()
+            
+        # Doorkeeper cleanup (Size-based)
+        if len(self.doorkeeper) > self.doorkeeper_limit:
+            self.doorkeeper.clear()
+
+    def age(self):
+        rem = []
+        for k in self.freq:
+            self.freq[k] //= 2
+            if self.freq[k] == 0:
+                rem.append(k)
+        for k in rem:
+            del self.freq[k]
+
+_states = {}
+
+def get_state(cache_snapshot):
+    cid = id(cache_snapshot.cache)
+    if cid not in _states:
+        _states[cid] = WTinyLFUState(cache_snapshot.capacity)
+    return _states[cid]
+
+def evict(cache_snapshot, obj):
+    state = get_state(cache_snapshot)
+    
+    # Consistency check
+    if not cache_snapshot.cache and (state.window or state.probation):
+        state.window.clear()
+        state.probation.clear()
+        state.protected.clear()
+        state.freq.clear()
+        state.doorkeeper.clear()
+        state.probation_hits.clear()
+        state.demoted.clear()
+
+    # Identify Candidates
+    w_victim = next(iter(state.window)) if state.window else None
+    
+    # If Window is empty, fallback (should be rare if cache is full)
+    if not w_victim:
+        return next(iter(cache_snapshot.cache))
+        
+    # If Main is empty, Window victim must go
+    if not state.probation and not state.protected:
+        return w_victim
+        
+    # Identify Main victim: Prefer Probation LRU
+    if state.probation:
+        p_victim = next(iter(state.probation))
+    else:
+        # Borrow from Protected if Probation is empty
+        p_victim = next(iter(state.protected))
+        
+    # Eviction Logic
+    # 1. Protect Window growth if it is small (steal from Main)
+    if len(state.window) < state.window_size:
+        return p_victim
+        
+    # 2. Duel: Window vs Main
+    freq_w = state.get_freq(w_victim)
+    freq_p = state.get_freq(p_victim)
+    
+    # Bias towards Main (Incumbency)
+    bias = 0
+    if p_victim in state.demoted:
+        bias = 5 # Strong protection for demoted items
+    elif p_victim in state.probation_hits:
+        bias = 1 # Moderate protection for items proving themselves
+        
+    # Window must be strictly better than (Main + bias) to evict Main
+    if freq_w > freq_p + bias:
+        return p_victim
+    else:
+        return w_victim
+
+def update_after_hit(cache_snapshot, obj):
+    state = get_state(cache_snapshot)
+    key = obj.key
+    state.record_access(key)
+    
+    if key in state.window:
+        # Hit in Window: Promote to Probation
+        del state.window[key]
+        state.probation[key] = True
+        
+    elif key in state.probation:
+        # Hit in Probation: Promote if threshold met (Probation Hit or Demoted)
+        if key in state.probation_hits or key in state.demoted:
+            del state.probation[key]
+            state.protected[key] = True
+            
+            # Cleanup metadata
+            if key in state.probation_hits:
+                state.probation_hits.remove(key)
+            if key in state.demoted:
+                state.demoted.remove(key)
+                
+            # Handle Protected Overflow
+            if len(state.protected) > state.protected_size:
+                victim, _ = state.protected.popitem(last=False)
+                state.probation[victim] = True
+                state.demoted.add(victim)
+                state.probation_hits.add(victim) # Grant credit for quick return
+                state.probation.move_to_end(victim)
+        else:
+            # First hit in Probation: Mark and move to MRU
+            state.probation_hits.add(key)
+            state.probation.move_to_end(key)
+            
+    elif key in state.protected:
+        state.protected.move_to_end(key)
+
+def update_after_insert(cache_snapshot, obj):
+    state = get_state(cache_snapshot)
+    key = obj.key
+    state.record_access(key)
+    
+    # New items always enter Window
+    state.window[key] = True
+    
+    # Balance segments if Window grew too large
+    # (Usually happens if Main was evicted to make room for Window insert)
+    if len(state.window) > state.window_size:
+        victim, _ = state.window.popitem(last=False)
+        state.probation[victim] = True
+        state.probation.move_to_end(victim)
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    state = get_state(cache_snapshot)
+    key = evicted_obj.key
+    
+    if key in state.window:
+        del state.window[key]
+    elif key in state.probation:
+        del state.probation[key]
+        if key in state.probation_hits:
+            state.probation_hits.remove(key)
+        if key in state.demoted:
+            state.demoted.remove(key)
+    elif key in state.protected:
+        del state.protected[key]
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

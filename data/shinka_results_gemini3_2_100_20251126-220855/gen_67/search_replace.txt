@@ -1,0 +1,108 @@
+<NAME>
+S3-FIFO-Resurrection
+</NAME>
+
+<DESCRIPTION>
+This update implements three key improvements to the S3-FIFO algorithm:
+1.  **Extended Ghost Registry**: Increases the ghost queue capacity to 3x the cache size (up from 1x). This allows the algorithm to track eviction history for larger working sets and loops that exceed the cache size.
+2.  **Full Eviction Tracking**: Routes evictions from the Main queue to the Ghost queue (previously only Small evictions were tracked). This allows "Second Chance" rescue for items that were in the protected segment but got evicted, which is beneficial for fluctuating working sets.
+3.  **Frequency Boosting on Rescue**: When an item is rescued from the Ghost queue, it is inserted into the Main queue with a frequency count of 1 (instead of 0). This gives rescued items an immediate buffer against eviction, distinguishing recurrent items (loops) from one-time scans. Frequency counters are preserved in the Ghost queue to support this.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Lazy cleanup of ghost
+    while len(s3_ghost) > capacity:
+        # Remove oldest item (head of dict)
+        s3_ghost.pop(next(iter(s3_ghost)))
+
+    while True:
+=======
+    # Extended Ghost Capacity: 3x cache size
+    g_capacity = int(capacity * 3)
+
+    # Lazy cleanup of ghost
+    while len(s3_ghost) > g_capacity:
+        # Remove oldest item (head of dict)
+        k = next(iter(s3_ghost))
+        s3_ghost.pop(k)
+        if k in s3_freq:
+            del s3_freq[k]
+
+    while True:
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On Insert:
+    - If in Ghost, insert to Main (rescue).
+    - Else, insert to Small.
+    '''
+    _check_reset(cache_snapshot)
+    global s3_small, s3_main, s3_ghost, s3_freq
+    key = obj.key
+    s3_freq[key] = 0
+
+    if key in s3_ghost:
+        s3_main[key] = None
+        s3_ghost.pop(key)
+    else:
+        s3_small[key] = None
+=======
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On Insert:
+    - If in Ghost, insert to Main (rescue) with frequency boost.
+    - Else, insert to Small.
+    '''
+    _check_reset(cache_snapshot)
+    global s3_small, s3_main, s3_ghost, s3_freq
+    key = obj.key
+
+    if key in s3_ghost:
+        s3_main[key] = None
+        s3_ghost.pop(key)
+        # Rescue with frequency boost (give it a second chance in Main)
+        s3_freq[key] = 1
+    else:
+        s3_small[key] = None
+        s3_freq[key] = 0
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    On Evict:
+    - Cleanup from queues.
+    - If evicted from Small, add to Ghost.
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+    key = evicted_obj.key
+
+    if key in s3_small:
+        s3_small.pop(key)
+        s3_ghost[key] = None
+    elif key in s3_main:
+        s3_main.pop(key)
+
+    if key in s3_freq:
+        s3_freq.pop(key)
+=======
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    On Evict:
+    - Cleanup from queues.
+    - If evicted from Small or Main, add to Ghost.
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+    key = evicted_obj.key
+
+    if key in s3_small:
+        s3_small.pop(key)
+        s3_ghost[key] = None
+    elif key in s3_main:
+        s3_main.pop(key)
+        s3_ghost[key] = None
+
+    # Frequency is preserved in s3_freq until evicted from Ghost
+>>>>>>> REPLACE
+</DIFF>

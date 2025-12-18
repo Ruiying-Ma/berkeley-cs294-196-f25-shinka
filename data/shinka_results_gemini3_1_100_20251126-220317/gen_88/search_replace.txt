@@ -1,0 +1,134 @@
+<NAME>
+segment_aware_eviction_fast_prom
+</NAME>
+
+<DESCRIPTION>
+1.  **Segment-Aware Eviction**: In `evict`, differentiate between victims from the `probation` and `protected` segments. Relax the eviction criteria for `probation` items (`fw > fm`) to allow fresher Window items to enter more easily, while maintaining strict protection for `protected` items (`fw > fm + 1`). This reduces churn for the core working set while increasing adaptability for the rest.
+2.  **Fast Promotion**: In `update_after_hit`, allow items in the `window` to be promoted directly to `protected` if their estimated frequency is high (>= 5). This utilizes the frequency sketch to identify returning heavy hitters and rescue them from the hazardous `window` and `probation` zones quickly.
+3.  **Refined Doorkeeper Reset**: In `_update_freq`, increase the Doorkeeper reset threshold from 2x to 4x capacity. This preserves "one-hit wonder" history longer, reducing false positives where recurring items are mistaken for new ones, without letting the filter grow unbounded.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Doorkeeper Management
+    if len(state['doorkeeper']) > capacity * 2:
+        state['doorkeeper'].clear()
+=======
+    # Doorkeeper Management
+    if len(state['doorkeeper']) > capacity * 4:
+        state['doorkeeper'].clear()
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Candidates
+    cand_w_key = next(iter(state['window'])) if state['window'] else None
+
+    cand_m_key = None
+    if state['probation']:
+        cand_m_key = next(iter(state['probation']))
+    elif state['protected']:
+        cand_m_key = next(iter(state['protected']))
+
+    # Fail-safe
+    if cand_w_key is None and cand_m_key is None: return None
+    if cand_w_key is None: return cand_m_key
+    if cand_m_key is None: return cand_w_key
+
+    fw = _get_freq(cand_w_key)
+    fm = _get_freq(cand_m_key)
+
+    # 1. Window Growing Logic
+    if state['window_size'] < w_cap:
+        # If Main victim is valuable (fm > fw), sacrifice Window instead.
+        if fm > fw:
+            return cand_w_key
+        return cand_m_key
+
+    # 2. Window Full - Duel
+    # Bias towards Main (Probation/Protected) to avoid churn.
+    if fw > fm + 1:
+        return cand_m_key
+    else:
+        return cand_w_key
+=======
+    # Candidates
+    cand_w_key = next(iter(state['window'])) if state['window'] else None
+
+    cand_m_key = None
+    victim_is_protected = False
+    if state['probation']:
+        cand_m_key = next(iter(state['probation']))
+    elif state['protected']:
+        cand_m_key = next(iter(state['protected']))
+        victim_is_protected = True
+
+    # Fail-safe
+    if cand_w_key is None and cand_m_key is None: return None
+    if cand_w_key is None: return cand_m_key
+    if cand_m_key is None: return cand_w_key
+
+    fw = _get_freq(cand_w_key)
+    fm = _get_freq(cand_m_key)
+
+    # 1. Window Growing Logic
+    if state['window_size'] < w_cap:
+        # If Main victim is valuable (fm > fw), sacrifice Window instead.
+        if fm > fw:
+            return cand_w_key
+        return cand_m_key
+
+    # 2. Window Full - Duel
+    # If victim is Protected, require significant difference to evict.
+    # If victim is Probation, require just better frequency.
+    diff = 1 if victim_is_protected else 0
+    if fw > fm + diff:
+        return cand_m_key
+    else:
+        return cand_w_key
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Position Update
+    if key in state['window']:
+        state['window'].move_to_end(key)
+    elif key in state['protected']:
+        state['protected'].move_to_end(key)
+    elif key in state['probation']:
+        # Promote Probation -> Protected
+        val = state['probation'].pop(key)
+        state['protected'][key] = val
+        state['protected_size'] += val
+
+        # Enforce Protected Limit (80% of Main)
+        limit = int(capacity * 0.8)
+        while state['protected_size'] > limit and state['protected']:
+            k, v = state['protected'].popitem(last=False)
+            state['protected_size'] -= v
+            state['probation'][k] = v
+            state['probation'].move_to_end(k)
+=======
+    # Position Update
+    if key in state['window']:
+        # Fast Promotion: If frequent enough, jump to Protected
+        if _get_freq(key) >= 5:
+            val = state['window'].pop(key)
+            state['window_size'] -= val
+            state['protected'][key] = val
+            state['protected_size'] += val
+        else:
+            state['window'].move_to_end(key)
+    elif key in state['protected']:
+        state['protected'].move_to_end(key)
+    elif key in state['probation']:
+        # Promote Probation -> Protected
+        val = state['probation'].pop(key)
+        state['protected'][key] = val
+        state['protected_size'] += val
+
+    # Enforce Protected Limit (80% of Main)
+    limit = int(capacity * 0.8)
+    while state['protected_size'] > limit and state['protected']:
+        k, v = state['protected'].popitem(last=False)
+        state['protected_size'] -= v
+        state['probation'][k] = v
+        state['probation'].move_to_end(k)
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,324 @@
+<NAME>
+tinylfu_dual_main_lexi_sampling_gated_promotions
+</NAME>
+
+<DESCRIPTION>
+I propose three targeted improvements:
+1) Lexicographic sampling on W1 and competitive victim selection across M1 and M2. Previously, W1 used plain LRU and M2 was only considered when M1 was empty. I switch W1 to frequency-aware tail sampling and allow replacing either M1 or M2 when the incoming object is clearly hotter, picking the colder candidate via a TinyLFU+recency comparator with a bias favoring M2 protection. This increases resilience to mixed workloads and better admits hot objects by displacing the coldest main candidate.
+
+2) Scan-aware gated promotions on hit. Promotions from W1→W2 and M1→M2 can pollute protected segments under scans. I add gating during cooldown: only promote when the TinyLFU estimate indicates heat (>=2), otherwise refresh in place. This reduces churn and protects hot sets.
+
+3) Early admission on miss with TinyLFU comparisons. Instead of always inserting into W1, I perform competitive admission: under normal conditions, admit directly to M1 or M2 when the TinyLFU estimate significantly beats the cold candidates; under scan cooldown, avoid M2 and allow M1 only if the item shows notable heat. I also make W2 demotions frequency-aware.
+
+These changes preserve the existing structure, improve selection decisions, and reduce miss spikes on scans without adding heavy overhead.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def choose_victim(self, cache_snapshot, new_obj) -> str:
+        self._ensure_capacity(cache_snapshot.capacity)
+        self._self_heal(cache_snapshot)
+
+        now = cache_snapshot.access_count
+        # Cool down scan bias gradually
+        if self.scan_cooldown > 0:
+            self.scan_cooldown -= 1
+
+        w_tgt, _, _, _ = self._targets()
+
+        # Candidate selection
+        cand_w1 = self._lru(self.W1)  # simple LRU for window probation
+        cand_m1 = self._sample_lru_cold(self.M1, now, bias=0)
+        cand_m2 = self._sample_lru_cold(self.M2, now, bias=1)  # bias protects M2
+
+        f_new = self.sketch.estimate(new_obj.key)
+        f_m1 = self.sketch.estimate(cand_m1) if cand_m1 is not None else -1
+        f_m2 = self.sketch.estimate(cand_m2) if cand_m2 is not None else -1
+
+        bias = 3 if self.scan_cooldown > 0 else 1
+
+        # Prefer replacing a cold M1 if the new item is clearly hotter
+        if cand_m1 is not None and f_new > (f_m1 + bias):
+            return cand_m1
+
+        # Otherwise protect main and evict from W1 when possible
+        if cand_w1 is not None and (len(self.W1) + len(self.W2)) > 0:
+            return cand_w1
+
+        # If window empty, consider M2 replacement only if new is much hotter
+        if cand_m2 is not None and f_new > (f_m2 + bias + 1):
+            return cand_m2
+
+        # Fallbacks to ensure progress
+        if self.M1:
+            return self._lru(self.M1)
+        if self.M2:
+            return self._lru(self.M2)
+        if self.W2:
+            return self._lru(self.W2)
+        return next(iter(cache_snapshot.cache))
+=======
+    def choose_victim(self, cache_snapshot, new_obj) -> str:
+        self._ensure_capacity(cache_snapshot.capacity)
+        self._self_heal(cache_snapshot)
+
+        now = cache_snapshot.access_count
+        # Cool down scan bias gradually
+        if self.scan_cooldown > 0:
+            self.scan_cooldown -= 1
+
+        # Candidate selection with frequency-aware tail sampling
+        cand_w1 = self._sample_lru_cold(self.W1, now, bias=0)
+        cand_m1 = self._sample_lru_cold(self.M1, now, bias=0)
+        cand_m2 = self._sample_lru_cold(self.M2, now, bias=1)  # bias protects M2
+
+        f_new = self.sketch.estimate(new_obj.key)
+        f_m1 = self.sketch.estimate(cand_m1) if cand_m1 is not None else -1
+        f_m2 = self.sketch.estimate(cand_m2) if cand_m2 is not None else -1
+
+        bias = 3 if self.scan_cooldown > 0 else 1
+
+        # Decide competitively against main segments
+        replace_m1 = (cand_m1 is not None) and (f_new >= (f_m1 + bias))
+        replace_m2 = (cand_m2 is not None) and (f_new >= (f_m2 + bias + 1))
+
+        if replace_m1 and replace_m2:
+            # Pick the colder of the two (lexicographic by TinyLFU+recency), with slight M2 protection via bias above
+            t_m1 = self._cold_tuple(cand_m1, now, bias=0)
+            t_m2 = self._cold_tuple(cand_m2, now, bias=1)
+            return cand_m2 if t_m2 < t_m1 else cand_m1
+        if replace_m1:
+            return cand_m1
+        if replace_m2:
+            return cand_m2
+
+        # Otherwise protect main and evict from W1 when possible
+        if cand_w1 is not None and (len(self.W1) + len(self.W2)) > 0:
+            return cand_w1
+
+        # Fallbacks to ensure progress
+        if self.M1:
+            return self._lru(self.M1)
+        if self.M2:
+            return self._lru(self.M2)
+        if self.W2:
+            return self._lru(self.W2)
+        return next(iter(cache_snapshot.cache))
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        if key in self.W1:
+            self.hits_w += 1
+            # Promote to window protected
+            self.W1.pop(key, None)
+            self._touch(self.W2, key, now)
+            self.hits_w2 += 1
+            # Keep W2 within target (demote LRU back to W1)
+            while len(self.W2) > w2_tgt:
+                demote = self._lru(self.W2)
+                if demote is None:
+                    break
+                self.W2.pop(demote, None)
+                self._touch(self.W1, demote, now)
+            self._maybe_tune(now)
+            return
+=======
+        if key in self.W1:
+            self.hits_w += 1
+            # Gate promotion during scan cooldown to avoid polluting W2
+            f_est = self.sketch.estimate(key)
+            if self.scan_cooldown > 0 and f_est < 2:
+                # Refresh in W1
+                self._touch(self.W1, key, now)
+            else:
+                # Promote to window protected
+                self.W1.pop(key, None)
+                self._touch(self.W2, key, now)
+                self.hits_w2 += 1
+            # Keep W2 within target (demote cold back to W1)
+            while len(self.W2) > w2_tgt:
+                demote = self._sample_lru_cold(self.W2, now, bias=0)
+                if demote is None:
+                    break
+                self.W2.pop(demote, None)
+                self._touch(self.W1, demote, now)
+            self._maybe_tune(now)
+            return
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        if key in self.M1:
+            self.hits_main += 1
+            # Promote to main protected
+            self.M1.pop(key, None)
+            self._touch(self.M2, key, now)
+            self.prom_m2 += 1
+            # Keep M2 within target by demoting cold from M2 to M1
+            while len(self.M2) > prot_tgt:
+                demote = self._sample_lru_cold(self.M2, now, bias=1)
+                if demote is None:
+                    break
+                self.M2.pop(demote, None)
+                self._touch(self.M1, demote, now)
+                self.dem_m2 += 1
+            self._maybe_tune(now)
+            return
+=======
+        if key in self.M1:
+            self.hits_main += 1
+            # Gate promotion during scan cooldown to avoid polluting M2
+            f_est = self.sketch.estimate(key)
+            if self.scan_cooldown > 0 and f_est < 2:
+                self._touch(self.M1, key, now)
+            else:
+                # Promote to main protected
+                self.M1.pop(key, None)
+                self._touch(self.M2, key, now)
+                self.prom_m2 += 1
+            # Keep M2 within target by demoting cold from M2 to M1
+            while len(self.M2) > prot_tgt:
+                demote = self._sample_lru_cold(self.M2, now, bias=1)
+                if demote is None:
+                    break
+                self.M2.pop(demote, None)
+                self._touch(self.M1, demote, now)
+                self.dem_m2 += 1
+            self._maybe_tune(now)
+            return
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Ensure it's not tracked elsewhere
+        self.W1.pop(key, None); self.W2.pop(key, None)
+        self.M1.pop(key, None); self.M2.pop(key, None)
+
+        # Insert into W1 (probationary window)
+        self._touch(self.W1, key, now)
+
+        # Rebalance window size vs target
+        w_tgt, w2_tgt, _, prot_tgt = self._targets()
+
+        # If window exceeds target, consider moving W1's LRU to M1 using TinyLFU comparison vs M1 cold tail.
+        if (len(self.W1) + len(self.W2)) > w_tgt:
+            w1_lru = self._lru(self.W1)
+            if w1_lru is not None and w1_lru != key:
+                cand_m1 = self._sample_lru_cold(self.M1, now, bias=0)
+                f_w1 = self.sketch.estimate(w1_lru)
+                f_m1 = self.sketch.estimate(cand_m1) if cand_m1 is not None else -1
+                bias = 3 if self.scan_cooldown > 0 else 1
+                if f_w1 >= (f_m1 + bias):
+                    # Admit into probationary main
+                    self.W1.pop(w1_lru, None)
+                    self._touch(self.M1, w1_lru, now)
+                else:
+                    # Keep in window; refresh to avoid immediate churn
+                    self._touch(self.W1, w1_lru, now)
+            else:
+                # If W1 empty (rare), demote W2 LRU back to W1
+                w2_lru = self._lru(self.W2)
+                if w2_lru is not None:
+                    self.W2.pop(w2_lru, None)
+                    self._touch(self.W1, w2_lru, now)
+
+        # Keep W2 within its target size by demoting its LRU to W1
+        while len(self.W2) > w2_tgt:
+            demote_w2 = self._lru(self.W2)
+            if demote_w2 is None:
+                break
+            self.W2.pop(demote_w2, None)
+            self._touch(self.W1, demote_w2, now)
+
+        # Keep M2 within target (freq-aware demotion)
+        while len(self.M2) > prot_tgt:
+            demote = self._sample_lru_cold(self.M2, now, bias=1)
+            if demote is None:
+                break
+            self.M2.pop(demote, None)
+            self._touch(self.M1, demote, now)
+            self.dem_m2 += 1
+
+        # Periodic tuning
+        self._maybe_tune(now)
+=======
+        # Ensure it's not tracked elsewhere
+        self.W1.pop(key, None); self.W2.pop(key, None)
+        self.M1.pop(key, None); self.M2.pop(key, None)
+
+        # Early admission using TinyLFU vs main tails
+        f_new = self.sketch.estimate(key)
+        cand_m1 = self._sample_lru_cold(self.M1, now, bias=0)
+        cand_m2 = self._sample_lru_cold(self.M2, now, bias=1)
+        f_m1 = self.sketch.estimate(cand_m1) if cand_m1 is not None else -1
+        f_m2 = self.sketch.estimate(cand_m2) if cand_m2 is not None else -1
+        bias = 3 if self.scan_cooldown > 0 else 1
+
+        placed = False
+        if self.scan_cooldown > 0:
+            # Avoid polluting M2; allow M1 for clearly warm items
+            if f_new >= 4 or (cand_m1 is not None and f_new >= (f_m1 + bias)):
+                self._touch(self.M1, key, now)
+                placed = True
+        else:
+            if cand_m2 is not None and f_new >= (f_m2 + bias + 1):
+                self._touch(self.M2, key, now)
+                placed = True
+            elif cand_m1 is not None and f_new >= (f_m1 + bias):
+                self._touch(self.M1, key, now)
+                placed = True
+
+        if not placed:
+            # Default probationary admission
+            self._touch(self.W1, key, now)
+
+        # Rebalance window size vs target
+        w_tgt, w2_tgt, _, prot_tgt = self._targets()
+
+        # If window exceeds target, consider moving W1's LRU to M1 using TinyLFU comparison vs M1 cold tail.
+        if (len(self.W1) + len(self.W2)) > w_tgt:
+            w1_lru = self._lru(self.W1)
+            if w1_lru is not None and w1_lru != key:
+                cand_m1 = self._sample_lru_cold(self.M1, now, bias=0)
+                f_w1 = self.sketch.estimate(w1_lru)
+                f_m1 = self.sketch.estimate(cand_m1) if cand_m1 is not None else -1
+                bias = 3 if self.scan_cooldown > 0 else 1
+                if f_w1 >= (f_m1 + bias):
+                    # Admit into probationary main
+                    self.W1.pop(w1_lru, None)
+                    self._touch(self.M1, w1_lru, now)
+                else:
+                    # Keep in window; refresh to avoid immediate churn
+                    self._touch(self.W1, w1_lru, now)
+            else:
+                # If W1 empty (rare), demote a cold W2 back to W1
+                demote_w2 = self._sample_lru_cold(self.W2, now, bias=0)
+                if demote_w2 is not None:
+                    self.W2.pop(demote_w2, None)
+                    self._touch(self.W1, demote_w2, now)
+
+        # Keep W2 within its target size by demoting its cold entries to W1
+        while len(self.W2) > w2_tgt:
+            demote_w2 = self._sample_lru_cold(self.W2, now, bias=0)
+            if demote_w2 is None:
+                break
+            self.W2.pop(demote_w2, None)
+            self._touch(self.W1, demote_w2, now)
+
+        # Keep M2 within target (freq-aware demotion)
+        while len(self.M2) > prot_tgt:
+            demote = self._sample_lru_cold(self.M2, now, bias=1)
+            if demote is None:
+                break
+            self.M2.pop(demote, None)
+            self._touch(self.M1, demote, now)
+            self.dem_m2 += 1
+
+        # Periodic tuning
+        self._maybe_tune(now)
+>>>>>>> REPLACE
+</DIFF>

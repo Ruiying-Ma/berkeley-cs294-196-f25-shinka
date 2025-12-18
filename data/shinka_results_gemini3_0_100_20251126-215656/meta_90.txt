@@ -1,0 +1,590 @@
+# INDIVIDUAL PROGRAM SUMMARIES
+
+The following are summaries of individual programs evaluated since the last meta update:
+
+**Program Name: Basic Least Recently Used (LRU) Algorithm**
+- **Implementation**: The algorithm maintains a dictionary mapping cached keys to their last access count (logical timestamp), updating this value on every hit or insert and evicting the key with the oldest timestamp.
+- **Performance**: The algorithm achieved a combined score of 0.21, with strong performance on traces exhibiting high temporal locality (up to 0.868) but failing on others.
+- **Feedback**: This standard LRU implementation effectively captures recency but suffers significantly on scan-heavy or cyclic workloads (resulting in near-zero hit rates for many traces), suggesting the need for frequency-based or scan-resistant logic.
+**Program Identifier:** Generation 0 - Patch Name initial_program - Correct Program: True
+
+**Program Name: Hyperbolic Caching with Persistent Frequency History**
+- **Implementation**: Calculates eviction scores as `Frequency / (CurrentTime - LastAccessTime)` to evict the lowest-scored item, while permanently retaining frequency counts for evicted keys to prioritize returning objects.
+- **Performance**: Achieves a combined score of 0.23, with hit rates varying drastically from 0.00 to 0.88 depending on the workload trace.
+- **Feedback**: While the approach balances recency and frequency, the O(N) linear scan for eviction is inefficient, and the algorithm struggles to adapt to scan-heavy or rapidly changing workloads.
+**Program Identifier:** Generation 1 - Patch Name hyperbolic_caching_with_history - Correct Program: True
+
+**Program Name: S3-FIFO Eviction with Ghost Registry**
+- **Implementation**: Utilizes three `OrderedDict` structures to manage a small probationary FIFO, a main FIFO, and a ghost history, promoting items to the main queue based on access bits and prior eviction history.
+- **Performance**: Achieved a combined score of 0.25, showing strong scan resistance on looping traces (up to 89% hit rate) but lower efficiency on highly random workloads.
+- **Feedback**: The ghost registry effectively filters one-hit wonders by distinguishing frequency, though the static 10% allocation for the probationary queue may limit adaptability compared to dynamic resizing policies.
+**Program Identifier:** Generation 2 - Patch Name s3_fifo_ghost - Correct Program: True
+
+**Program Name: S3-FIFO Algorithm with Static Probation Partitioning**
+- **Implementation**: Maintains `small` and `main` FIFO queues using ordered dictionaries, promoting items from the small queue (capped at 10% size) to main if accessed again based on frequency bits.
+- **Performance**: Achieved a combined score of 0.23, with strong results on high-locality traces (up to 0.88) but poor handling of certain scan patterns (near 0.00).
+- **Feedback**: The algorithm effectively segments items to protect the main cache from one-time accesses, though the fixed 10% probation size limits its responsiveness compared to adaptive queue sizing.
+**Program Identifier:** Generation 3 - Patch Name s3fifo_v1 - Correct Program: True
+
+**Program Name: Segmented LRU (SLRU) with Fixed 80% Protected Partition**
+- **Implementation**: The algorithm divides the cache into a protected segment (80% capacity) and a probationary segment, promoting items to protected on hits and evicting the least recently used item from the probationary segment after handling demotions.
+- **Performance**: It achieves a combined score of 0.23, performing well on specific high-locality workloads (up to 0.88 hit rate) but failing significantly on many others (often <0.05).
+- **Feedback**: The SLRU logic effectively isolates popular items to improve hit rates on stable working sets, but the fixed partition ratio limits adaptability to changing access patterns compared to adaptive variants like ARC.
+**Program Identifier:** Generation 4 - Patch Name slru_eviction - Correct Program: True
+
+**Program Name: Adaptive Replacement Cache (ARC) with Dynamic Tuning**
+- **Implementation**: The program implements the ARC algorithm using four `OrderedDict`s to separate recent (T1) and frequent (T2) items from their ghost entries, dynamically adjusting the target list size `p` based on ghost hits to balance eviction policies.
+- **Performance**: The algorithm achieved a combined score of 0.24, with notable success on specific traces (up to 0.89 hit rate) but near-zero effectiveness on many others.
+- **Feedback**: The implementation accurately captures ARC's adaptive logic, but the high variance in performance suggests that the standard learning rate for `p` may be too slow to adapt to the specific, rapidly changing patterns in this dataset.
+**Program Identifier:** Generation 5 - Patch Name arc_eviction - Correct Program: True
+
+**Program Name: Hyperbolic Frequency-Age-Size Score with Ghost Decay**
+- **Implementation**: The algorithm selects eviction victims by minimizing a `Frequency / (Age * Size)` score, prioritizing the retention of frequently used, recently accessed, and small objects. It implements a ghost history mechanism where the frequency of evicted items is preserved but halved, allowing the cache to distinguish between one-hit wonders and recurring content.
+- **Performance**: The algorithm achieves a combined score of 0.23, showing strong results on high-locality traces (e.g., Trace 28) but near-zero hit rates on scan-heavy or churning workloads.
+- **Feedback**: While the hyperbolic formula successfully integrates multiple factors, the static weighting and aggressive eviction of new items (which start with zero frequency) make it brittle against workloads with shifting patterns or large working sets.
+**Program Identifier:** Generation 6 - Patch Name probation_lfu_size_decay - Correct Program: True
+
+**Program Name: Frequency-Age-Size Score Eviction with Decay**
+- **Implementation**: The algorithm evicts items with the lowest score calculated as `Frequency / (Age * sqrt(Size))`, utilizing integer cross-multiplication for comparisons and decaying frequency upon eviction.
+- **Performance**: Achieved a combined score of 0.22, exhibiting extreme variance with excellent rates on some traces (0.88) but near-zero on many others.
+- **Feedback**: The heuristic effectively prioritizes small, frequent, and recent items in stable workloads but struggles significantly with scans or dynamic patterns where the age penalty causes premature eviction.
+**Program Identifier:** Generation 7 - Patch Name improved_hyperbolic_size_aware - Correct Program: True
+
+**Program Name: GDSF Variant with Frequency Decay**
+- **Implementation**: Implements Greedy Dual Size Frequency (GDSF) using a linear scan, calculating priority as $L + Frequency/Size$ and updating the inflation value $L$ to the evicted item's score. It retains frequency history for evicted items, decaying values by half to balance recency and frequency.
+- **Performance**: Achieved a combined score of 0.22, showing strong results on static frequency traces (e.g., 0.88) but failing near-completely on dynamic workloads.
+- **Feedback**: The algorithm effectively identifies popular items in stable distributions but lacks responsiveness to shifting access patterns, likely due to the persistent frequency history overshadowing recency. Additionally, the $O(N)$ linear scan for eviction is computationally expensive for larger caches.
+**Program Identifier:** Generation 8 - Patch Name gdsf_caching - Correct Program: True
+
+**Program Name: S3-FIFO with Ghost Queue (S3-FIFO-D)**
+- **Implementation**: Implements a three-queue structure (Small, Main, Ghost) where the Ghost queue tracks evicted probation items to promote them directly to Main upon re-access, bypassing the Small queue. It uses a static 10% target size for the Small queue and frequency counters to drive eviction and promotion decisions.
+- **Performance**: Achieved a combined score of 0.25, demonstrating strong performance on high-locality traces (up to 0.89) but failing significantly on others (near 0.00).
+- **Feedback**: While the Ghost queue logic aids in scan resistance and identifying recurring items, the static allocation for the Small queue limits the algorithm's ability to adapt to shifting workload phases compared to fully dynamic approaches.
+**Program Identifier:** Generation 9 - Patch Name s3fifo_ghost - Correct Program: True
+
+**Program Name: Adaptive S3-FIFO (A-S3-FIFO) with Ghost Registries**
+- **Implementation**: This algorithm augments the standard S3-FIFO structure by dynamically adjusting the size ratio between the probationary (S) and protected (M) queues based on hits in ghost registries that track recently evicted items.
+- **Performance**: The program achieved a combined score of 0.24, exhibiting high variance with excellent performance on some traces (e.g., 0.89) but failing near-completely on others.
+- **Feedback**: While the adaptive mechanism attempts to optimize queue allocation, the low overall score and inconsistency suggest that the adaptation logic (step size or ghost hit interpretation) may be unstable or slow to react to rapidly changing access patterns compared to static configurations.
+**Program Identifier:** Generation 10 - Patch Name adaptive_s3_fifo - Correct Program: True
+
+**Program Name: Adaptive S3-FIFO with Ghost-Based Resizing**
+- **Implementation**: This algorithm integrates S3-FIFO's probationary and main queues with ARC-style ghost lists, dynamically adjusting the probationary queue size based on hits in the ghost registries to balance frequency and recency.
+- **Performance**: The approach yields a combined score of 0.23, exhibiting extreme variance with excellent hit rates on some traces (up to 0.89) but failing completely on others (<0.05).
+- **Feedback**: While the adaptive mechanism attempts to optimize queue allocation, the high variance suggests the adaptation logic (step size or convergence speed) is unstable across diverse workloads compared to simpler static implementations.
+**Program Identifier:** Generation 11 - Patch Name strict_promotion_and_extended_ghosts - Correct Program: True
+
+**Program Name: Byte-Aware S3-FIFO Eviction with Ghost Registry**
+- **Implementation**: The solution implements S3-FIFO using a Small (probation) and Main queue, controlling the Small queue size via a 10% byte-capacity limit rather than item count. It features a ghost registry for rescuing evicted items and uses access bits for lazy promotion and second-chance retention.
+- **Performance**: The algorithm achieves a combined score of 0.23, showing high efficiency on select traces (up to 0.88 hit rate) but poor results on many others.
+- **Feedback**: While the byte-aware tracking adds precision, the static 10% threshold for the probation queue appears too restrictive for certain workloads, causing high variance and thrashing in traces where a larger initial buffer or adaptive sizing would be beneficial.
+**Program Identifier:** Generation 12 - Patch Name s3fifo_byte_aware - Correct Program: True
+
+**Program Name: S3-FIFO with Ghost Queue and Main-to-Small Demotion**
+- **Implementation**: Implements an S3-FIFO variant using probationary (Small) and protected (Main) queues, where unreferenced items in Main are demoted to Small rather than immediately evicted. A ghost queue tracks recently evicted Small items to bypass probation upon re-entry.
+- **Performance**: Achieved a combined score of 0.25, performing well on some workloads (up to 89%) but failing significantly on many others (near 0%).
+- **Feedback**: The demotion strategy likely extends object lifetime excessively for scan patterns, causing the probationary queue to clog and degrading performance on high-churn traces compared to standard eviction logic.
+**Program Identifier:** Generation 13 - Patch Name S3-FIFO-Demotion - Correct Program: True
+
+**Program Name: Adaptive Byte-Aware S3-FIFO with Ghost Queue Sizing**
+- **Implementation**: This solution maintains probation and protected queues using an ARC-inspired adaptive ratio adjusted by hits in ghost registries, alongside byte-level capacity tracking and lazy promotion via access bits.
+- **Performance**: The program achieved a score of 0.23, with high variability showing strong performance on static-friendly traces but near-zero hit rates on many others.
+- **Feedback**: The addition of ARC-style dynamic resizing to S3-FIFO adds complexity that appears to destabilize performance on specific traces, though the byte-awareness correctly handles variable-sized objects.
+**Program Identifier:** Generation 14 - Patch Name adaptive_s3_fifo - Correct Program: True
+
+**Program Name: S3-LRU Hybrid with Ghost Queue and Lazy Promotion**
+- **Implementation**: This algorithm employs a small FIFO queue with second-chance promotion to filter one-time accesses and a main LRU queue for popular items, utilizing a ghost queue to fast-track returning evictions into the main cache.
+- **Performance**: The approach achieved a combined score of 0.25, performing exceptionally well on recency-heavy traces (0.89 hit rate) but struggling with scan-heavy workloads where hit rates dropped near zero.
+- **Feedback**: The static 10% allocation for the small queue appears insufficient for specific access patterns; implementing adaptive queue sizing to dynamically adjust the balance between recency and frequency would likely improve stability across diverse traces.
+**Program Identifier:** Generation 15 - Patch Name s3_lru_hybrid - Correct Program: True
+
+**Program Name: Dynamic S3-FIFO with ARC-like Adaptive Sizing**
+- **Implementation**: This algorithm maintains Small and Main FIFO queues with ghost registries, dynamically adjusting the Small queue's target size based on ghost hits to automatically balance recency and frequency. It employs a second-chance mechanism using access bits for promotion from Small to Main upon eviction and reinsertion within Main.
+- **Performance**: The approach achieved a combined score of 0.23, demonstrating high hit rates on specific traces (up to 0.89) but near-zero performance on many others.
+- **Feedback**: While the adaptive partitioning mechanism effectively captures working sets for some patterns, the high variance suggests the resizing logic or eviction priority may be unstable or slow to converge on workloads with rapid phase changes or scan patterns.
+**Program Identifier:** Generation 16 - Patch Name dyns3fifo - Correct Program: True
+
+**Program Name: S3-FIFO with Static Split and Ghost Registry**
+- **Implementation**: Implements the S3-FIFO algorithm using a 10% capacity Small queue for insertions and a Main queue for promoted items, leveraging a ghost registry to identify and promote recurring items upon re-access.
+- **Performance**: Achieved a combined score of 0.24, demonstrating high effectiveness on specific workloads (hit rates > 0.7) but poor performance on the majority of traces.
+- **Feedback**: The ghost registry effectively filters "one-hit wonders" to protect the main cache, but the fixed 90/10 split between Main and Small queues likely limits adaptability across diverse access patterns compared to adaptive segmentation.
+**Program Identifier:** Generation 17 - Patch Name implement_s3_fifo - Correct Program: True
+
+**Program Name: S3-FIFO with Ghost Registry and Queue Demotion**
+- **Implementation**: Implements S3-FIFO using a 10% probationary queue, a main queue, and a ghost registry, where unaccessed items from the main queue are demoted back to the probationary queue instead of being evicted.
+- **Performance**: Achieved a combined score of 0.25, performing well on high-locality traces but suffering near-zero hit rates on several dynamic workloads.
+- **Feedback**: The decision to recycle unaccessed main queue items back to the probationary queue creates a circular flow that likely retains cold data too long, undermining the algorithm's scan resistance and eviction efficiency.
+**Program Identifier:** Generation 18 - Patch Name extended_ghost_and_demotion - Correct Program: True
+
+**Program Name: Adaptive S3-LRU with Ghost Queue Sizing**
+- **Implementation**: This hybrid algorithm combines S3-FIFO's probation queue and lazy promotion with an LRU protected region, utilizing ARC-style ghost queues to dynamically adjust the partition size based on eviction history.
+- **Performance**: The algorithm achieved a combined score of 0.23, delivering high hit rates on specific traces (up to 0.89) but failing to capture patterns in others.
+- **Feedback**: While the adaptive resizing aims to balance scan resistance and recency, the significant performance variance suggests the adaptation logic may be unstable or slow to converge on optimal configurations for certain workloads.
+**Program Identifier:** Generation 19 - Patch Name adaptive_s3_lru_ghost - Correct Program: True
+
+**Program Name: Adaptive S3-FIFO with Ghost Queue**
+- **Implementation**: This algorithm extends S3-FIFO by incorporating a ghost queue to track evicted probation items and dynamically adjusts the ratio between the small and main queues based on hit patterns. It also implements a conditional demotion strategy where items evicted from the main queue are moved to the small queue if space permits.
+- **Performance**: The program achieves a combined score of 0.23, with excellent hit rates on specific traces (up to 0.89) but near-zero performance on others.
+- **Feedback**: While the adaptive resizing and ghost queue allow the cache to adjust to varying working set sizes, the extreme variance in performance suggests the adaptation logic or demotion strategy may be unstable or counterproductive for certain access patterns.
+**Program Identifier:** Generation 20 - Patch Name adaptive_s3_fifo - Correct Program: True
+
+**Program Name: Adaptive S3-LRU Hybrid with Ghost Queue Resizing**
+- **Implementation**: Utilizes a small FIFO queue with second-chance promotion to filter one-time accesses and a main LRU queue for hot items, dynamically adjusting the size ratio based on ghost queue hits.
+- **Performance**: Achieved a combined hit rate score of 0.23, performing exceptionally well on specific traces (0.89) while failing on others.
+- **Feedback**: The ghost-based adaptive resizing effectively balances recency and frequency for stable workloads, though the incremental adjustment step may be too slow for highly volatile traces.
+**Program Identifier:** Generation 21 - Patch Name adaptive_s3_lru_dual_ghost - Correct Program: True
+
+**Program Name: Dynamic S3-FIFO with Adaptive Sizing and Frequency Gating**
+- **Implementation**: Utilizes Small and Main queues with ghost registries to dynamically adjust partition sizes and restricts promotion to Main based on global access frequency counts.
+- **Performance**: The algorithm achieved a combined score of 0.23, showing high variance with excellent hit rates on some traces but failing completely on others.
+- **Feedback**: The adaptive sizing benefits locality-heavy workloads, but the strict frequency gating and S-queue capacity limit likely cause thrashing on scan-heavy or looping access patterns.
+**Program Identifier:** Generation 22 - Patch Name freq_gating_and_s_cap - Correct Program: True
+
+**Program Name: S3-FIFO with Frequency Decay and Large Ghost Queue**
+- **Implementation**: Utilizes a probationary Small queue, a protected Main queue with frequency-based decay (demoting to Small), and an enlarged Ghost queue (20x capacity) to facilitate promotion.
+- **Performance**: Achieves a combined score of 0.23, exhibiting high variance with hit rates ranging from 0.89 on optimal traces to 0.00 on others.
+- **Feedback**: While the large ghost queue and frequency decay successfully capture long loops and repeated access patterns, the specific demotion logic results in zero hit rates on several traces, indicating significant robustness issues.
+**Program Identifier:** Generation 23 - Patch Name s3_fifo_decay_ghost - Correct Program: True
+
+**Program Name: Adaptive S3-FIFO with Demotion and Ghost Registry**
+- **Implementation**: Utilizes a two-queue system where victims from the protected queue are demoted to the probationary queue, while probationary evictions populate a ghost registry that dynamically adjusts the partition size.
+- **Performance**: Achieved a combined score of 0.22, showing high efficacy on repetitive loops but failing significantly on volatile, scan-heavy workloads.
+- **Feedback**: The demotion strategy creates a useful recirculating buffer for stable working sets, but the adaptive sizing mechanism is likely biased or slow to converge, causing the probationary queue to thrash during phase changes.
+**Program Identifier:** Generation 24 - Patch Name adaptive_s3fifo_v2 - Correct Program: True
+
+**Program Name: Dynamic S3-FIFO with ARC-like Partitioning**
+- **Implementation**: Maintains Small and Main FIFO queues with ghost registries to dynamically adjust partition ratios based on marginal utility (ghost hits), similar to ARC. It incorporates size-gating to evict large items immediately and demotes unaccessed Main items to the Small queue rather than evicting them directly.
+- **Performance**: The approach yields a combined score of 0.22, excelling on specific workloads (up to 0.88 hit rate) but failing significantly on most others (<0.05).
+- **Feedback**: While the dynamic sizing and ghost registries provide adaptability for stable working sets, the complex item demotion logic and reliance on heuristic global state resets likely cause instability and poor generalization across diverse traces.
+**Program Identifier:** Generation 25 - Patch Name evict_demotion_sizegating - Correct Program: True
+
+**Program Name: S3-FIFO with Probation Hysteresis and Ghost Registry**
+- **Implementation**: Uses a split-queue architecture (Small 10%, Main 90%) with a ghost registry for history-based promotion and a strict probation mechanism requiring two hits in the Small queue for promotion to Main.
+- **Performance**: Achieved a combined score of 0.25, with strong results on static workloads (up to 89% hit rate) but near-zero performance on several specific trace patterns.
+- **Feedback**: The strict "two-hit" requirement within the small queue likely acts as an overly aggressive filter, preventing legitimate working sets from stabilizing in the Main queue before being evicted, causing thrashing on dynamic workloads.
+**Program Identifier:** Generation 26 - Patch Name optimize_s3_fifo_hysteresis - Correct Program: True
+
+**Program Name: S3-FIFO-D with Ghost Cache and Demotion Logic**
+- **Implementation**: Implements a segmented FIFO (Small/Main) where items demote from Main to Small based on frequency counters (capped at 3), utilizing a ghost cache to promote re-accessed evicted items directly to Main with boosted priority.
+- **Performance**: Achieved a combined score of 0.25, showing strong results on static high-locality traces (up to 0.89) but failing significantly on scan or loop patterns (near 0.00).
+- **Feedback**: The demotion mechanism effectively retains hot content, but the lack of adaptive queue sizing and rigid frequency resets leads to thrashing in dynamic or large working-set scenarios.
+**Program Identifier:** Generation 27 - Patch Name s3_fifo_demotion_ghost_persistence - Correct Program: True
+
+**Program Name: Adaptive S3-FIFO with Ghost Queue Resizing**
+- **Implementation**: Implements a two-queue S3-FIFO structure where the ratio between probationary and protected queues is dynamically adjusted based on hits in ghost registries, utilizing a second-chance mechanism for promotion.
+- **Performance**: Achieves a combined score of 0.23, showing strong results on frequency-biased workloads (up to 0.89) but poor performance on scan-heavy traces.
+- **Feedback**: While the adaptive resizing effectively captures high-frequency items, the near-zero scores on many traces suggest the algorithm struggles to filter one-time access patterns or adapt quickly enough to shifting workload phases.
+**Program Identifier:** Generation 28 - Patch Name as3fifo_v2 - Correct Program: True
+
+**Program Name: Hyper S3-FIFO with Dual Ghost Queues and Adaptive Sizing**
+- **Implementation**: Manages a probationary (S) and protected (M) queue, dynamically adjusting the partition ratio based on ghost hits, and demotes M-evictions to S to filter warm items.
+- **Performance**: Achieved a combined score of 0.23, with high hit rates on selected traces (e.g., 0.89) but near-zero performance on several others.
+- **Feedback**: The ghost-based adaptive sizing effectively balances recency and frequency for some patterns, but the extreme low scores indicate the adaptation logic or queue management is unstable or slow to react on certain workloads.
+**Program Identifier:** Generation 29 - Patch Name hyper_s3_fifo - Correct Program: True
+
+**Program Name: S3-FIFO with Ghost Registry and Two-Hit Promotion**
+- **Implementation**: Utilizes Small (10%) and Main (90%) queues via `OrderedDict`, promoting items to Main only upon two hits or a ghost match, and evicting cold items directly from Main without demotion.
+- **Performance**: Achieved a combined score of 0.22, performing well on high-frequency loops (e.g., 88% hit rate) but failing near-completely on sparse workloads.
+- **Feedback**: The strict two-hit promotion threshold combined with a small probationary queue likely filters too aggressively, preventing items with moderate reuse intervals from establishing residency in the protected Main queue.
+**Program Identifier:** Generation 30 - Patch Name s3_fifo_2h_ghost - Correct Program: True
+
+**Program Name: Dynamic S3-FIFO with ARC-like Partition Sizing**
+- **Implementation**: Enhances S3-FIFO with a dynamic probation queue size adjusted by ghost hits, distinguishing between premature S-evictions and M-demotions to guide resizing.
+- **Performance**: Achieved a combined score of 0.23, showing high efficiency on specific repetitive traces (up to 0.89) but poor generalization across the broader dataset.
+- **Feedback**: While the ghost-based adaptation logic correctly targets loop-heavy workloads, the specific parameter tuning or demotion policy struggles to maintain consistency on mixed or scan-heavy traces.
+**Program Identifier:** Generation 31 - Patch Name freq_demote_s3fifo - Correct Program: True
+
+**Program Name: DynS3FIFO with Adaptive Partitioning and Ghost Registries**
+- **Implementation**: This S3-FIFO variant dynamically resizes the small probation queue using ARC-like ghost hits and demotes cold items from Main to Small instead of immediate eviction.
+- **Performance**: Achieved a combined score of 0.23, performing well on specific looping patterns but poorly on most mixed workloads.
+- **Feedback**: The dynamic resizing coupled with Main-to-Small demotion appears to cause instability or pollution in the probation queue, resulting in near-zero hit rates on many traces compared to standard static configurations.
+**Program Identifier:** Generation 32 - Patch Name persistent_freq_eviction - Correct Program: True
+
+**Program Name: Advanced S3-FIFO with Ghost Queue and Demotion**
+- **Implementation**: Uses a three-queue structure (`q_small`, `q_main`, `q_ghost`) with a static 10% probation size, promoting items on hits or ghost hits and demoting warm main items back to probation during eviction.
+- **Performance**: The algorithm achieved a combined score of 0.24, excelling on specific traces (up to 0.89 hit rate) but performing poorly on many others.
+- **Feedback**: The ghost queue and promotion logic provide strong scan resistance, but the static queue sizing and specific demotion strategy limit adaptability across diverse access patterns.
+**Program Identifier:** Generation 33 - Patch Name s3_fifo_demotion - Correct Program: True
+
+**Program Name: Adaptive S3-FIFO with Dual Ghost Queues**
+- **Implementation**: The algorithm maintains probation and protected FIFO queues, dynamically adjusting their size ratio based on hits in corresponding ghost queues that track evicted items. Access frequency determines promotion from probation to protected or reinsertion within the protected queue.
+- **Performance**: It achieved a combined score of 0.24, excelling on specific traces (up to 0.89 hit rate) while performing poorly (<0.05) on a large subset of the dataset.
+- **Feedback**: While the adaptive partitioning attempts to optimize queue sizing, the reliance on simple frequency bits and FIFO order limits its ability to handle complex or scanning patterns effectively across diverse workloads.
+**Program Identifier:** Generation 34 - Patch Name adaptive_s3_fifo - Correct Program: True
+
+**Program Name: Enhanced Adaptive S3-FIFO with Dual Ghost Queues**
+- **Implementation**: This algorithm maintains Small and Main FIFO queues with an adaptive capacity ratio tuned by hits in dual ghost queues, promoting frequently accessed items to the Main queue based on frequency caps.
+- **Performance**: It achieves a combined score of 0.23, showing high efficiency on specific traces (up to 0.89) but extremely poor performance on the majority of diverse workloads.
+- **Feedback**: While the adaptive mechanism captures some stable high-locality patterns, the slow convergence or instability of the ratio adjustment leads to ineffective caching on dynamic or scan-heavy traces.
+**Program Identifier:** Generation 35 - Patch Name enhanced_adaptive_s3fifo - Correct Program: True
+
+**Program Name: S3-FIFO with Frequency Decay and Ghost Queue**
+- **Implementation**: This approach combines a small probationary FIFO queue and a main LRU queue, implementing frequency decay upon demotion and utilizing a ghost queue to rescue previously evicted items.
+- **Performance**: The algorithm achieves a combined score of 0.25, with notable strength in specific traces but zero hit rates in others.
+- **Feedback**: The frequency decay mechanism allows for a "second chance" based on intensity, but the static 10% allocation for probation may be too restrictive for certain access patterns.
+**Program Identifier:** Generation 36 - Patch Name freq_decay_s3_fifo - Correct Program: True
+
+**Program Name: S3-FIFO with Demotion and Frequency Decay**
+- **Implementation**: Implements an S3-FIFO architecture where items evicted from the protected "main" queue are demoted back to the probationary "small" queue rather than being immediately discarded. It utilizes a ghost cache and frequency counters with decay logic to manage promotions and re-insertions.
+- **Performance**: Achieved a combined score of 0.24, showing strong performance on high-locality traces (e.g., 0.89 on trace 28) and decent stability across mixed workloads.
+- **Feedback**: The demotion mechanism provides a valuable second chance for cooling items, effectively extending the lifecycle of useful data, though the frequency resetting strategy upon promotion may limit effectiveness in scenarios requiring persistent high-frequency retention.
+**Program Identifier:** Generation 37 - Patch Name tune_ghost_parameters - Correct Program: True
+
+**Program Name: S3-FIFO with Demotion and Ghost Queue**
+- **Implementation**: Uses three queues (Small, Main, Ghost) with a 10% small partition, where cold items evicted from Main are demoted back to Small for a second chance rather than being removed immediately.
+- **Performance**: Achieved a score of 0.25, showing strength in high-frequency traces (up to 89%) but failing completely on others (near 0% hit rate).
+- **Feedback**: The demotion strategy effectively extends the lifetime of cold items from Main, causing cache pollution on scan-heavy workloads which likely explains the poor performance on specific traces compared to standard S3-FIFO.
+**Program Identifier:** Generation 38 - Patch Name s3_fifo_p - Correct Program: True
+
+**Program Name: Adaptive S3-FIFO with Dual Ghost Queues and Demotion**
+- **Implementation**: Extends S3-FIFO by utilizing two distinct ghost queues to track evictions from the Small and Main regions separately, using hits in these queues to dynamically adjust the ratio between the two partitions. It also includes a demotion policy where items evicted from the Main queue are moved to the Small queue for a second chance.
+- **Performance**: Achieves a combined score of 0.23, exhibiting high variance with excellent performance on a few specific traces but near-zero hit rates on many others.
+- **Feedback**: The complex adaptive sizing mechanism driven by dual ghost queues appears unstable, leading to poor generalization and failure to retain the working set on sparse or scanning workloads compared to simpler approaches.
+**Program Identifier:** Generation 39 - Patch Name s3_fifo_dual_ghost_adaptive - Correct Program: True
+
+**Program Name: Smart S3-FIFO with Ghost Registry and Conditional Demotion**
+- **Implementation**: Enhances S3-FIFO with a ghost registry to rescue previously evicted items and utilizes conditional demotion, where cold items from the main queue are strictly evicted rather than demoted if the probationary queue is full.
+- **Performance**: The algorithm achieves a combined score of 0.25, demonstrating strong results on high-locality traces (e.g., trace 28) but failing significantly on high-churn workloads (e.g., trace 14).
+- **Feedback**: While the ghost registry effectively captures recurrence, the strict eviction policy is likely too aggressive; discarding main-queue items immediately when the probationary queue is full prevents valuable data from recirculating during pressure.
+**Program Identifier:** Generation 40 - Patch Name smart_s3_fifo - Correct Program: True
+
+**Program Name: S3-FIFO with Conditional Demotion and Ghost Origin Tracking**
+- **Implementation**: This algorithm partitions the cache into a small probation queue (fixed at 10%) and a main protected queue, utilizing a conditional demotion strategy where items evicted from main are moved to probation if space permits rather than being immediately discarded. It also employs a ghost cache that tracks whether evicted items originated from the main or probation queues to determine their restoration policy.
+- **Performance**: The approach yields a combined score of 0.23, demonstrating strong results on stable, loop-heavy traces (e.g., 0.8874 on trace_28) but performing poorly on high-churn workloads (e.g., 0.0000 on trace_14).
+- **Feedback**: While the demotion logic effectively extends the residency of valuable items when pressure is low, the small fixed probation size causes rapid thrashing during scans, preventing new items from accumulating enough frequency to be promoted.
+**Program Identifier:** Generation 41 - Patch Name conditional_demotion_ghost_origin - Correct Program: True
+
+**Program Name: S3-FIFO-P with Conditional Demotion and Origin-Tracking Ghost**
+- **Implementation**: Implements a partitioned S3-FIFO with a 10% probation queue, featuring conditional demotion that evicts protected items directly if probation is full, and a ghost cache that tracks entry origin for restoration.
+- **Performance**: Achieved a combined score of 0.22, exhibiting extreme variance with high hit rates on specific workloads but failing completely on others.
+- **Feedback**: The strict conditional demotion logic, which bypasses the probation queue when full, likely causes premature eviction of useful data, reducing robustness and adaptability across diverse access patterns compared to standard S3-FIFO.
+**Program Identifier:** Generation 42 - Patch Name s3_fifo_p - Correct Program: True
+
+**Program Name: S3-FIFO with Ghost Origin Tracking**
+- **Implementation**: Utilizes a three-queue structure (Small, Main, Ghost) where the Ghost queue retains a flag indicating previous Main residency, enabling selective restoration of ghost hits to either Main or Small based on their history.
+- **Performance**: The algorithm achieved a combined score of 0.23, demonstrating high hit rates on select traces (up to 0.88) but failing completely on others (0.00 on trace 14).
+- **Feedback**: The provenance-based restoration logic effectively filters scan patterns for some workloads, but the rigid queue sizing and promotion rules lack the robustness needed for consistently high performance across all trace types.
+**Program Identifier:** Generation 43 - Patch Name trace_origin_s3_fifo - Correct Program: True
+
+**Program Name: S3-FIFO with Ghost Queue and Conditional Demotion**
+- **Implementation**: This approach augments S3-FIFO with a Ghost queue to bypass probation for re-accessed evicted items and implements conditional demotion from Main to Small based on queue occupancy and frequency decay.
+- **Performance**: The algorithm achieves a combined score of 0.25, excelling on high-locality traces (e.g., 0.89 on trace_28) but performing poorly on scan-heavy or sparse workloads.
+- **Feedback**: While the Ghost queue improves adaptation to recurring items, the complex demotion logic and frequency capping may lead to inconsistent retention on diverse trace patterns.
+**Program Identifier:** Generation 44 - Patch Name conditional_demotion_evict - Correct Program: True
+
+**Program Name: S3-FIFO with Demotion and Ghost Registry**
+- **Implementation**: Maintains a probationary small queue and a protected main queue, where items are promoted to main upon hits and demoted back to the small queue rather than immediately evicted.
+- **Performance**: Achieved a combined score of 0.25, demonstrating strong scan resistance and high hit rates on repetitive traces (up to 0.89) but struggling with sparse data.
+- **Feedback**: The implementation adds robustness through M-to-S demotion and ghost entries, though the static queue sizing and specific frequency decay logic may introduce overhead for simple LRU-friendly workloads.
+**Program Identifier:** Generation 45 - Patch Name s3_fifo_demotion_decay - Correct Program: True
+
+**Program Name: S3-FIFO with Ghost Registry and Conditional Demotion**
+- **Implementation**: Maintains a small probationary queue (10%) and a large main queue, utilizing a ghost registry to effectively rescue returning evicted items directly to the main queue. It employs conditional demotion where victims from the main queue are only moved to probation if the probationary queue is not full.
+- **Performance**: Achieves a combined score of 0.25, showing strong results on recurring loop patterns (e.g., 0.89 hit rate) but performing poorly on scan-heavy workloads (e.g., 0.00 hit rate).
+- **Feedback**: While the ghost registry successfully captures looping working sets, the static queue sizing and strict demotion policy limit adaptability, causing the cache to drop useful data too aggressively during scans or sparse access patterns.
+**Program Identifier:** Generation 46 - Patch Name s3_fifo_optim - Correct Program: True
+
+**Program Name: S3-FIFO with Frequency Decay and Recursive Demotion**
+- **Implementation**: This algorithm extends S3-FIFO by demoting cold items from the Main queue back to the Small (probation) queue instead of evicting them, using a decayed frequency counter to govern promotion and reinsertion.
+- **Performance**: The approach achieved a combined score of 0.25, with high hit rates on stable workloads (e.g., 0.89 on trace 28) but poor performance on scan-heavy traces.
+- **Feedback**: While the demotion strategy effectively retains warm data in static working sets, the recycling of Main items back to Small appears to hinder the rapid eviction necessary for dynamic or high-churn access patterns.
+**Program Identifier:** Generation 47 - Patch Name s3_fifo_decay_demote - Correct Program: True
+
+**Program Name: S3-FIFO with Conditional Demotion and Origin-Aware Ghost**
+- **Implementation**: Uses a 10% probation FIFO and a protected Main FIFO, employing a ghost cache that tracks eviction origin to tune readmission frequency. Victims from Main are evicted directly (bypassing probation) if the probation queue is full to prevent pollution during scans.
+- **Performance**: Achieves a combined score of 0.25, showing strong locality handling (e.g., 0.89 hit rate) but struggling significantly on specific scan-heavy workloads (near 0% on several traces).
+- **Feedback**: While conditional demotion prevents the probation queue from blocking during churn, the aggressive direct eviction and small fixed probation size likely cause thrashing on traces with larger working sets or looping patterns.
+**Program Identifier:** Generation 48 - Patch Name s3fifo_cd_og - Correct Program: True
+
+**Program Name: Two-Tier Ghost S3-FIFO with Conditional Demotion**
+- **Implementation**: Maintains separate ghost registries for Small and Main queues and enforces a two-hit probation filter for promoting items from Small to Main, while conditionally demoting Main items to Small only if space permits.
+- **Performance**: Achieved a combined score of 0.21, excelling on specific patterns (e.g., 0.88 hit rate) but failing completely on others (0.00 hit rate).
+- **Feedback**: The strict probation mechanism effectively filters one-time access noise but delays the identification of new hot items, and the complex eviction path struggles to adapt quickly to high-churn workloads compared to simpler policies.
+**Program Identifier:** Generation 49 - Patch Name 2tg_s3 - Correct Program: True
+
+**Program Name: Tiered S3-FIFO with Ghost Registry and Frequency Gating**
+- **Implementation**: Utilizes a small FIFO probation queue (10% capacity) and a main LRU queue, promoting items via frequency checks or ghost list hits while handling evictions through demotion or removal.
+- **Performance**: Achieved a combined score of 0.24, excelling on specific workloads (0.89 max hit rate) but struggling significantly on many others.
+- **Feedback**: The ghost-guided promotion effectively captures recurrent items in stable workloads, but the aggressive probation sizing and strict hit requirements likely hinder performance on scan-heavy or high-churn traces.
+**Program Identifier:** Generation 50 - Patch Name s3fifo_tiered_ghost - Correct Program: True
+
+**Program Name: Optimized S3-FIFO with Conditional Demotion and Adaptive Promotion**
+- **Implementation**: This algorithm refines S3-FIFO by using a probationary (S) and protected (M) queue structure, implementing conditional demotion from M to S only when space permits and adjusting promotion thresholds based on M-queue utilization.
+- **Performance**: It achieved a combined score of 0.24, demonstrating strong results on looping and frequency-heavy traces (e.g., 0.89 on trace 28) while struggling with scan patterns.
+- **Feedback**: The adaptive promotion logic effectively accelerates working set capture when the cache is underutilized, and conditional demotion helps retain marginal items, though scan resistance remains a limitation on single-pass workloads.
+**Program Identifier:** Generation 51 - Patch Name S3FIFO_Ghost4x_Freq2 - Correct Program: True
+
+**Program Name: S3-FIFO with Ghost Queue and Conditional Demotion**
+- **Implementation**: This algorithm extends S3-FIFO by adding a Ghost queue for history tracking and a logic path where cold items evicted from the Main queue are demoted to the Small queue instead of being immediately removed. It uses Python ordered dictionaries to manage the Small (probation), Main (protected), and Ghost queues with a 10% capacity target for Small.
+- **Performance**: The approach yields a combined score of 0.23, demonstrating strong hit rates on stable, repetitive patterns (e.g., 0.89 on trace 28) but failing significantly on high-churn workloads (0.00 on trace 14).
+- **Feedback**: The addition of the Ghost queue and Main-to-Small demotion improves retention of intermediate-frequency items, but the rigid 10% size limit on the Small queue likely causes thrashing on workloads that require a larger filter for one-time accesses.
+**Program Identifier:** Generation 52 - Patch Name conditional_demotion_and_larger_ghost - Correct Program: True
+
+**Program Name: S3-FIFO with Ghost Registry and Conditional Demotion**
+- **Implementation**: Utilizes Small, Main, and Ghost queues (via `OrderedDict`) to manage probationary versus frequent items, using simulated access bits for second-chance re-insertion and ghost history for direct Main queue insertion.
+- **Performance**: Achieved a combined score of 0.23, with high efficiency on specific traces (up to 0.89 hit rate) but poor consistency across the full dataset, dropping to near-zero on several inputs.
+- **Feedback**: The ghost registry effectively filters "one-hit wonders" to improve scan resistance, but the static 10% sizing of the probationary queue and the specific demotion logic likely caused the significant performance drops on dynamic workloads.
+**Program Identifier:** Generation 53 - Patch Name conditional_demotion_and_larger_ghost - Correct Program: True
+
+**Program Name: Advanced S3-FIFO with Conditional Demotion**
+- **Implementation**: Extends S3-FIFO with a 10% probationary queue, a 4x ghost registry, and conditional demotion logic that moves evicted Main items to Probation only if space allows.
+- **Performance**: The algorithm achieved a combined score of 0.23, showing strong performance on high-locality traces but failing on scanning or looping patterns.
+- **Feedback**: While conditional demotion aids in retaining marginal items, the fixed queue sizing lacks the adaptability required to handle diverse traces consistently.
+**Program Identifier:** Generation 54 - Patch Name adv_s3fifo - Correct Program: True
+
+**Program Name: S3-FIFO with 10% Probation Queue and 5x Ghost History**
+- **Implementation**: Uses Small (10% cap), Main, and Ghost FIFO queues; Small promotes frequently accessed items to Main or evicts to an expanded Ghost queue (5x cap).
+- **Performance**: Score 0.23; strong on looping traces (>0.80) but poor on scans and random access patterns (~0.02).
+- **Feedback**: The small probation area effectively filters one-hit wonders but evicts potential hits too early in diverse workloads, despite the extended history tracking.
+**Program Identifier:** Generation 55 - Patch Name s3_fifo_v5_large_ghost - Correct Program: True
+
+**Program Name: Adaptive S3-FIFO with Conditional Demotion**
+- **Implementation**: This algorithm partitions the cache into probationary (S) and protected (M) queues, dynamically adjusting the partition size based on ghost hits and employing a conditional demotion strategy where M-victims move to S if space permits.
+- **Performance**: The algorithm achieves a combined score of 0.24, demonstrating strong results on high-locality traces (up to 0.88 hit rate) but performing poorly on scan-heavy workloads (near 0.0 hit rate).
+- **Feedback**: While conditional demotion effectively retains stable working sets, the adaptive sizing mechanism appears vulnerable to scans, failing to filter one-hit wonders effectively in low-locality scenarios.
+**Program Identifier:** Generation 56 - Patch Name adaptive_s3_demote - Correct Program: True
+
+**Program Name: Tiered Ghost S3-FIFO Cache**
+- **Implementation**: Utilizes a segmented cache with probationary (S) and protected (M) queues, employing a ghost registry that tracks eviction origin to enable tiered rescue policies (M-ghosts restore to M, S-ghosts retry in S with credit).
+- **Performance**: The algorithm achieved a combined score of 0.24, demonstrating strong performance on high-locality traces (e.g., Trace 28) but effectively zero hit rate on specific scan patterns.
+- **Feedback**: The origin-aware rescue strategy effectively prioritizes previously protected items, but the static 10% probationary queue allocation limits the cache's ability to adapt to workloads requiring larger scan buffers.
+**Program Identifier:** Generation 57 - Patch Name tiered_ghost_s3fifo - Correct Program: True
+
+**Program Name: S3-FIFO with Conditional Demotion and Ghost Origins**
+- **Implementation**: Implementation utilizes three FIFO queues (Small, Main, Ghost) where items evicted from Main are only demoted to Small if the Small queue is under capacity; otherwise, they are evicted directly to a Ghost queue which tracks their origin for optimized re-insertion.
+- **Performance**: Achieved a combined score of 0.24, showing high effectiveness on standard locality traces (up to 0.89) but failing significantly on scan-heavy workloads (0.00 on trace 14).
+- **Feedback**: The conditional demotion logic successfully prevents cold Main items from trashing the probationary queue, but the static 10% allocation for new items appears too restrictive for handling larger working sets or looping patterns efficiently.
+**Program Identifier:** Generation 58 - Patch Name s3fifo_dg - Correct Program: True
+
+**Program Name: S3-FIFO with Demotion and Frequency-Based Promotion**
+- **Implementation**: Utilizes three queues (Small, Main, Ghost) where items evicted from Main are demoted to Small for a second chance, controlled by access frequency caps and a large ghost history.
+- **Performance**: Achieved a combined score of 0.23, excelling on stable looping workloads (up to 0.89 hit rate) while performing poorly on highly dynamic patterns.
+- **Feedback**: The demotion logic effectively protects the working set in static scenarios, but the fixed 10% probationary queue size appears too restrictive for workloads requiring rapid adaptation to new content.
+**Program Identifier:** Generation 59 - Patch Name freq_boost_and_ghost_expansion - Correct Program: True
+
+**Program Name: S3-FIFO with Frequency Decay and Conditional Demotion**
+- **Implementation:** Extends S3-FIFO by adding frequency decay and a conditional demotion mechanism where items evicted from the Main queue return to the Small queue if space permits, rather than being discarded.
+- **Performance:** Achieved a combined score of 0.23, excelling on static traces (0.89 hit rate) but struggling significantly with dynamic or scan-heavy patterns (near 0.00).
+- **Feedback:** While the demotion strategy effectively protects the working set, the lack of aggressive eviction for zero-frequency items in the Small queue likely causes cache pollution during scans.
+**Program Identifier:** Generation 60 - Patch Name conditional_demote_extended_ghost - Correct Program: True
+
+**Program Name: S3-FIFO Implementation with Ghost Registry**
+- **Implementation**: Utilizes a small probationary FIFO queue (10%) and a main protected FIFO queue, employing a ghost registry to track evicted items for promotion and accessed bits for second-chance re-insertion.
+- **Performance**: Achieved a combined score of 0.23, with high efficiency on specific traces (up to 0.89) but poor results on others (near 0.00).
+- **Feedback**: The algorithm demonstrates strong scan resistance and frequency awareness, though the static 10% partition size appears too rigid for certain workloads, causing significant misses.
+**Program Identifier:** Generation 61 - Patch Name improved_s3fifo_ghost - Correct Program: True
+
+**Program Name: Optimized S3-FIFO with Conditional Demotion and Ghost Registry**
+- **Implementation**: Implements a segmented cache with probationary (S) and protected (M) queues, utilizing a ghost registry to rescue previously evicted items directly to M. Uniquely, M-victims are only demoted to S if S is under capacity; otherwise, they are discarded to prevent polluting the insertion buffer.
+- **Performance**: Achieved a combined score of 0.25, showing strong results on frequency-biased traces (up to 0.89) but struggling significantly with high-churn patterns (near 0.02).
+- **Feedback**: The conditional demotion logic effectively filters one-hit wonders and keeps the probationary queue open for new entries, but the static 10% allocation for probation appears too rigid for traces with larger transient working sets.
+**Program Identifier:** Generation 62 - Patch Name ghost_expansion_and_bonus - Correct Program: True
+
+**Program Name: S3-FIFO with Extended Ghost and Conservative Rescue**
+- **Implementation**: Uses a 10% probationary queue and a main queue with conditional demotion, utilizing a double-sized ghost registry that rescues items into the main queue without initial access credit ("cold").
+- **Performance**: Achieved a combined score of 0.25, excelling on frequency-heavy traces (e.g., 0.89 on trace_28) while struggling with certain scan patterns (0.00 on trace_14).
+- **Feedback**: The extended ghost capacity improves the detection of longer reuse loops (Trace 29), and the conservative rescue logic effectively mitigates main-queue pollution, though the static queue sizing limits adaptability on variable workloads.
+**Program Identifier:** Generation 63 - Patch Name s3fifo_ext_ghost_clean - Correct Program: True
+
+**Program Name: S3-FIFO with Extended Ghost and Conservative Rescue**
+- **Implementation**: This S3-FIFO variant employs a large ghost registry (5x capacity) and a "conservative rescue" where items recovered from history enter the Main queue without an access bit, requiring a subsequent hit to persist. It also conditionally demotes victims from the Main queue to the eviction end of the Small queue.
+- **Performance**: The approach achieves a combined score of 0.23, with notable strength on scanning and looping traces (e.g., 0.3171 on Trace 12) while maintaining high hit rates on frequency-heavy workloads.
+- **Feedback**: The "no-bonus" rescue logic effectively prevents one-hit wonders in the ghost history from polluting the protected queue, and the extended ghost size significantly aids in capturing long-period cyclic patterns.
+**Program Identifier:** Generation 64 - Patch Name s3fifo_extended_ghost_soft_demotion - Correct Program: True
+
+**Program Name:** S3-FIFO Cache with Ghost Registry and Probationary Queue
+- **Implementation:** Maintains a small probationary FIFO (10% capacity) and a main FIFO, using a ghost registry to promote recurring items and a second-chance mechanism to retain frequently accessed objects.
+- **Performance:** Achieved a combined score of 0.24, demonstrating high hit rates on standard locality traces but failing significantly on several specific access patterns (e.g., traces 14-19).
+- **Feedback:** The implementation successfully separates scan-resistant probationary items from popular ones, though the fixed queue sizing and specific demotion strategy likely limit adaptation to dynamic workload shifts compared to adaptive policies.
+**Program Identifier:** Generation 65 - Patch Name smart_s3fifo_v2 - Correct Program: True
+
+**Program Name: S3-FIFO Hybrid with Ghost Queue and Recirculating Demotion**
+- **Implementation**: Implements a segmented cache with a 10% FIFO probation queue and a main LRU queue, using a ghost history for promotions and recirculating demoted main items back to probation.
+- **Performance**: Achieves a combined score of 0.24, demonstrating strong results on looping patterns (e.g., traces 27-28) but failing significantly on scan-heavy workloads.
+- **Feedback**: The policy of recirculating demoted items into a small, fixed-size probation queue likely causes congestion and pollution during scans, suggesting that adaptive queue sizing or stricter eviction rules are necessary.
+**Program Identifier:** Generation 66 - Patch Name s3_lru_ghost_expanded - Correct Program: True
+
+**Program Name: S3-FIFO with Conservative Rescue and Rapid Demotion**
+- **Implementation**: Utilizes a dual-queue S3-FIFO structure with a 4x ghost registry, where ghost hits are rescued to the main queue without hit credits and main-queue evictions are demoted to the immediate eviction position of the small queue.
+- **Performance**: The algorithm scored 0.23, performing well on Zipfian traces but suffering severe degradation on scan and loop-heavy workloads (e.g., Traces 14-19).
+- **Feedback**: The conservative rescue logic successfully balanced pollution resistance in mixed workloads, but the aggressive demotion strategy (placing items at the FIFO head) evicted potentially useful data too quickly in looping scenarios.
+**Program Identifier:** Generation 67 - Patch Name optimize_ghost_and_demotion - Correct Program: True
+
+**Program Name: Probation-Rejection Optimized S3-FIFO with Capacity Gating**
+- **Implementation**: Enhances S3-FIFO by evicting Main items directly to ghost history when the Small queue is full (bypassing probation), and enforces "strict probation" where demoted items are placed at the immediate eviction position.
+- **Performance**: Achieved a combined score of 0.23, excelling on static high-locality traces (up to 0.89 hit rate) but failing significantly on dynamic or sparse workloads (near 0.00).
+- **Feedback**: While the capacity-gated bypass effectively prevents scan pollution, the strict probation logic (inserting demoted items as the next victim) likely flushes useful items too aggressively in shifting access patterns.
+**Program Identifier:** Generation 68 - Patch Name pro_s3_fifo - Correct Program: True
+
+**Program Name: S3-FIFO with Demotion Recycling and Ghost Queue**
+- **Implementation**: This algorithm modifies S3-FIFO by demoting cold items from the main queue back to the small (probation) queue rather than evicting them, utilizing a ghost queue for history-based promotion.
+- **Performance**: The approach achieved a combined score of 0.24, showing strong results on specific repetitive traces but failing significantly on dynamic workloads with near-zero hit rates.
+- **Feedback**: Recycling items from Main to Small likely overcrowded the limited (10%) probation area, preventing new items from establishing residency and leading to high churn in dynamic scenarios.
+**Program Identifier:** Generation 69 - Patch Name extended_ghost_and_decay - Correct Program: True
+
+**Program Name: S3-FIFO with Ghost Registry and Capacity-Gated Demotion**
+- **Implementation**: This approach modifies S3-FIFO by adding a ghost queue for history tracking and a conditional demotion mechanism that moves cold Main items to the Small queue only when capacity permits.
+- **Performance**: It achieves a combined score of 0.23, performing exceptionally well on specific traces while struggling with low hit rates on many dynamic workloads.
+- **Feedback**: The ghost registry helps recover false negatives, but the restrictive demotion logic may cause cache stagnation, preventing efficient adaptation to shifting access patterns.
+**Program Identifier:** Generation 70 - Patch Name s3_lru_ghost_v2 - Correct Program: True
+
+**Program Name: S3-FIFO with Ghost Queue and Conditional Demotion**
+- **Implementation**: This program implements an S3-FIFO variation using three ordered dictionaries (Small, Main, Ghost) where items found in the Ghost queue bypass the probationary Small queue upon re-insertion, and eviction relies on frequency bits with a conditional demotion strategy from Main to Small based on available budget.
+- **Performance**: The algorithm achieves a combined score of 0.23, demonstrating strong hit rates on stable working sets (e.g., traces 28, 34) but performing poorly on high-churn workloads.
+- **Feedback**: While the ghost queue mechanism improves handling of items that quickly re-enter the cache, the fixed 20% probationary budget and specific demotion logic struggle with aggressive scanning patterns, resulting in near-zero hit rates on several traces.
+**Program Identifier:** Generation 71 - Patch Name s3_enhanced_eviction - Correct Program: True
+
+**Program Name: S3-FIFO with Conditional Demotion and Ghost Frequency Boost**
+- **Implementation**: This algorithm utilizes an S3-FIFO structure with a 20% small queue, where cold items evicted from the main queue are conditionally demoted back to the small queue if space permits, and ghost hits are promoted to main with an initial frequency bonus.
+- **Performance**: The model achieved a combined score of 0.23, demonstrating highly variable performance with excellent hit rates on specific traces (up to 88%) but near-zero results on others.
+- **Feedback**: The conditional demotion logic likely retains decaying items too long, crowding out new insertions in the small queue, while the aggressive frequency boost for ghost hits may preserve obsolete items in dynamic workloads.
+**Program Identifier:** Generation 72 - Patch Name s3_fifo_optimized_p - Correct Program: True
+
+**Program Name: S3-FIFO with Ghost Queue and Demotion Strategy**
+- **Implementation**: Implements S3-FIFO using Small, Main, and Ghost queues, where items evicted from Main with zero frequency are conditionally demoted to Small, and Ghost hits promote directly to Main.
+- **Performance**: Achieves a combined score of 0.22, showing high variance with strong results on specific traces (up to 88%) but near-zero hit rates on many others.
+- **Feedback**: The addition of Main-to-Small demotion and a large Ghost queue attempts to improve retention, but the inconsistent performance suggests the tuning fails to adapt to high-churn workloads where the probation queue may become clogged with demoted items.
+**Program Identifier:** Generation 73 - Patch Name s3_fifo_tuned - Correct Program: True
+
+**Program Name: S3-FIFO with Demotion and Ghost Queue**
+- **Implementation**: Maintains a probationary "Small" queue (10% capacity) and a protected "Main" queue, where items evicted from Main are demoted back to Small rather than immediately discarded. A ghost queue is used to fast-track previously evicted items directly to the Main queue upon re-access.
+- **Performance**: Achieved a combined score of 0.25, showing strong hit rates on frequency-heavy traces but lower effectiveness on scan-heavy workloads.
+- **Feedback**: The demotion mechanism provides a robust second chance for items leaving the protected segment, though the static queue sizing limits adaptability compared to algorithms with dynamic resizing.
+**Program Identifier:** Generation 74 - Patch Name s3fifo_d_reset - Correct Program: True
+
+**Program Name: S3-FIFO with Demotion (S3-FIFO-D)**
+- **Implementation**: Implements a segmented cache with a probationary "Small" queue (20%) and a protected "Main" queue (80%), using a ghost queue for history and a specific policy where unreferenced Main items are demoted to Small rather than evicted immediately.
+- **Performance**: Achieved a combined score of 0.23, with exceptional performance on specific high-locality traces (up to 88% hit rate) but poor results (<5%) on many scan-heavy workloads.
+- **Feedback**: The demotion mechanism helps retain working sets in static scenarios, but the fixed partition sizes and movement of cold items back to the probationary queue likely cause cache pollution during sequential scans.
+**Program Identifier:** Generation 75 - Patch Name s3_fifo_conditional_demotion - Correct Program: True
+
+**Program Name: S3-FIFO with Conditional Demotion and Ghost Queue**
+- **Implementation**: Implements a probationary Small queue (20%) and protected Main queue (80%) with a Ghost queue for history tracking, uniquely applying conditional demotion where items evicted from Main only return to Small if space permits.
+- **Performance**: Achieves a combined score of 0.23, showing high efficiency on specific locality-heavy traces (up to 0.88 hit rate) but struggling significantly on sparse or scanning workloads (often < 5%).
+- **Feedback**: The strict conditional demotion logic, which bypasses the Small queue when full, likely causes premature eviction of potentially useful items during high-churn periods. Additionally, the static 20/80 partition may be too rigid to adapt to the wide variance in trace characteristics.
+**Program Identifier:** Generation 76 - Patch Name s3_fifo_optimized - Correct Program: True
+
+**Program Name: Smart S3-FIFO v2 with Ghost Rescue and Demotion**
+- **Implementation**: Modifies S3-FIFO with a 20% probationary queue target, a 4x ghost registry, and a mechanism where ghost hits enter the main queue with "warm" status while cold main items demote to probationary.
+- **Performance**: Achieved a combined score of 0.24, with high hit rates on looping traces (e.g., 0.88) but very low performance on many others (<0.05).
+- **Feedback**: The warm start for ghost hits effectively captures loops, but the rigid queue sizing and demotion logic appear brittle, failing to adapt to changing working set sizes in diverse workloads.
+**Program Identifier:** Generation 77 - Patch Name smart_s3fifo_v2 - Correct Program: True
+
+**Program Name: Hyper S3-FIFO with Frequency Decay**
+- **Implementation**: Combines a 20% probationary queue with a protected queue using 3-bit frequency counters that decay on eviction; notably, it only allows demotion from protected to probationary if the latter has spare capacity.
+- **Performance**: Achieves a combined score of 0.23, performing well on static frequency traces (up to 0.89) but failing completely on large loop patterns (0.00 score on Trace 14).
+- **Feedback**: The strict conditional demotion logic (blocking M-to-S moves when S is full) bypasses the probationary buffer during high contention, causing the cache to lose track of working sets in loop-based workloads despite the expanded ghost registry.
+**Program Identifier:** Generation 78 - Patch Name hyper_s3fifo - Correct Program: True
+
+**Program Name: S3-FIFO with Adaptive Demotion and Extended Ghost**
+- **Implementation**: Extends S3-FIFO with a 20% small queue reservation, a 4x capacity ghost registry that grants frequency bonuses on promotion, and a conditional demotion mechanism that bypasses the small queue when full.
+- **Performance**: The algorithm scored 0.23 overall, demonstrating significant instability with excellent hit rates on some traces (0.88) and zero on others.
+- **Feedback**: While the conditional demotion logic aims to improve scan resistance by protecting the small queue, the aggressive promotion bonuses and rigid thresholds likely caused the poor adaptability observed in the low-scoring traces.
+**Program Identifier:** Generation 79 - Patch Name s3_fifo_adaptive_ghost_v2 - Correct Program: True
+
+**Program Name: Robust S3-FIFO with Always-Demote Policy**
+- **Implementation**: Uses two `OrderedDict` queues (Small/Main) with a ghost registry and global state reset, implementing an "always demote" policy where unreferenced Main-queue items are moved to the Small-queue.
+- **Performance**: The algorithm achieves a combined score of 0.24, excelling on high-locality workloads (up to 0.89 hit rate) while performing poorly on specific adversarial traces.
+- **Feedback**: The global reset effectively handles environment state persistence, but the demotion strategy combined with a constrained Small-queue size likely causes cache pollution, hindering performance on certain access patterns.
+**Program Identifier:** Generation 80 - Patch Name robust_s3fifo - Correct Program: True
+
+**Program Name: S3-FIFO with Demotion and Probabilistic Guard**
+- **Implementation**: This algorithm maintains probationary (Small) and protected (Main) FIFO queues, using a probabilistic guard to insert new items at the head of the Small queue (immediate eviction) when full, and uniquely demotes evicted Main items back to the Small queue.
+- **Performance**: The program achieves a combined score of 0.24, performing well on frequency-biased workloads but failing completely on specific loop traces (e.g., 0.00% hit rate on trace 14).
+- **Feedback**: The strategy of demoting items from Main to Small instead of direct eviction likely contributes to thrashing or pollution in strict looping patterns; the probabilistic admission is a good concept but needs tuning to avoid rejecting too many items in scan-heavy scenarios.
+**Program Identifier:** Generation 81 - Patch Name reset_scan_ghost_tuning - Correct Program: True
+
+**Program Name: S3-FIFO with Demotion and Robust State Management**
+- **Implementation**: Implements S3-FIFO with a 10% probationary queue and a 90% main queue, where cold items evicted from the main queue are demoted back to probation for a final chance, managed via global state resets.
+- **Performance**: Achieves a combined score of 0.25, with high hit rates on looping patterns (e.g., 89%) but near-zero performance on scan-heavy traces.
+- **Feedback**: The demotion mechanism effectively retains warm data by preventing immediate eviction from the main cache, though the static queue sizing leads to significant performance disparities across different workload types.
+**Program Identifier:** Generation 82 - Patch Name s3fifo_robust_demotion - Correct Program: True
+
+**Program Name: Smart S3-FIFO with Ghost Registry and Conditional Demotion**
+- **Implementation**: Enhances S3-FIFO with a ghost registry for efficient re-entry, integer frequency counters with decay, and a conditional demotion policy that evicts cold Main items directly if the Small queue is full.
+- **Performance**: Achieves a combined score of 0.23, showing strong results on high-locality traces (up to 89% hit rate) but struggling significantly with scan-heavy or random workloads.
+- **Feedback**: The ghost registry helps rescue false negatives, but the strict eviction from the Main queue when the Small queue is full likely causes premature data loss for working sets that exceed the Main queue's capacity.
+**Program Identifier:** Generation 83 - Patch Name improved_smarts3fifo - Correct Program: True
+
+**Program Name: S3-FIFO with Extended Ghost and Tenancy Bonus**
+- **Implementation**: This S3-FIFO variant uses a fixed 10% probationary / 90% main queue split and a 5x capacity ghost registry, granting items rescued from ghost a frequency bonus (set to 1) in the main queue to ensure short-term survival. It employs frequency-based eviction logic and conditionally demotes victims from the main queue back to the probationary queue if space allows.
+- **Performance**: Achieved a combined score of 0.23, demonstrating high hit rates on specific looping workloads (e.g., 0.89 on trace 28) but failing significantly on scan-heavy or high-churn traces (e.g., 0.00 on trace 14).
+- **Feedback**: While the extended ghost registry improves loop detection, the static queue sizing and specific demotion logic lack the adaptability required for diverse workloads, leading to inconsistent performance across the benchmark suite.
+**Program Identifier:** Generation 84 - Patch Name s3fifo_freq_ghost - Correct Program: True
+
+**Program Name: S3-FIFO with Ghost Registry and Aggressive Scan Filtering**
+- **Implementation**: Enhances S3-FIFO with a Ghost registry for Main queue promotion and applies a strict probabilistic filter that inserts 90% of new items at the head of the Small queue when full.
+- **Performance**: Achieved a combined score of 0.24, excelling on static patterns but failing significantly (near 0% hit rate) on many dynamic traces.
+- **Feedback**: The aggressive filtering mechanism (10% survival rate) prevents the cache from learning new working sets in dynamic workloads, causing valid items to be evicted before their second access.
+**Program Identifier:** Generation 85 - Patch Name s3_fifo_scan_resistant - Correct Program: True
+
+**Program Name: S3-FIFO with 2-bit Frequency and 3x Ghost Registry**
+- **Implementation**: This approach modifies S3-FIFO by replacing the boolean access bit with a 0-3 frequency counter and expanding the ghost registry to 3x capacity. It utilizes a Small/Main queue split where ghost hits promote to Main with reset frequency to validate tenancy.
+- **Performance**: The algorithm scores 0.24 overall, excelling on mixed and frequency-biased traces (Trace 28: 0.89) while failing completely on specific loop patterns (Trace 14: 0.0).
+- **Feedback**: Expanding the ghost registry offers limited benefit for difficult loops, and resetting frequency to zero upon promotion likely causes premature eviction of recurring items.
+**Program Identifier:** Generation 86 - Patch Name s3_fifo_multibit_expanded_ghost - Correct Program: True
+
+**Program Name: S3-FIFO with Frequency Retention and Extended Ghost Registry**
+- **Implementation**: Utilizes an S3-FIFO structure with a double-capacity ghost queue and frequency counters (capped at 3) to manage promotion and demotion, employing a conservative zero-frequency reset for ghost rescues.
+- **Performance**: Achieves a combined score of 0.25, excelling on mixed patterns and high-locality workloads (e.g., Trace 28 hit rate 0.89) but struggling with large loops (Trace 14).
+- **Feedback**: The extended ghost registry aids in loop detection, but the conservative rescue policy (resetting frequency to zero) likely hampers rapid adaptation to reoccurring hot items.
+**Program Identifier:** Generation 87 - Patch Name s3_fifo_freq_xghost - Correct Program: True
+
+**Program Name: S3-FIFO with Early Discharge Queue and Probabilistic Admission**
+- **Implementation**: This S3-FIFO variant adds an "Early Discharge" queue to filter scans, probabilistically directing 75% of overflows there, and grants a frequency bonus to items promoted from the ghost history.
+- **Performance**: The program achieves a combined score of 0.24, with strong performance on static locality traces (up to 89%) but poor results on dynamic or sparse workloads (often <3%).
+- **Feedback**: The fixed probabilistic admission to the discharge queue effectively guards against scans but appears too rigid for changing workloads, causing significant misses on traces that require rapid adaptation or have low repetition.
+**Program Identifier:** Generation 88 - Patch Name s3_fifo_pa_tb - Correct Program: True
+
+**Program Name: S3-FIFO with Ghost List and Demotion Strategy**
+- **Implementation**: This algorithm extends S3-FIFO by adding a "ghost" queue to track evicted items for quick promotion and implements a demotion logic where items evicted from the main queue return to the small queue for a second chance.
+- **Performance**: The approach achieves a combined score of 0.25, excelling on static locality traces but performing poorly on many others (e.g., trace 14 with 0.0 hit rate).
+- **Feedback**: While the ghost list aids loop detection, the demotion strategy (Main to Small) likely increases the retention of cold items during scans, preventing the cache from adapting quickly to new working sets.
+**Program Identifier:** Generation 89 - Patch Name S3FIFO_GhostBonus_Decay - Correct Program: True
+
+# GLOBAL INSIGHTS SCRATCHPAD
+
+The following are global insights about optimization approaches and their effectiveness:
+
+Based on the evaluation of Generations 80-89 and the continued dominance of the Current Best Program (Generation 74), here are the optimization insights:
+
+## Successful Algorithmic Patterns
+- **Unconditional Demotion to Probation (Confirmed):** The top-performing programs in this batch (**Gen 82**, **Gen 87**, **Gen 89**, all scoring **0.25**) reinforce the success of the **Current Best Program (Gen 74)**. This strategy mandates that *all* items evicted from the Main queue (frequency 0) are demoted to the Small (probationary) queue, regardless of the Small queue's current size. This "second chance" mechanism is crucial for retaining decaying working sets in high-locality traces (Trace 28).
+- **Static 10% Probation / 90% Main Split:** The 0.25 scoring programs consistently utilized a strict 10/90 split. This allocation maximizes the protected region for frequency-biased workloads, achieving high hit rates on Trace 28 (0.89) and Trace 27 (0.82). This proved superior to dynamic sizing or larger probationary buffers.
+- **Strict Priority Eviction Loop:** The **Current Best Program** succeeds because of its specific eviction loop structure: `while True: if len(s_queue) > s_capacity ...`. This ensures that if an item is demoted from Main to Small, the loop immediately re-evaluates the Small queue's size and performs an eviction from Small if necessary. This transforms the Small queue into a strict flow-through filter, preventing the unconditional demotion policy from bloating the cache.
+
+## Ineffective Approaches
+- **Conditional (Capacity-Gated) Demotion:** **Gen 83** and **Gen 84** (Score 0.23) attempted to demote Main items *only* if the Small queue had space. This logic consistently fails because the Small queue is full under pressure, causing the algorithm to default to standard eviction and losing the critical "second chance" mechanism for warm data.
+- **Probabilistic Admission/Guards:** **Gen 81** and **Gen 85** (Score 0.24) introduced probabilistic filters to guard the Small queue against scans. While this theoretically improves scan resistance, in practice, it rejected valid items in dynamic workloads before they could acquire frequency, preventing the cache from learning new working sets.
+- **Complex Tenancy Bonuses:** **Gen 84** attempted to give ghost-rescued items a "frequency bonus" (start at 1 instead of 0). This failed to improve performance (Score 0.23) compared to the **Current Best Program's** approach of resetting frequency to 0. The zero-reset forces promoted items to immediately prove their utility again, acting as a better filter than artificial tenure.
+
+## Implementation Insights
+- **Reset-to-Zero Policy:** The **Current Best Program** and **Gen 87** effectively use a policy where items moving between queues (Main -> Small or Ghost -> Main) have their frequency counts reset to 0. This "clean slate" approach simplifies the logic and prevents stale heavy hitters from monopolizing the cache, relying on the queue position (MRU insertion) rather than a counter value to provide the initial grace period.
+- **Decoupled Frequency Management:** The effectiveness of **Gen 74** relies on maintaining `access_counts` in a separate dictionary rather than as an object attribute. This allows the eviction logic to instantaneously "decay" or "reset" frequency values during the `while` loop without needing to re-create objects or update the queue structure itself, minimizing overhead during high-churn operations.
+- **Ghost Registry Sizing (2x):** While **Gen 84** tested a 5x ghost registry, it did not outperform the 2x capacity used in the **Current Best Program** and **Gen 87**. The 2x size appears sufficient to bridge the gap for the looping patterns in this suite (Trace 27, 34) without incurring the management overhead or false positives of a larger history.
+
+## Performance Analysis
+- **The 0.25 Stability:** The score of 0.25 represents a stable local maximum achieved by **Gen 74**, **Gen 82**, **Gen 87**, and **Gen 89**. These programs share the core architecture of S3-FIFO with 10% probation and unconditional demotion. Deviations from this core (e.g., conditional demotion in **Gen 83** or probabilistic guards in **Gen 88**) consistently drop the score to 0.23 or 0.24.
+- **Locality vs. Scan Trade-off:** The high performance of the 0.25 cohort is driven by maximizing static locality (Trace 28: ~0.89 hit rate) at the expense of adversarial loop patterns (Trace 14: 0.00). Programs that improved Trace 14 performance (like **Gen 85** or **Gen 88**) generally did so by sacrificing significant hit rate on Trace 28, resulting in a lower net score.
+- **Resilience to Complexity:** The evaluation shows that adding complexity—such as separate discharge queues (**Gen 88**) or multi-bit frequency retention (**Gen 86**)—often degrades performance compared to the simpler binary/integer logic of the **Current Best Program**. The "dumb" strategy of always demoting and letting the Small queue filter naturally is more robust than trying to predict which items deserve to stay.
+
+# META RECOMMENDATIONS
+
+The following are actionable recommendations for the next program generations:
+
+Based on the analysis of Generation 80-89 and the performance of the Current Best Program (Generation 74), here are 5 actionable recommendations for future mutations. These recommendations prioritize addressing the 0.00% hit rate on scan traces (Trace 14) while preserving and enhancing the strong static locality (Trace 28) identified in the successful programs.
+
+1.  **Ghost-Gated Admission Policy (Scan Resistance)**
+    Implement a "Reject-to-Ghost" policy for new items to solve the 0.00 score on Trace 14. In `update_after_insert`, if the `s_queue` is full and the item is *not* in the `ghost_registry`, do not admit it to the cache; instead, add it directly to the `ghost_registry` and return. This prevents one-time-use items (scans) from displacing the valuable "second chance" items demoted from the Main queue, effectively utilizing the metadata-only Ghost registry as a primary filter during congestion.
+
+2.  **Extended Ghost Registry Capacity**
+    Increase the `ghost_registry` capacity from `2x` to `4x` or `5x` of the cache size. This expansion is computationally cheap (metadata only) but essential to support the "Ghost-Gated Admission" policy (#1) and to better capture large looping patterns (Traces 27, 34) that exceed the current history horizon.
+
+3.  **Increased Frequency Ceiling**
+    Raise the maximum `access_counts` cap from `3` to `7`. The current low ceiling limits the algorithm's ability to distinguish between "moderately warm" and "extremely hot" items. A larger frequency range provides a deeper buffer for the core working set in the Main queue, preventing premature demotion during temporary bursts of churn and reinforcing the high hit rates on Trace 28.
+
+4.  **Lazy Promotion Threshold**
+    Strengthen the promotion criteria from the Small queue to the Main queue by requiring `freq > 1` (two hits) instead of the current `freq > 0` (one hit). Under this policy, items with only a single hit in probation are evicted to the Ghost registry rather than promoted. This acts as a stricter filter against "one-hit wonders," ensuring the protected Main queue is reserved for items with stronger evidence of recurrence.
+
+5.  **Reduced Probation Queue Allocation**
+    If the "Ghost-Gated Admission" (#1) is implemented, the Small queue no longer needs to buffer large volumes of new traffic. Experiment with reducing the static `s_queue` allocation from 10% to 5% (and increasing Main to 95%). This maximizes the protected region for the heavy hitters (Trace 28) while relying on the Ghost registry to handle the initial filtering of new items.

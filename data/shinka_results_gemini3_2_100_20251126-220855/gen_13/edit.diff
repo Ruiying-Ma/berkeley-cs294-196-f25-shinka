@@ -1,0 +1,278 @@
+--- a/original.py
++++ b/original.py
+@@ -1,165 +1,160 @@
+ # EVOLVE-BLOCK-START
+ """Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+ 
+-# ARC Global State
+-m_lru = {}    # key -> access_count
+-m_t1 = set()  # T1 keys (Recent)
+-m_t2 = set()  # T2 keys (Frequent)
+-m_b1 = set()  # B1 keys (Ghost Recent)
+-m_b2 = set()  # B2 keys (Ghost Frequent)
+-m_p = 0.0     # Adaptation parameter (Target T1 size)
++from collections import OrderedDict
++
++# LIRS Global State
++# m_s: Stack S. Stores LIR and HIR blocks. Ordered by recency.
++#      Keys: object keys. Values: None (dummy). MRU at end.
++# m_q: Queue Q. Stores Resident HIR blocks. Keys: object keys. MRU at end.
++# m_lir: Set of keys that are currently LIR status.
++m_s = OrderedDict()
++m_q = OrderedDict()
++m_lir = set()
+ m_last_access_count = 0
+ 
++# Constants
++HIR_RATIO = 0.01
++
+ def check_reset(cache_snapshot):
+-    global m_last_access_count, m_lru, m_t1, m_t2, m_b1, m_b2, m_p
+-    current_count = cache_snapshot.access_count
+-    if current_count < m_last_access_count:
+-        m_lru.clear()
+-        m_t1.clear()
+-        m_t2.clear()
+-        m_b1.clear()
+-        m_b2.clear()
+-        m_p = 0.0
+-    m_last_access_count = current_count
++    global m_last_access_count, m_s, m_q, m_lir
++    if cache_snapshot.access_count < m_last_access_count:
++        m_s.clear()
++        m_q.clear()
++        m_lir.clear()
++    m_last_access_count = cache_snapshot.access_count
++
++def prune_stack():
++    '''Ensure the bottom of Stack S is a LIR block.'''
++    global m_s, m_lir
++    while m_s:
++        k = next(iter(m_s))
++        if k not in m_lir:
++            m_s.popitem(last=False)
++        else:
++            break
+ 
+ def evict(cache_snapshot, obj):
+     '''
+-    This function defines how the algorithm chooses the eviction victim.
++    LIRS Eviction:
++    - Prefer evicting Resident HIR (front of Q).
++    - If needed, evict LIR (bottom of S).
+     '''
+     check_reset(cache_snapshot)
+-    global m_p, m_t1, m_t2, m_b1, m_b2, m_lru
++    global m_s, m_q, m_lir
+ 
+-    # ARC Adaptation: Adjust p based on ghost hits
+-    if obj.key in m_b1:
+-        delta = 1.0
+-        if len(m_b1) < len(m_b2):
+-            delta = float(len(m_b2)) / len(m_b1)
+-        m_p = min(float(cache_snapshot.capacity), m_p + delta)
+-    elif obj.key in m_b2:
+-        delta = 1.0
+-        if len(m_b2) < len(m_b1):
+-            delta = float(len(m_b1)) / len(m_b2)
+-        m_p = max(0.0, m_p - delta)
++    # Ensure S is pruned
++    prune_stack()
+ 
+-    # Filter sets to match actual cache (handle drift/init)
+-    t1_real = [k for k in m_t1 if k in cache_snapshot.cache]
+-    t2_real = [k for k in m_t2 if k in cache_snapshot.cache]
++    # Victim from Q (Resident HIR)
++    if m_q:
++        return next(iter(m_q))
+ 
+-    # Fallback
+-    if not t1_real and not t2_real:
+-        t1_real = list(cache_snapshot.cache.keys())
++    # Victim from LIR (if Q empty)
++    if m_s:
++        return next(iter(m_s))
+ 
+-    # ARC Replace Logic
+-    replace_t1 = False
+-    if len(t1_real) > 0 and len(t1_real) > m_p:
+-        replace_t1 = True
+-    elif len(t1_real) > 0 and (obj.key in m_b2) and (len(t1_real) == int(m_p)):
+-        replace_t1 = True
+-
+-    victim_key = None
+-    if (replace_t1 or not t2_real) and t1_real:
+-        victim_key = min(t1_real, key=lambda k: m_lru.get(k, 0))
+-    else:
+-        # Evict from T2
+-        victim_key = min(t2_real, key=lambda k: m_lru.get(k, 0))
+-
+-    return victim_key
++    # Fallback (should not be reached)
++    return next(iter(cache_snapshot.cache)) if cache_snapshot.cache else None
+ 
+ def update_after_hit(cache_snapshot, obj):
+-    '''
+-    Update metadata after hit. Move to T2.
+-    '''
+     check_reset(cache_snapshot)
+-    global m_lru, m_t1, m_t2, m_b1, m_b2
+-    m_lru[obj.key] = cache_snapshot.access_count
++    global m_s, m_q, m_lir
++    key = obj.key
++    capacity = cache_snapshot.capacity
++    target_lir = max(1, int(capacity * (1.0 - HIR_RATIO)))
+ 
+-    if obj.key in m_t1:
+-        m_t1.remove(obj.key)
+-        m_t2.add(obj.key)
+-    # If already in T2, stays in T2.
++    if key in m_lir:
++        # LIR Hit
++        if key in m_s:
++            m_s.move_to_end(key)
++        else:
++            # Restoration if desynced
++            m_s[key] = None
++        prune_stack()
++
++    elif key in m_q:
++        # Resident HIR Hit
++        if key in m_s:
++            # HIR in Stack -> Promote to LIR
++            m_lir.add(key)
++            del m_q[key]
++            m_s.move_to_end(key)
++
++            # Demote if needed
++            if len(m_lir) > target_lir:
++                # Bottom of S is the LIR to demote (due to prune)
++                demoted = next(iter(m_s))
++                m_lir.remove(demoted)
++                m_s.popitem(last=False)
++                m_q[demoted] = None
++                # Prune S again because new bottom might be HIR
++                prune_stack()
++        else:
++            # Stay HIR
++            m_q.move_to_end(key)
++            m_s[key] = None
++
++    else:
++        # Access to item in cache but not in our structures (shouldn't happen)
++        # Treat as new insert
++        m_q[key] = None
++        m_s[key] = None
+ 
+ def update_after_insert(cache_snapshot, obj):
+-    '''
+-    Update metadata after insert. Handle ghost hits.
+-    '''
+     check_reset(cache_snapshot)
+-    global m_lru, m_t1, m_t2, m_b1, m_b2
+-    m_lru[obj.key] = cache_snapshot.access_count
++    global m_s, m_q, m_lir
++    key = obj.key
++    capacity = cache_snapshot.capacity
++    target_lir = max(1, int(capacity * (1.0 - HIR_RATIO)))
+ 
+-    if obj.key in m_b1:
+-        m_b1.remove(obj.key)
+-        m_t2.add(obj.key)
+-    elif obj.key in m_b2:
+-        m_b2.remove(obj.key)
+-        m_t2.add(obj.key)
++    if key in m_s:
++        # Non-Resident HIR -> Promote
++        m_lir.add(key)
++        m_s.move_to_end(key)
++
++        if len(m_lir) > target_lir:
++            demoted = next(iter(m_s))
++            m_lir.remove(demoted)
++            m_s.popitem(last=False)
++            m_q[demoted] = None
++            prune_stack()
+     else:
+-        # New object -> T1
+-        m_t1.add(obj.key)
+-        # Safety: ensure not in T2
+-        if obj.key in m_t2:
+-            m_t2.remove(obj.key)
++        # New -> HIR
++        m_q[key] = None
++        m_s[key] = None
+ 
+ def update_after_evict(cache_snapshot, obj, evicted_obj):
+-    '''
+-    Update metadata after eviction. Move to ghosts.
+-    '''
+     check_reset(cache_snapshot)
+-    global m_t1, m_t2, m_b1, m_b2, m_lru
++    global m_s, m_q, m_lir
++    key = evicted_obj.key
+ 
+-    if evicted_obj.key in m_t1:
+-        m_t1.remove(evicted_obj.key)
+-        m_b1.add(evicted_obj.key)
+-    elif evicted_obj.key in m_t2:
+-        m_t2.remove(evicted_obj.key)
+-        m_b2.add(evicted_obj.key)
+-
+-    # Manage ghost size: limit total ghosts to capacity
+-    target_ghost = cache_snapshot.capacity
+-    if len(m_b1) + len(m_b2) > target_ghost:
+-        # Evict LRU from ghosts (B1 U B2)
+-        # Optimization: Scan only if needed.
+-        # Simple implementation: check all ghosts.
+-        # Since ghosts are not in cache, we use m_lru timestamps.
+-        # But iterating all ghosts might be O(N). N=capacity. Accepted.
+-        victim_ghost = None
+-        min_ts = float('inf')
+-
+-        # Iterate B1
+-        for k in m_b1:
+-            ts = m_lru.get(k, 0)
+-            if ts < min_ts:
+-                min_ts = ts
+-                victim_ghost = k
+-        # Iterate B2
+-        for k in m_b2:
+-            ts = m_lru.get(k, 0)
+-            if ts < min_ts:
+-                min_ts = ts
+-                victim_ghost = k
+-
+-        if victim_ghost:
+-            if victim_ghost in m_b1: m_b1.remove(victim_ghost)
+-            elif victim_ghost in m_b2: m_b2.remove(victim_ghost)
+-            if victim_ghost in m_lru: del m_lru[victim_ghost]
++    if key in m_q:
++        del m_q[key]
++    if key in m_lir:
++        m_lir.remove(key)
++        if key in m_s:
++            del m_s[key]
++            prune_stack()
+ 
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

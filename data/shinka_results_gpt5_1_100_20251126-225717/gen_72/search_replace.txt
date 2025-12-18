@@ -1,0 +1,373 @@
+<NAME>
+tiny_wslru_scan_guard_and_tiny_admission
+</NAME>
+
+<DESCRIPTION>
+I introduce three coordinated improvements that target the largest weaknesses visible in the metrics (very low hit rates on scan-like traces and some over-promotion leading to protected-segment pressure):
+
+1) Stronger scan resistance in eviction: While scan_mode is active, always evict from the window first; if empty, evict from probation before touching protected. Additionally, when not in scan_mode, the victim selection now first tries to choose among window/probation candidates; protected is considered only if necessary. This reduces unnecessary evictions from protected and preserves hot items.
+
+2) Gentle TinyLFU-style admission and promotion control:
+   - On insert, if the incoming item is colder than the last evicted item and not a B2 ghost, insert at the window LRU (not MRU). This “doorkeeper” reduces pollution by very cold items.
+   - In scan_mode, new items are placed into the window LRU instead of probation LRU so they churn within the window and don’t pollute the main segments.
+   - On hit in probation (outside scans), require two-touch promotion unless the decayed frequency score is already above a small hot threshold. This curbs over-eager promotions that can bloat protected with items that won’t be reused.
+
+3) Minor prioritization tweaks in victim selection maintain the existing hot shielding while reinforcing the preference to evict from non-protected segments when alternatives exist.
+
+These changes align with W-TinyLFU principles combined with segmented LRU and ARC-style ghosts, improving robustness across workloads, especially under scans and mixed locality, thereby reducing miss rates.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    """
+    Choose an eviction victim key to make space for obj.
+    """
+    _maybe_age(cache_snapshot)
+    _sync_metadata(cache_snapshot)
+    _rebalance(cache_snapshot)
+
+    # Track unique for scan detection
+    try:
+        _epoch_unique.add(obj.key)
+    except Exception:
+        pass
+
+    if not cache_snapshot.cache:
+        return None
+
+    incoming_score = _score(obj.key)
+    hot_thr = _hot_thr(cache_snapshot)
+
+    # Prefer evicting from window during scans to avoid polluting main
+    if _scan_mode and _win:
+        # If window non-empty, choose its LRU
+        for k in _sample_lru_keys(_win, 1):
+            if k in cache_snapshot.cache:
+                return k
+
+    candidates = []
+    # Gather LRU-side samples from segments
+    for idx, k in enumerate(_sample_lru_keys(_win, _S_WIN)):
+        if k in cache_snapshot.cache:
+            s = _score(k)
+            hotter = 1 if s > incoming_score else 0
+            shield = 1 if s >= hot_thr else 0
+            seg_rank = 0  # window preferred
+            candidates.append((hotter, shield, s, seg_rank, idx, k))
+    for idx, k in enumerate(_sample_lru_keys(_prob, _S_PROB)):
+        if k in cache_snapshot.cache:
+            s = _score(k)
+            hotter = 1 if s > incoming_score else 0
+            shield = 1 if s >= hot_thr else 0
+            seg_rank = 1
+            candidates.append((hotter, shield, s, seg_rank, idx, k))
+    for idx, k in enumerate(_sample_lru_keys(_prot, _S_PROT)):
+        if k in cache_snapshot.cache:
+            s = _score(k)
+            hotter = 1 if s > incoming_score else 0
+            shield = 1 if s >= hot_thr else 0
+            seg_rank = 2  # protected least preferred
+            candidates.append((hotter, shield, s, seg_rank, idx, k))
+
+    if not candidates:
+        # fallback
+        return next(iter(cache_snapshot.cache.keys()))
+
+    # Select by: not hotter than incoming, not shielded hot, low score, prefer window/prob, older index
+    hotter, shield, s, seg_rank, idx, victim = min(candidates)
+    # If we ended up evicting from protected, we are being too aggressive; gently bias by shrinking prot in rebalance
+    if _key_seg.get(victim) == 'prot':
+        # count for later adaptation
+        global _evict_prot_cnt
+        _evict_prot_cnt += 1
+    else:
+        global _evict_prob_cnt
+        _evict_prob_cnt += 1
+    return victim
+=======
+def evict(cache_snapshot, obj):
+    """
+    Choose an eviction victim key to make space for obj.
+    """
+    _maybe_age(cache_snapshot)
+    _sync_metadata(cache_snapshot)
+    _rebalance(cache_snapshot)
+
+    # Track unique for scan detection
+    try:
+        _epoch_unique.add(obj.key)
+    except Exception:
+        pass
+
+    if not cache_snapshot.cache:
+        return None
+
+    incoming_score = _score(obj.key)
+    hot_thr = _hot_thr(cache_snapshot)
+
+    # Strong scan guard: evict from window first, then probation; avoid protected
+    if _scan_mode:
+        # Prefer window LRU
+        for k in _sample_lru_keys(_win, 1):
+            if k in cache_snapshot.cache:
+                return k
+        # Then probation LRU
+        for k in _sample_lru_keys(_prob, 1):
+            if k in cache_snapshot.cache:
+                return k
+        # Fall back to protected LRU if no alternative
+        for k in _sample_lru_keys(_prot, 1):
+            if k in cache_snapshot.cache:
+                return k
+
+    candidates = []
+    # Gather LRU-side samples from segments
+    for idx, k in enumerate(_sample_lru_keys(_win, _S_WIN)):
+        if k in cache_snapshot.cache:
+            s = _score(k)
+            hotter = 1 if s > incoming_score else 0
+            shield = 1 if s >= hot_thr else 0
+            seg_rank = 0  # window preferred
+            candidates.append((hotter, shield, s, seg_rank, idx, k))
+    for idx, k in enumerate(_sample_lru_keys(_prob, _S_PROB)):
+        if k in cache_snapshot.cache:
+            s = _score(k)
+            hotter = 1 if s > incoming_score else 0
+            shield = 1 if s >= hot_thr else 0
+            seg_rank = 1
+            candidates.append((hotter, shield, s, seg_rank, idx, k))
+    for idx, k in enumerate(_sample_lru_keys(_prot, _S_PROT)):
+        if k in cache_snapshot.cache:
+            s = _score(k)
+            hotter = 1 if s > incoming_score else 0
+            shield = 1 if s >= hot_thr else 0
+            seg_rank = 2  # protected least preferred
+            candidates.append((hotter, shield, s, seg_rank, idx, k))
+
+    if not candidates:
+        # fallback
+        return next(iter(cache_snapshot.cache.keys()))
+
+    # Prefer victims from window/probation when available; otherwise allow protected
+    non_prot = [c for c in candidates if c[3] < 2]
+    pool = non_prot if non_prot else candidates
+
+    # Select by: not hotter than incoming, not shielded hot, low score, prefer window/prob, older index
+    hotter, shield, s, seg_rank, idx, victim = min(pool)
+    if _key_seg.get(victim) == 'prot':
+        global _evict_prot_cnt
+        _evict_prot_cnt += 1
+    else:
+        global _evict_prob_cnt
+        _evict_prob_cnt += 1
+    return victim
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def update_after_hit(cache_snapshot, obj):
+    """
+    Update metadata after a cache hit.
+    """
+    _maybe_age(cache_snapshot)
+    _sync_metadata(cache_snapshot)
+
+    k = obj.key
+    _inc(k)
+    try:
+        _epoch_unique.add(k)
+    except Exception:
+        pass
+
+    seg = _key_seg.get(k)
+
+    fresh_window = max(1, int(max(cache_snapshot.capacity, 1)))
+    if seg == 'win':
+        last = _two_touch.get(k)
+        if last is not None and (_epoch - last) <= 1:
+            _two_touch.pop(k, None)
+            _place(k, 'prot', mru=True)  # two-touch promotion
+        else:
+            _two_touch[k] = _epoch
+            # refresh within window
+            if k in _win:
+                _win.move_to_end(k, last=True)
+            else:
+                _place(k, 'win', mru=True)
+    elif seg == 'prob':
+        if _scan_mode:
+            # require two-touch in probation during scans
+            last = _two_touch.get(k)
+            if last is not None and (_epoch - last) <= 1:
+                _two_touch.pop(k, None)
+                _place(k, 'prot', mru=True)
+            else:
+                _two_touch[k] = _epoch
+                if k in _prob:
+                    _prob.move_to_end(k, last=True)
+        else:
+            _place(k, 'prot', mru=True)
+    elif seg == 'prot':
+        # refresh protected
+        if k in _prot:
+            _prot.move_to_end(k, last=True)
+        else:
+            _place(k, 'prot', mru=True)
+        _two_touch.pop(k, None)
+    else:
+        # unknown key: place to window
+        _place(k, 'win', mru=True)
+
+    _rebalance(cache_snapshot)
+=======
+def update_after_hit(cache_snapshot, obj):
+    """
+    Update metadata after a cache hit.
+    """
+    _maybe_age(cache_snapshot)
+    _sync_metadata(cache_snapshot)
+
+    k = obj.key
+    _inc(k)
+    try:
+        _epoch_unique.add(k)
+    except Exception:
+        pass
+
+    seg = _key_seg.get(k)
+
+    fresh_window = max(1, int(max(cache_snapshot.capacity, 1)))
+    hot_thr = _hot_thr(cache_snapshot)
+
+    if seg == 'win':
+        last = _two_touch.get(k)
+        if last is not None and (_epoch - last) <= 1:
+            _two_touch.pop(k, None)
+            _place(k, 'prot', mru=True)  # two-touch promotion
+        else:
+            _two_touch[k] = _epoch
+            # refresh within window
+            if k in _win:
+                _win.move_to_end(k, last=True)
+            else:
+                _place(k, 'win', mru=True)
+    elif seg == 'prob':
+        if _scan_mode:
+            # require two-touch in probation during scans
+            last = _two_touch.get(k)
+            if last is not None and (_epoch - last) <= 1:
+                _two_touch.pop(k, None)
+                _place(k, 'prot', mru=True)
+            else:
+                _two_touch[k] = _epoch
+                if k in _prob:
+                    _prob.move_to_end(k, last=True)
+        else:
+            # Outside scans: promote only if sufficiently hot or two-touch within short window
+            if _score(k) >= hot_thr:
+                _place(k, 'prot', mru=True)
+            else:
+                last = _two_touch.get(k)
+                if last is not None and (_epoch - last) <= 1:
+                    _two_touch.pop(k, None)
+                    _place(k, 'prot', mru=True)
+                else:
+                    _two_touch[k] = _epoch
+                    if k in _prob:
+                        _prob.move_to_end(k, last=True)
+                    else:
+                        _place(k, 'prob', mru=True)
+    elif seg == 'prot':
+        # refresh protected
+        if k in _prot:
+            _prot.move_to_end(k, last=True)
+        else:
+            _place(k, 'prot', mru=True)
+        _two_touch.pop(k, None)
+    else:
+        # unknown key: place to window
+        _place(k, 'win', mru=True)
+
+    _rebalance(cache_snapshot)
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    """
+    Update metadata right after inserting a new object.
+    """
+    _maybe_age(cache_snapshot)
+    _sync_metadata(cache_snapshot)
+
+    k = obj.key
+    _inc(k)
+    try:
+        _epoch_unique.add(k)
+    except Exception:
+        pass
+
+    # Decide placement with ghost awareness
+    g1 = _B1.get(k)
+    g2 = _B2.get(k)
+    recent1 = g1 is not None and (_epoch - g1) <= 2
+    recent2 = g2 is not None and (_epoch - g2) <= 2
+
+    if _scan_mode:
+        # scan resistance: insert cold into probation LRU (avoid polluting window)
+        _place(k, 'prob', mru=False)
+    else:
+        if recent2:
+            _place(k, 'prot', mru=True)
+        elif recent1:
+            _place(k, 'prob', mru=True)
+        else:
+            # default into window MRU
+            _place(k, 'win', mru=True)
+
+    _rebalance(cache_snapshot)
+=======
+def update_after_insert(cache_snapshot, obj):
+    """
+    Update metadata right after inserting a new object.
+    """
+    _maybe_age(cache_snapshot)
+    _sync_metadata(cache_snapshot)
+
+    k = obj.key
+    _inc(k)
+    try:
+        _epoch_unique.add(k)
+    except Exception:
+        pass
+
+    # Decide placement with ghost awareness
+    g1 = _B1.get(k)
+    g2 = _B2.get(k)
+    recent1 = g1 is not None and (_epoch - g1) <= 2
+    recent2 = g2 is not None and (_epoch - g2) <= 2
+
+    incoming_score = _score(k)
+
+    if _scan_mode:
+        # Stronger scan resistance: keep scans in window LRU so window absorbs churn
+        _place(k, 'win', mru=False)
+    else:
+        if recent2:
+            _place(k, 'prot', mru=True)
+        elif recent1:
+            _place(k, 'prob', mru=True)
+        else:
+            # Tiny admission guard: if colder than last victim, insert at window LRU; else window MRU
+            if incoming_score < _last_victim_score:
+                _place(k, 'win', mru=False)
+            else:
+                _place(k, 'win', mru=True)
+
+    _rebalance(cache_snapshot)
+>>>>>>> REPLACE
+
+</DIFF>

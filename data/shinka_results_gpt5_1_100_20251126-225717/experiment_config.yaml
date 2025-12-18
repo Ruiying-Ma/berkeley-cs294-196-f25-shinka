@@ -1,0 +1,112 @@
+database_config:
+  archive_size: 20
+  db_path: /home/ruiying/ShinkaEvolve/examples/caching_gpt5_1/shinka_results/evolution_db.sqlite
+  elite_selection_ratio: 0.3
+  embedding_model: text-embedding-3-small
+  enforce_island_separation: true
+  exploitation_alpha: 1.0
+  exploitation_ratio: 0.2
+  island_elitism: true
+  migration_interval: 5
+  migration_rate: 0.1
+  num_archive_inspirations: 4
+  num_beams: 5
+  num_islands: 5
+  num_top_k_inspirations: 2
+  parent_selection_lambda: 10.0
+  parent_selection_strategy: weighted
+evolution_config:
+  code_embed_sim_threshold: 0.995
+  embedding_model: text-embedding-3-small
+  init_program_path: /home/ruiying/ShinkaEvolve/examples/caching_gpt5_1/initial.py
+  job_type: local
+  language: python
+  llm_dynamic_selection: ucb1
+  llm_dynamic_selection_kwargs:
+    exploration_coef: 1.0
+  llm_kwargs:
+    max_tokens: 32768
+    reasoning_efforts:
+    - auto
+    temperatures:
+    - 0.0
+    - 0.7
+    - 1.0
+  llm_models:
+  - gpt-5
+  max_novelty_attempts: 3
+  max_parallel_jobs: 1
+  max_patch_attempts: 3
+  max_patch_resamples: 3
+  meta_llm_kwargs:
+    max_tokens: 16384
+    temperatures:
+    - 0.7
+  meta_llm_models:
+  - gpt-5
+  meta_max_recommendations: 5
+  meta_rec_interval: 10
+  novelty_llm_kwargs:
+    max_tokens: 16384
+    temperatures:
+    - 0.7
+  novelty_llm_models:
+  - gpt-5
+  num_generations: 100
+  patch_type_probs:
+  - 0.6
+  - 0.3
+  - 0.1
+  patch_types:
+  - diff
+  - full
+  - cross
+  results_dir: /home/ruiying/ShinkaEvolve/examples/caching_gpt5_1/shinka_results
+  task_sys_msg: "You are an expert in computer system caching. \nOnly change code\
+    \ within EVOLVE-BLOCK-START and EVOLVE-BLOCK-END.\nYour task is to improve a cache\
+    \ eviction algorithm to minimize the cache miss rate. The cache receives a sequence\
+    \ of access requests for objects, and when the cache is full, it must evict an\
+    \ object to make space for a new one. The cache is full when the total number\
+    \ of cached objects reaches its capacity. Focus on improving the `evict` function,\
+    \ the `update_after_hit` function, the `update_after_insert` function, and the\
+    \ `update_after_evict` function to find a cache eviction algorithm with as low\
+    \ miss rate as possible.\n\n**TASK:** Improve the `evict` function, the `update_after_hit`\
+    \ function, the `update_after_insert` function, and the `update_after_evict` function\
+    \ to find optimal cache eviction algorithms that minimize miss rates.\n\n**PROBLEM\
+    \ SPECIFICS:**\n- **Input:** A sequence of cache access requests for objects\n\
+    - **Goal:** Find a cache eviction algorithm that minimizes the total number of\
+    \ cache misses\n- **Constraints:** The number of objects that can be stored in\
+    \ the cache is limited by its capacity.\n\n**INSTRUCTIONS:**\nFocus on evolving\
+    \ the `evict` function, the `update_after_hit` function, the `update_after_insert`\
+    \ function to produce the best algorithm possible with the minimal miss rate.\n\
+    - `evict` defines how the algorithm chooses the eviction victim.\n- `update_after_hit`\
+    \ defines how the algorithm update the metadata it maintains immediately after\
+    \ a cache hit.\n- `update_after_insert` defines how the algorithm updates the\
+    \ metadata it maintains immediately after inserting a new object into the cache.\n\
+    - `update_after_evict` defines how the algorithm updates the metadata it maintains\
+    \ immediately after evicting the victim.\nYou have read-only access to these data\
+    \ and no access to any functions:\n- An \"object\" represents the unit of a request,\
+    \ such as inserting an object into the cache or retrieving an object from the\
+    \ cache. Each object `obj` provides the following **read-only** attributes that\
+    \ you can reference:\n    - `obj.key` (str): A string that uniquely identifies\
+    \ the object.\n    - `obj.size` (int): A positive integer representing the size\
+    \ of the object in bytes.\n- You can also reference the following **read-only**\
+    \ attributes provided by a cache snapshots `cache_snapshot`:\n    - `cache_snapshot.cache`\
+    \ (dict): A dictionary containing the cached objects, where the keys are the objects'\
+    \ keys, and the values are the corresponding objects themselves.\n    - `cache_snapshot.size`\
+    \ (int): A non-negative integer representing the current total size of the cache\
+    \ in bytes.\n    - `cache_snapshot.capacity` (int): A positive integer representing\
+    \ the maximum allowed size of the cache in bytes.\n    - `cache_snapshot.access_count`\
+    \ (int): The current total number of cache accesses. You can also use this to\
+    \ represent current time.\n    - `cache_snapshot.hit_count` (int): The current\
+    \ total number of cache hits.\n    - `cache_snapshot.miss_count` (int): The current\
+    \ total number of cache misses.\n\nExplain step-by-step the reasoning process\
+    \ for your solution and how this will lead to a better cache eviction algorithm.\n"
+  use_text_feedback: false
+job_config:
+  conda_env: null
+  eval_program_path: /home/ruiying/ShinkaEvolve/examples/caching_gpt5_1/evaluate.py
+  extra_cmd_args: {}
+  time: 00:05:00
+results_directory: /home/ruiying/ShinkaEvolve/examples/caching_gpt5_1/shinka_results
+timestamp: '2025-11-26T14:01:02.082477'

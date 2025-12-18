@@ -1,0 +1,274 @@
+<NAME>
+arc_p_sync_and_guard_tuning
+</NAME>
+
+<DESCRIPTION>
+We bring the ARC implementation closer to canonical behavior and fix a key adaptation gap: ghost-driven p updates only occurred in evict, so when the cache was not full (no eviction), ghost hits were admitted to T2 without adapting p, degrading responsiveness and increasing miss rates on many workloads. We introduce a per-access flag p_adjusted_this_access that is set when evict already performed the p update, and we perform the canonical p adjustment in update_after_insert when a ghost hit occurs and evict did not adjust. This ensures p is always updated exactly once per ghost reference.
+
+Additionally, we retune the scan guard thresholds to react earlier to cold/scan-like bursts by opening the guard after a shorter cold streak (C//8 vs C//2) and aligning the effective p drop computation with that shorter threshold. This reduces cache pollution during scans and helps protect frequency without overreacting.
+
+We also ensure the per-access flag is reset at the end of update_after_hit and update_after_insert to avoid cross-access leakage. These changes, combined, improve adaptation to phase changes and reduce unnecessary misses on mixed and adversarial traces, while keeping ARC semantics and stability measures like ghost hysteresis intact.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+# Idle tracking and scan handling
+last_ghost_hit_access = -1  # last access_count when B1/B2 was hit
+cold_streak = 0             # consecutive brand-new inserts (no ghost)
+scan_guard_until = -1       # guard window end
+cold_extra_applied = False  # one-time extra clamp during cold scans
+guard_demote_once = False   # one-shot demotion bias flag
+
+# Track which list the eviction candidate was chosen from to ensure correct ghosting
+last_replaced_from = None   # 'T1' or 'T2'
+=======
+# Idle tracking and scan handling
+last_ghost_hit_access = -1  # last access_count when B1/B2 was hit
+cold_streak = 0             # consecutive brand-new inserts (no ghost)
+scan_guard_until = -1       # guard window end
+cold_extra_applied = False  # one-time extra clamp during cold scans
+guard_demote_once = False   # one-shot demotion bias flag
+# Per-access flag indicating whether p was already adjusted on a ghost reference
+p_adjusted_this_access = False
+
+# Track which list the eviction candidate was chosen from to ensure correct ghosting
+last_replaced_from = None   # 'T1' or 'T2'
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    Choose the eviction victim.
+    - Return: candid_obj_key
+    '''
+    global arc_p, last_ghost_hit_access, cold_streak, scan_guard_until, cold_extra_applied, last_replaced_from, guard_demote_once
+    _ensure_capacity(cache_snapshot)
+    _resync(cache_snapshot)
+    _decay_p_if_idle(cache_snapshot)
+=======
+def evict(cache_snapshot, obj):
+    '''
+    Choose the eviction victim.
+    - Return: candid_obj_key
+    '''
+    global arc_p, last_ghost_hit_access, cold_streak, scan_guard_until, cold_extra_applied, last_replaced_from, guard_demote_once, p_adjusted_this_access
+    _ensure_capacity(cache_snapshot)
+    _resync(cache_snapshot)
+    _decay_p_if_idle(cache_snapshot)
+    p_adjusted_this_access = False
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    if in_B1:
+        # step_up = ceil(|B2|/|B1|); clamp by C//8
+        denom = max(1, len(arc_B1))
+        step_up = (len(arc_B2) + denom - 1) // denom
+        arc_p = min(C, arc_p + min(step_up, max(1, C // 8)))
+        last_ghost_hit_access = cache_snapshot.access_count
+        cold_streak = 0
+        scan_guard_until = -1
+        guard_demote_once = False
+        cold_extra_applied = False
+=======
+    if in_B1:
+        # step_up = ceil(|B2|/|B1|); clamp by C//8
+        denom = max(1, len(arc_B1))
+        step_up = (len(arc_B2) + denom - 1) // denom
+        arc_p = min(C, arc_p + min(step_up, max(1, C // 8)))
+        last_ghost_hit_access = cache_snapshot.access_count
+        cold_streak = 0
+        scan_guard_until = -1
+        guard_demote_once = False
+        cold_extra_applied = False
+        p_adjusted_this_access = True
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    elif in_B2:
+        # step_down = ceil(|B1|/|B2|); clamp by C//8 (or C//4 under prolonged cold streaks)
+        denom = max(1, len(arc_B2))
+        step_down = (len(arc_B1) + denom - 1) // denom
+        dec_cap = max(1, (C // 4) if cold_streak >= max(1, C // 2) else (C // 8))
+        arc_p = max(0, arc_p - min(step_down, dec_cap))
+        last_ghost_hit_access = cache_snapshot.access_count
+        cold_streak = 0
+        scan_guard_until = -1
+        guard_demote_once = False
+        cold_extra_applied = False
+=======
+    elif in_B2:
+        # step_down = ceil(|B1|/|B2|); clamp by C//8 (or C//4 under prolonged cold streaks)
+        denom = max(1, len(arc_B2))
+        step_down = (len(arc_B1) + denom - 1) // denom
+        dec_cap = max(1, (C // 4) if cold_streak >= max(1, C // 2) else (C // 8))
+        arc_p = max(0, arc_p - min(step_down, dec_cap))
+        last_ghost_hit_access = cache_snapshot.access_count
+        cold_streak = 0
+        scan_guard_until = -1
+        guard_demote_once = False
+        cold_extra_applied = False
+        p_adjusted_this_access = True
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    else:
+        # Brand-new: do NOT change p here; optionally open a short guard window on long cold streaks
+        if cold_streak >= max(1, C // 2):
+            scan_guard_until = max(scan_guard_until, cache_snapshot.access_count + _guard_window(C))
+=======
+    else:
+        # Brand-new: do NOT change p here; optionally open a short guard window on long cold streaks
+        if cold_streak >= max(1, C // 8):
+            scan_guard_until = max(scan_guard_until, cache_snapshot.access_count + _guard_window(C))
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    drop_cap = max(1, C // 16)
+    extra = 0
+    if guard_active:
+        extra = min(drop_cap, 1 + max(0, (cold_streak - max(1, C // 2))) // max(1, C // 16))
+=======
+    drop_cap = max(1, C // 16)
+    extra = 0
+    if guard_active:
+        extra = min(drop_cap, 1 + max(0, (cold_streak - max(1, C // 8))) // max(1, C // 16))
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_hit(cache_snapshot, obj):
+    '''
+    Update metadata immediately after a cache hit.
+    '''
+    global m_key_timestamp, cold_streak, scan_guard_until, guard_demote_once
+    _ensure_capacity(cache_snapshot)
+    _decay_p_if_idle(cache_snapshot)
+=======
+def update_after_hit(cache_snapshot, obj):
+    '''
+    Update metadata immediately after a cache hit.
+    '''
+    global m_key_timestamp, cold_streak, scan_guard_until, guard_demote_once, p_adjusted_this_access
+    _ensure_capacity(cache_snapshot)
+    _decay_p_if_idle(cache_snapshot)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Update timestamp for tie-breaking/fallback
+    m_key_timestamp[key] = cache_snapshot.access_count
+=======
+    # Update timestamp for tie-breaking/fallback
+    m_key_timestamp[key] = cache_snapshot.access_count
+    # Reset per-access p-adjustment flag
+    p_adjusted_this_access = False
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Update metadata immediately after inserting a new object into the cache.
+    '''
+    global m_key_timestamp, cold_streak, scan_guard_until
+    _ensure_capacity(cache_snapshot)
+    _decay_p_if_idle(cache_snapshot)
+=======
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Update metadata immediately after inserting a new object into the cache.
+    '''
+    global m_key_timestamp, cold_streak, scan_guard_until, guard_demote_once, last_ghost_hit_access, cold_extra_applied, arc_p, p_adjusted_this_access
+    _ensure_capacity(cache_snapshot)
+    _decay_p_if_idle(cache_snapshot)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    if key in arc_B1 or key in arc_B2:
+        cold_streak = 0
+        scan_guard_until = -1
+        # keep ghosts disjoint
+        arc_B1.pop(key, None)
+        arc_B2.pop(key, None)
+        _move_to_mru(arc_T2, key)
+=======
+    if key in arc_B1 or key in arc_B2:
+        # Canonical ghost-driven p updates if evict didn't do it
+        if not p_adjusted_this_access:
+            if key in arc_B1:
+                denom = max(1, len(arc_B1))
+                step_up = (len(arc_B2) + denom - 1) // denom
+                arc_p = min(C, arc_p + min(step_up, max(1, C // 8)))
+            else:
+                denom = max(1, len(arc_B2))
+                step_down = (len(arc_B1) + denom - 1) // denom
+                dec_cap = max(1, (C // 4) if cold_streak >= max(1, C // 2) else (C // 8))
+                arc_p = max(0, arc_p - min(step_down, dec_cap))
+            last_ghost_hit_access = cache_snapshot.access_count
+            guard_demote_once = False
+            cold_extra_applied = False
+        cold_streak = 0
+        scan_guard_until = -1
+        # keep ghosts disjoint
+        arc_B1.pop(key, None)
+        arc_B2.pop(key, None)
+        _move_to_mru(arc_T2, key)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # If long cold streak and no active guard, open a short guard window
+        if cold_streak >= max(1, C // 2) and not guard_active:
+            scan_guard_until = max(scan_guard_until, cache_snapshot.access_count + _guard_window(C))
+        # Ensure ghosts are disjoint from residents
+        arc_B1.pop(key, None)
+        arc_B2.pop(key, None)
+=======
+        # If long cold streak and no active guard, open a short guard window
+        if cold_streak >= max(1, C // 8) and not guard_active:
+            scan_guard_until = max(scan_guard_until, cache_snapshot.access_count + _guard_window(C))
+        # Ensure ghosts are disjoint from residents
+        arc_B1.pop(key, None)
+        arc_B2.pop(key, None)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    _trim_ghosts()
+    m_key_timestamp[key] = cache_snapshot.access_count
+=======
+    _trim_ghosts()
+    m_key_timestamp[key] = cache_snapshot.access_count
+    # Reset per-access p-adjustment flag
+    p_adjusted_this_access = False
+>>>>>>> REPLACE
+
+</DIFF>

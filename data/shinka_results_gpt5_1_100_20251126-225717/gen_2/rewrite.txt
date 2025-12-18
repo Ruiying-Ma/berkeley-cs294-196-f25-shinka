@@ -1,0 +1,156 @@
+# EVOLVE-BLOCK-START
+"""Cache eviction algorithm using decayed LFU with ghost-admission bias."""
+
+import math
+
+# Compatibility ledger from legacy code (kept but not relied upon for policy)
+m_key_timestamp = dict()
+
+# Per-key decayed frequency state
+_score = dict()          # key -> decayed frequency score (float)
+_last_update = dict()    # key -> last timestamp when score was updated (int)
+
+# Ghost history: tracks last-access time for recently evicted keys to bias re-admission
+_ghost_last_access = dict()  # key -> last access time recorded at eviction
+
+
+def _half_life(cache_snapshot):
+    """
+    Choose a decay half-life scaled to cache capacity.
+    Larger caches get a longer memory; smaller caches emphasize recency more.
+    """
+    cap = max(int(getattr(cache_snapshot, "capacity", 1)), 1)
+    # Empirically effective: ~1.5x capacity accesses as half-life
+    return max(8, int(1.5 * cap))
+
+
+def _decay_factor(delta, hl):
+    if hl <= 0:
+        return 0.0
+    # Exponential decay to half every 'hl' accesses: 0.5 ** (delta/hl)
+    return math.pow(0.5, float(delta) / float(hl))
+
+
+def _current_score(key, now, hl):
+    s = _score.get(key, 0.0)
+    last = _last_update.get(key, now)
+    if s <= 0.0:
+        return 0.0
+    delta = now - last
+    if delta <= 0:
+        return s
+    return s * _decay_factor(delta, hl)
+
+
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    now = cache_snapshot.access_count
+    hl = _half_life(cache_snapshot)
+
+    # Select the key with the minimal decayed LFU score; tie-break by oldest last_update (LRU-ish).
+    min_key = None
+    min_score = None
+    min_last = None
+
+    for k in cache_snapshot.cache.keys():
+        cs = _current_score(k, now, hl)
+        lu = _last_update.get(k, now)
+        if (min_score is None) or (cs < min_score) or (cs == min_score and lu < min_last):
+            min_key = k
+            min_score = cs
+            min_last = lu
+
+    # Fallback (should not happen, but keep safe)
+    if min_key is None:
+        for k in cache_snapshot.cache:
+            min_key = k
+            break
+    return min_key
+
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    Update metadata immediately after a cache hit.
+    '''
+    global m_key_timestamp, _score, _last_update, _ghost_last_access
+
+    now = cache_snapshot.access_count
+    k = obj.key
+    hl = _half_life(cache_snapshot)
+
+    # Update decayed score lazily on access
+    cur = _current_score(k, now, hl)
+    _score[k] = cur + 1.0
+    _last_update[k] = now
+
+    # Maintain general ledger and ghost recency (used for admission)
+    m_key_timestamp[k] = now
+    _ghost_last_access[k] = now  # keep last access fresh for this key
+
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Update metadata immediately after inserting a new object into the cache.
+    '''
+    global m_key_timestamp, _score, _last_update, _ghost_last_access
+
+    now = cache_snapshot.access_count
+    k = obj.key
+    hl = _half_life(cache_snapshot)
+
+    # Admission bias: if the key was seen recently in ghost, give it a stronger initial score.
+    # Otherwise, keep a conservative initial score to avoid pollution.
+    base = 0.3
+    last_ghost = _ghost_last_access.get(k)
+    if last_ghost is not None:
+        # Recently evicted and accessed within a half-life -> boost
+        if (now - last_ghost) <= hl:
+            base = 1.2
+
+    _score[k] = base
+    _last_update[k] = now
+    m_key_timestamp[k] = now
+    # We do not remove from ghost here; admission bias can persist for a short time.
+
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Update metadata immediately after evicting the victim.
+    '''
+    global m_key_timestamp, _score, _last_update, _ghost_last_access
+
+    if evicted_obj is None:
+        return
+
+    ek = evicted_obj.key
+    # Record last access time of evicted key into ghost for admission decisions
+    last_seen = _last_update.get(ek, cache_snapshot.access_count)
+    _ghost_last_access[ek] = last_seen
+
+    # Remove from main metadata
+    _score.pop(ek, None)
+    _last_update.pop(ek, None)
+    m_key_timestamp.pop(ek, None)
+
+    # Bound ghost size to avoid unbounded growth: keep up to ~50x capacity recent ghosts
+    cap = max(int(getattr(cache_snapshot, "capacity", 1)), 1)
+    max_ghost = max(50 * cap, 100)  # ensure reasonable minimum
+    if len(_ghost_last_access) > max_ghost:
+        # Evict the stalest ghosts
+        # Remove approx 10% overflow to amortize cost
+        target = len(_ghost_last_access) - max_ghost
+        # Sort by last access ascending and drop 'target' items
+        # For performance, do a simple selection loop without full sort
+        # but given this triggers rarely, a sort is fine.
+        stale_items = sorted(_ghost_last_access.items(), key=lambda x: x[1])[:target]
+        for key, _ in stale_items:
+            _ghost_last_access.pop(key, None)
+
+# EVOLVE-BLOCK-END

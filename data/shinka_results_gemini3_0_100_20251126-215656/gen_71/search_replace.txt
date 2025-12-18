@@ -1,0 +1,227 @@
+<NAME>
+s3_enhanced_eviction
+</NAME>
+
+<DESCRIPTION>
+This update tunes the S3-FIFO algorithm to better handle scans and loops, addressing weaknesses in the current implementation.
+1.  **Small Queue Target (20%):** Increases the probationary queue size from 10% to 20% of the cache. This provides a larger buffer for new items to prove their worth, reducing thrashing of potentially useful data during high-churn periods (Recommendation 5).
+2.  **Capacity-Gated Conditional Demotion:** In `evict`, items evicted from the Main queue are now conditionally demoted to the Small queue only if there is available space (i.e., `len(Small) < s_target`). If the Small queue is full (e.g., during a scan), the item is evicted from the cache entirely. This mechanism preserves the effectiveness of the probationary queue by preventing it from being flooded with recycled Main items when it's already under pressure (Recommendation 1).
+3.  **Extended Ghost Queue (4x):** In `update_after_evict`, the Ghost queue capacity is increased to 4x the cache size. This expanded history allows the algorithm to detect and recover items from larger working sets and longer loops that exceed the physical cache size (Recommendation 2).
+4.  **Universal Ghost Tracking:** Evicted items from both Small and Main queues are now added to the Ghost queue to maximize loop detection coverage.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO eviction with Ghost Queue support.
+    Evicts from Small (Probation) or Main (Protected) based on S3-FIFO logic.
+    '''
+    global _s3_small, _s3_main, _s3_freq
+    _check_reset(cache_snapshot)
+
+    # Target size for small queue (10% of capacity)
+    curr_size = len(cache_snapshot.cache)
+    s_target = max(1, int(curr_size * 0.1))
+
+    while True:
+        # 1. Check Small FIFO (Probation)
+        # If Small is larger than target, we prefer to evict from it
+        if len(_s3_small) > s_target:
+            if not _s3_small:
+                break # Should be caught by outer checks, but safety
+
+            candidate = next(iter(_s3_small))
+
+            # Consistency check: if key not in actual cache, clean up and skip
+            if candidate not in cache_snapshot.cache:
+                _s3_small.pop(candidate, None)
+                _s3_freq.pop(candidate, None)
+                continue
+
+            # S3-FIFO Logic:
+            freq = _s3_freq.get(candidate, 0)
+            if freq > 0:
+                # Accessed while in Small -> Promote to Main
+                _s3_small.pop(candidate)
+                _s3_main[candidate] = None # Insert at tail (MRU)
+                _s3_freq[candidate] = 0    # Reset frequency
+                continue
+            else:
+                # Not visited: Evict from Small
+                return candidate
+
+        # 2. Check Main FIFO (Protected)
+        if _s3_main:
+            candidate = next(iter(_s3_main))
+
+            if candidate not in cache_snapshot.cache:
+                _s3_main.pop(candidate, None)
+                _s3_freq.pop(candidate, None)
+                continue
+
+            freq = _s3_freq.get(candidate, 0)
+            if freq > 0:
+                # Accessed while in Main -> Second Chance (Reinsert)
+                _s3_main.pop(candidate)
+                _s3_main[candidate] = None # Reinsert at tail
+                _s3_freq[candidate] = 0
+                continue
+            else:
+                # Not visited in Main: Evict
+                return candidate
+
+        # 3. Fallback: Main is empty or only contains active items that got reinserted?
+        # Force check Small if Main is empty and Small is not empty (even if <= target)
+        if not _s3_main and _s3_small:
+            candidate = next(iter(_s3_small))
+            if candidate not in cache_snapshot.cache:
+                _s3_small.pop(candidate, None)
+                _s3_freq.pop(candidate, None)
+                continue
+
+            freq = _s3_freq.get(candidate, 0)
+            if freq > 0:
+                 _s3_small.pop(candidate)
+                 _s3_main[candidate] = None
+                 _s3_freq[candidate] = 0
+                 continue
+            else:
+                 return candidate
+=======
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO eviction with Ghost Queue support.
+    Evicts from Small (Probation) or Main (Protected) based on S3-FIFO logic.
+    '''
+    global _s3_small, _s3_main, _s3_freq
+    _check_reset(cache_snapshot)
+
+    # Target size for small queue (20% of capacity)
+    curr_size = len(cache_snapshot.cache)
+    s_target = max(1, int(curr_size * 0.2))
+
+    while True:
+        # 1. Check Small FIFO (Probation)
+        # If Small is larger than target, we prefer to evict from it
+        if len(_s3_small) > s_target:
+            if not _s3_small:
+                break # Should be caught by outer checks, but safety
+
+            candidate = next(iter(_s3_small))
+
+            # Consistency check: if key not in actual cache, clean up and skip
+            if candidate not in cache_snapshot.cache:
+                _s3_small.pop(candidate, None)
+                _s3_freq.pop(candidate, None)
+                continue
+
+            # S3-FIFO Logic:
+            freq = _s3_freq.get(candidate, 0)
+            if freq > 0:
+                # Accessed while in Small -> Promote to Main
+                _s3_small.pop(candidate)
+                _s3_main[candidate] = None # Insert at tail (MRU)
+                _s3_freq[candidate] = 0    # Reset frequency
+                continue
+            else:
+                # Not visited: Evict from Small
+                return candidate
+
+        # 2. Check Main FIFO (Protected)
+        if _s3_main:
+            candidate = next(iter(_s3_main))
+
+            if candidate not in cache_snapshot.cache:
+                _s3_main.pop(candidate, None)
+                _s3_freq.pop(candidate, None)
+                continue
+
+            freq = _s3_freq.get(candidate, 0)
+            if freq > 0:
+                # Accessed while in Main -> Second Chance (Reinsert)
+                _s3_main.pop(candidate)
+                _s3_main[candidate] = None # Reinsert at tail
+                _s3_freq[candidate] = 0
+                continue
+            else:
+                # Not visited in Main: Conditional Demotion
+                # Only demote to Small if there is space in the probationary budget.
+                # This prevents "recycling" items during scans/thrashing.
+                if len(_s3_small) < s_target:
+                    _s3_main.pop(candidate)
+                    _s3_small[candidate] = None
+                    _s3_freq[candidate] = 0
+                    continue
+                else:
+                    return candidate
+
+        # 3. Fallback: Main is empty or only contains active items that got reinserted?
+        # Force check Small if Main is empty and Small is not empty (even if <= target)
+        if not _s3_main and _s3_small:
+            candidate = next(iter(_s3_small))
+            if candidate not in cache_snapshot.cache:
+                _s3_small.pop(candidate, None)
+                _s3_freq.pop(candidate, None)
+                continue
+
+            freq = _s3_freq.get(candidate, 0)
+            if freq > 0:
+                 _s3_small.pop(candidate)
+                 _s3_main[candidate] = None
+                 _s3_freq[candidate] = 0
+                 continue
+            else:
+                 return candidate
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    global _s3_small, _s3_main, _s3_ghost, _s3_freq
+    _check_reset(cache_snapshot)
+
+    key = evicted_obj.key
+
+    # If evicted from Small, track in Ghost
+    if key in _s3_small:
+        _s3_small.pop(key)
+        _s3_ghost[key] = None
+        # Limit ghost size to avoid unbounded memory usage
+        # Using cache capacity as a reasonable limit
+        if len(_s3_ghost) > cache_snapshot.capacity:
+            # Remove oldest (FIFO head)
+            _s3_ghost.pop(next(iter(_s3_ghost)), None)
+
+    elif key in _s3_main:
+        _s3_main.pop(key)
+
+    _s3_freq.pop(key, None)
+=======
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    global _s3_small, _s3_main, _s3_ghost, _s3_freq
+    _check_reset(cache_snapshot)
+
+    key = evicted_obj.key
+
+    # If evicted from Small, track in Ghost.
+    # Items evicted from Main (due to conditional demotion failure) are also effectively
+    # "evicted" in this context and should be tracked if we want to catch loops.
+
+    in_small = key in _s3_small
+    in_main = key in _s3_main
+
+    if in_small:
+        _s3_small.pop(key)
+    elif in_main:
+        _s3_main.pop(key)
+
+    # Always add to ghost on eviction to capture potential loops
+    _s3_ghost[key] = None
+
+    # Extended Ghost Registry Capacity (4x)
+    if len(_s3_ghost) > cache_snapshot.capacity * 4:
+        # Remove oldest (FIFO head)
+        _s3_ghost.pop(next(iter(_s3_ghost)), None)
+
+    _s3_freq.pop(key, None)
+>>>>>>> REPLACE
+</DIFF>

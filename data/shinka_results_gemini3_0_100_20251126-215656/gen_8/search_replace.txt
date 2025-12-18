@@ -1,0 +1,185 @@
+<NAME>
+gdsf_caching
+</NAME>
+
+<DESCRIPTION>
+Implement the Greedy Dual-Size Frequency (GDSF) algorithm.
+This algorithm assigns a priority score to each object based on its frequency and size, plus an aging factor 'L' which increases over time (set to the priority of the last evicted object).
+The priority formula is $H(obj) = L + (Frequency(obj) / Size(obj))$.
+This optimizes the hit rate by keeping small, frequently accessed objects, while the 'L' factor ensures that objects eventually age out if not accessed, preventing cache pollution.
+We also maintain a ghost frequency history (decayed on eviction) to better estimate frequency for re-inserted items.
+Tie-breaking is done using LRU (Least Recently Used).
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+m_key_timestamp = dict()
+m_key_frequency = dict()
+
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    Uses Hyperbolic Caching: Score = Frequency / (CurrentTime - LastAccessTime).
+    Evicts the object with the lowest score.
+    '''
+    current_time = cache_snapshot.access_count
+
+    # Find key with minimum hyperbolic score
+    # We compare f1/a1 < f2/a2 <=> f1*a2 < f2*a1 to avoid division and floats
+
+    min_key = None
+    min_freq = -1
+    min_age = -1
+
+    for key in cache_snapshot.cache:
+        # Safety check, though keys in cache should be in m_key_timestamp
+        if key not in m_key_timestamp: continue
+
+        freq = m_key_frequency.get(key, 1)
+        last_access = m_key_timestamp[key]
+        age = current_time - last_access
+        if age <= 0: age = 1
+
+        if min_key is None:
+            min_key = key
+            min_freq = freq
+            min_age = age
+        else:
+            # Compare current (freq, age) with min (min_freq, min_age)
+            # freq / age < min_freq / min_age  <=> freq * min_age < min_freq * age
+            val1 = freq * min_age
+            val2 = min_freq * age
+
+            if val1 < val2:
+                min_key = key
+                min_freq = freq
+                min_age = age
+            elif val1 == val2:
+                # Tie-breaker: LRU (oldest timestamp => largest age)
+                if age > min_age:
+                    min_key = key
+                    min_freq = freq
+                    min_age = age
+
+    return min_key
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    Update metadata after hit: update timestamp and increment frequency.
+    '''
+    global m_key_timestamp, m_key_frequency
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+    m_key_frequency[obj.key] = m_key_frequency.get(obj.key, 0) + 1
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Update metadata after insert: set timestamp, init or increment frequency (Ghost).
+    '''
+    global m_key_timestamp, m_key_frequency
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+    # Keep frequency history if available (Ghost Cache behavior)
+    if obj.key in m_key_frequency:
+        m_key_frequency[obj.key] += 1
+    else:
+        m_key_frequency[obj.key] = 1
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Update metadata after evict: remove timestamp, keep frequency.
+    '''
+    global m_key_timestamp
+    if evicted_obj.key in m_key_timestamp:
+        m_key_timestamp.pop(evicted_obj.key)
+    # We purposefully do NOT remove from m_key_frequency to retain history
+=======
+m_key_timestamp = dict()
+m_key_frequency = dict()
+m_key_priority = dict()
+g_L = 0.0
+
+def evict(cache_snapshot, obj):
+    '''
+    GDSF-like eviction: Score = L + Frequency / Size.
+    Evicts the object with the lowest score.
+    Updates L to the score of the evicted object.
+    Tie-breaker: LRU.
+    '''
+    global g_L
+
+    min_key = None
+    min_priority = float('inf')
+    min_ts = float('inf')
+
+    # Candidate selection: Find object with min priority
+    for key, item in cache_snapshot.cache.items():
+        # Ensure priority exists (recover if missing)
+        if key not in m_key_priority:
+            freq = m_key_frequency.get(key, 1)
+            size = item.size if item.size > 0 else 1
+            m_key_priority[key] = g_L + (freq / size)
+
+        p = m_key_priority[key]
+        ts = m_key_timestamp.get(key, 0)
+
+        if p < min_priority:
+            min_key = key
+            min_priority = p
+            min_ts = ts
+        elif p == min_priority:
+            # Tie-breaker: LRU (smallest timestamp)
+            if ts < min_ts:
+                min_key = key
+                min_ts = ts
+
+    # Update L to the priority of the evicted object
+    if min_key is not None:
+        g_L = min_priority
+
+    return min_key
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    Update metadata after hit: update timestamp, freq, priority.
+    '''
+    global m_key_timestamp, m_key_frequency, m_key_priority, g_L
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+    m_key_frequency[obj.key] = m_key_frequency.get(obj.key, 0) + 1
+
+    freq = m_key_frequency[obj.key]
+    size = obj.size if obj.size > 0 else 1
+    # GDSF update: H = L + F/S
+    m_key_priority[obj.key] = g_L + (freq / size)
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Update metadata after insert: set timestamp, init/update freq, priority.
+    '''
+    global m_key_timestamp, m_key_frequency, m_key_priority, g_L
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+
+    # Ghost frequency
+    if obj.key in m_key_frequency:
+        m_key_frequency[obj.key] += 1
+    else:
+        m_key_frequency[obj.key] = 1
+
+    freq = m_key_frequency[obj.key]
+    size = obj.size if obj.size > 0 else 1
+    # GDSF update
+    m_key_priority[obj.key] = g_L + (freq / size)
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Update metadata after evict: remove timestamp/priority, decay frequency.
+    '''
+    global m_key_timestamp, m_key_priority, m_key_frequency
+    if evicted_obj.key in m_key_timestamp:
+        m_key_timestamp.pop(evicted_obj.key)
+    if evicted_obj.key in m_key_priority:
+        m_key_priority.pop(evicted_obj.key)
+
+    # Decay frequency in history
+    if evicted_obj.key in m_key_frequency:
+        m_key_frequency[evicted_obj.key] //= 2
+>>>>>>> REPLACE
+</DIFF>

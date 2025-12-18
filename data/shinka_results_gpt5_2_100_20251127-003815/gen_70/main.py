@@ -1,0 +1,512 @@
+# EVOLVE-BLOCK-START
+"""Hybrid ARC + TinyLFU with LRFU-decayed sampling.
+
+Public API:
+- evict(cache_snapshot, obj) -> key
+- update_after_hit(cache_snapshot, obj)
+- update_after_insert(cache_snapshot, obj)
+- update_after_evict(cache_snapshot, obj, evicted_obj)
+"""
+
+from collections import OrderedDict
+import random
+
+
+class _ArcTinyLfuLrfu:
+    """
+    ARC resident sets with ghosts + TinyLFU for admission + LRFU decayed scores
+    for fine-grained victim selection within segments.
+    - T1: probationary (recency)
+    - T2: protected (frequency)
+    - B1, B2: ghosts to adapt ARC target p
+    """
+
+    __slots__ = (
+        # ARC segments
+        "T1", "T2", "B1", "B2", "p",
+        # TinyLFU sketch
+        "SKETCH_DEPTH", "sketch_w", "sketch", "sketch_ops", "age_threshold",
+        # LRFU metadata
+        "score", "last_time", "decay_half_life", "decay_base",
+        # run/misc
+        "last_access_seen", "miss_streak", "scan_cooldown",
+        # victim bookkeeping
+        "last_victim_key", "last_victim_from",
+        # sampling
+        "_sample_k",
+    )
+
+    def __init__(self):
+        # Resident and ghost sets
+        self.T1 = OrderedDict()
+        self.T2 = OrderedDict()
+        self.B1 = OrderedDict()
+        self.B2 = OrderedDict()
+        self.p = 0.0
+
+        # TinyLFU CMS
+        self.SKETCH_DEPTH = 4
+        self.sketch_w = 0
+        self.sketch = []
+        self.sketch_ops = 0
+        self.age_threshold = 0
+
+        # LRFU decayed scoring
+        self.score = {}
+        self.last_time = {}
+        self.decay_half_life = 16
+        self.decay_base = 2 ** (-1.0 / float(self.decay_half_life))
+
+        # Misc
+        self.last_access_seen = -1
+        self.miss_streak = 0
+        self.scan_cooldown = 0
+
+        # Victim tracking
+        self.last_victim_key = None
+        self.last_victim_from = None
+
+        # Sampling window from LRU side
+        self._sample_k = 8
+
+    # ---------- lifecycle / setup ----------
+
+    def _cap(self, cache_snapshot):
+        return max(1, int(cache_snapshot.capacity))
+
+    def _reset_if_new_run(self, cache_snapshot):
+        if cache_snapshot.access_count <= 1 or self.last_access_seen > cache_snapshot.access_count:
+            self.T1.clear(); self.T2.clear()
+            self.B1.clear(); self.B2.clear()
+            self.p = 0.0
+            self.sketch_w = 0
+            self.sketch = []
+            self.sketch_ops = 0
+            self.age_threshold = 0
+            self.score.clear(); self.last_time.clear()
+            self.decay_half_life = 16
+            self.decay_base = 2 ** (-1.0 / float(self.decay_half_life))
+            self.miss_streak = 0
+            self.last_victim_key = None
+            self.last_victim_from = None
+            self._sample_k = 8
+            self.scan_cooldown = 0
+        self.last_access_seen = cache_snapshot.access_count
+
+    def _prune_metadata(self, cache_snapshot):
+        # Keep resident sets consistent with actual cache
+        cache_keys = cache_snapshot.cache.keys()
+        for seg in (self.T1, self.T2):
+            stale = [k for k in seg.keys() if k not in cache_keys]
+            for k in stale:
+                seg.pop(k, None)
+        # Prune LRFU meta for non-resident non-ghost keys occasionally if needed
+        # (we remove on eviction; here we are conservative)
+
+    def _seed_from_cache(self, cache_snapshot):
+        # If both segments empty but cache has content, seed T1
+        if not self.T1 and not self.T2 and cache_snapshot.cache:
+            for k in cache_snapshot.cache.keys():
+                self.T1[k] = None
+
+    # ---------- TinyLFU ----------
+
+    def _ensure_sketch(self, cache_snapshot):
+        if self.sketch_w:
+            return
+        cap = self._cap(cache_snapshot)
+        target = max(512, 4 * cap)  # capacity-aware width
+        w = 1
+        while w < target:
+            w <<= 1
+        self.sketch_w = w
+        self.sketch = [[0] * self.sketch_w for _ in range(self.SKETCH_DEPTH)]
+        self.sketch_ops = 0
+        # Age period within [4C,16C], mid by default
+        self.age_threshold = max(4 * cap, min(16 * cap, 8 * cap))
+        # Tune LRFU decay relative to capacity (shorter for small caches)
+        self.decay_half_life = max(8, min(64, (cap // 2) or 8))
+        self.decay_base = 2 ** (-1.0 / float(self.decay_half_life))
+        # Sample size scales mildly with capacity
+        self._sample_k = max(4, min(12, (cap // 8) or 4))
+
+    def _hash_idx(self, key, i):
+        return (hash((key, i, 0x9E3779B97F4A7C15)) & (self.sketch_w - 1))
+
+    def _sketch_add(self, cache_snapshot, key, delta=1):
+        self._ensure_sketch(cache_snapshot)
+        if not self.sketch_w:
+            return
+        for i in range(self.SKETCH_DEPTH):
+            self.sketch[i][self._hash_idx(key, i)] += delta
+        self.sketch_ops += 1
+        if self.sketch_ops >= self.age_threshold:
+            for i in range(self.SKETCH_DEPTH):
+                row = self.sketch[i]
+                for j in range(self.sketch_w):
+                    row[j] >>= 1
+            self.sketch_ops = 0
+
+    def _sketch_est(self, cache_snapshot, key):
+        self._ensure_sketch(cache_snapshot)
+        if not self.sketch_w:
+            return 0
+        est = None
+        for i in range(self.SKETCH_DEPTH):
+            v = self.sketch[i][self._hash_idx(key, i)]
+            est = v if est is None or v < est else est
+        return est if est is not None else 0
+
+    # ---------- LRFU decayed score ----------
+
+    def _ensure_meta(self, key, now):
+        if key not in self.last_time:
+            self.last_time[key] = now
+        if key not in self.score:
+            self.score[key] = 0.0
+
+    def _decayed_score(self, key, now):
+        self._ensure_meta(key, now)
+        old = self.last_time[key]
+        dt = now - old
+        if dt > 0:
+            self.score[key] *= self.decay_base ** dt
+            self.last_time[key] = now
+        return self.score[key]
+
+    # ---------- helpers ----------
+
+    def _move_to_mru(self, seg, key):
+        if key in seg:
+            seg.move_to_end(key, last=True)
+        else:
+            seg[key] = None
+
+    def _trim_ghosts(self, cache_snapshot):
+        cap = self._cap(cache_snapshot)
+        max_g = 2 * cap
+        while len(self.B1) + len(self.B2) > max_g:
+            if len(self.B1) > len(self.B2):
+                self.B1.popitem(last=False)
+            else:
+                self.B2.popitem(last=False)
+
+    def _eviction_sample(self, cache_snapshot, seg):
+        """
+        Sample up to K keys from a randomized window within the LRU tail
+        (oldest min(4K, |seg|) keys). Choose lexicographic min:
+        (TinyLFU estimate, LRFU decayed score). Lower is colder.
+        """
+        if not seg:
+            return None
+        now = cache_snapshot.access_count
+        n = len(seg)
+        k = max(1, min(self._sample_k, n))
+        tail_len = min(n, k * 4)
+        # Collect the LRU-tail keys up to tail_len
+        tail_keys = []
+        it = iter(seg.keys())  # LRU -> MRU
+        for _ in range(tail_len):
+            try:
+                tail_keys.append(next(it))
+            except StopIteration:
+                break
+        if not tail_keys:
+            # Fallback: pick the LRU
+            for kk in seg.keys():
+                return kk
+            return None
+        # Randomized offset into the tail to avoid deterministic bias
+        max_start = max(0, len(tail_keys) - k)
+        start = random.randint(0, max_start) if max_start > 0 else 0
+        sample_keys = tail_keys[start:start + k]
+
+        best_k = None
+        best_f = None
+        best_d = None
+        for kk in sample_keys:
+            f = self._sketch_est(cache_snapshot, kk)
+            d = self._decayed_score(kk, now)
+            if (best_k is None
+                or f < best_f
+                or (f == best_f and d < best_d)):
+                best_k, best_f, best_d = kk, f, d
+                if best_f == 0 and best_d == 0.0:
+                    break
+        return best_k
+
+    def _replace_segment(self, cache_snapshot, incoming_key):
+        """
+        ARC Replace rule:
+        if |T1| >= 1 and ((incoming in B2 and |T1| == p) or |T1| > p) -> evict from T1
+        else evict from T2 (if non-empty), otherwise from T1.
+        """
+        t1 = len(self.T1)
+        t2 = len(self.T2)
+        cap = self._cap(cache_snapshot)
+        p_int = int(round(max(0.0, min(float(cap), self.p))))
+        if t1 >= 1 and ((incoming_key in self.B2 and t1 == p_int) or (t1 > p_int)):
+            return "T1"
+        if t2 == 0 and t1 > 0:
+            return "T1"
+        return "T2" if t2 > 0 else "T1"
+
+    # ---------- public API ----------
+
+    def evict(self, cache_snapshot, obj):
+        self._reset_if_new_run(cache_snapshot)
+        self._prune_metadata(cache_snapshot)
+        self._ensure_sketch(cache_snapshot)
+        self._seed_from_cache(cache_snapshot)
+
+        now = cache_snapshot.access_count
+        f_new = self._sketch_est(cache_snapshot, obj.key)
+
+        # ARC suggested segment to replace
+        seg_pref = self._replace_segment(cache_snapshot, obj.key)
+
+        # Scan-aware: during cooldown, prefer evicting from T1 if possible
+        if self.scan_cooldown > 0 and self.T1:
+            seg_pref = "T1"
+
+        # Sample candidates from both segments
+        cand_t1 = self._eviction_sample(cache_snapshot, self.T1) if self.T1 else None
+        cand_t2 = self._eviction_sample(cache_snapshot, self.T2) if self.T2 else None
+
+        # If one segment is empty, fall back to the other
+        if cand_t1 is None and cand_t2 is None:
+            # Fallback to any cached key
+            victim = None
+            seg_name = None
+            for k in cache_snapshot.cache.keys():
+                victim = k
+                seg_name = "T1" if k in self.T1 else ("T2" if k in self.T2 else None)
+                break
+            self.last_victim_key = victim
+            self.last_victim_from = seg_name
+            return victim
+        if cand_t1 is None:
+            self.last_victim_key = cand_t2
+            self.last_victim_from = "T2"
+            return cand_t2
+        if cand_t2 is None:
+            self.last_victim_key = cand_t1
+            self.last_victim_from = "T1"
+            return cand_t1
+
+        # Both candidates exist: choose colder by (TinyLFU, LRFU) with +1 bias favoring T2
+        f1 = self._sketch_est(cache_snapshot, cand_t1); d1 = self._decayed_score(cand_t1, now)
+        f2 = self._sketch_est(cache_snapshot, cand_t2); d2 = self._decayed_score(cand_t2, now)
+        # Bias T2 to make it slightly harder to evict
+        f2b = f2 + 1
+
+        if (f1 < f2b) or (f1 == f2b and d1 <= d2):
+            chosen_key = cand_t1
+            chosen_seg = "T1"
+            other_key, other_f, other_d = cand_t2, f2, d2
+        else:
+            chosen_key = cand_t2
+            chosen_seg = "T2"
+            other_key, other_f, other_d = cand_t1, f1, d1
+
+        # Respect ARC segment preference unless conditions justify override
+        if seg_pref == "T1" and chosen_seg == "T2":
+            # Only replace T2 if incoming is clearly hotter than T2 candidate
+            if f_new > (f2 + 1):
+                victim = chosen_key
+                seg_name = "T2"
+            else:
+                victim = cand_t1
+                seg_name = "T1"
+        elif seg_pref == "T2" and chosen_seg == "T1":
+            # Prefer T2 unless T1 is much colder
+            if (f1 + 0) < (f2 - 1) or not self.T2:
+                victim = cand_t1
+                seg_name = "T1"
+            else:
+                victim = cand_t2
+                seg_name = "T2"
+        else:
+            victim = chosen_key
+            seg_name = chosen_seg
+
+        self.last_victim_key = victim
+        self.last_victim_from = seg_name
+        return victim
+
+    def update_after_hit(self, cache_snapshot, obj):
+        self._reset_if_new_run(cache_snapshot)
+        self._prune_metadata(cache_snapshot)
+        self._ensure_sketch(cache_snapshot)
+
+        now = cache_snapshot.access_count
+        key = obj.key
+        # Reset scan indicator and learn
+        self.miss_streak = 0
+        # Cooldown decays faster on hits
+        if self.scan_cooldown > 0:
+            self.scan_cooldown = max(0, self.scan_cooldown - 2)
+        self._sketch_add(cache_snapshot, key, 1)
+        # Bump decayed score
+        s = self._decayed_score(key, now)
+        self.score[key] = s + 1.0
+
+        if key in self.T2:
+            self._move_to_mru(self.T2, key)
+        elif key in self.T1:
+            # Promote T1 -> T2 on hit unless in scan cooldown and not hot
+            hot = (self._sketch_est(cache_snapshot, key) >= 2) or (self._decayed_score(key, now) >= 1.0)
+            if self.scan_cooldown > 0 and not hot:
+                self._move_to_mru(self.T1, key)
+            else:
+                self.T1.pop(key, None)
+                self._move_to_mru(self.T2, key)
+        else:
+            # Metadata miss but hit in cache: place to T2 only if hot, else T1
+            if (self._sketch_est(cache_snapshot, key) >= 3) or (self._decayed_score(key, now) >= 1.0):
+                self._move_to_mru(self.T2, key)
+            else:
+                self._move_to_mru(self.T1, key)
+
+        # Enforce protected target size: |T2| <= cap - p
+        cap = self._cap(cache_snapshot)
+        p_int = int(round(max(0.0, min(float(cap), self.p))))
+        t2_target = max(0, cap - p_int)
+        while len(self.T2) > t2_target and self.T2:
+            # Demote T2 LRU to T1 MRU
+            demote_k, _ = self.T2.popitem(last=False)
+            self._move_to_mru(self.T1, demote_k)
+
+    def update_after_insert(self, cache_snapshot, obj):
+        self._reset_if_new_run(cache_snapshot)
+        self._prune_metadata(cache_snapshot)
+        self._ensure_sketch(cache_snapshot)
+
+        now = cache_snapshot.access_count
+        key = obj.key
+        self.miss_streak += 1
+        # Slow cooldown decay on continued misses
+        if self.scan_cooldown > 0:
+            self.scan_cooldown = max(0, self.scan_cooldown - 1)
+        # Trigger scan cooldown if too many consecutive misses
+        cap = self._cap(cache_snapshot)
+        if self.miss_streak >= max(32, cap // 2):
+            self.scan_cooldown = max(self.scan_cooldown, min(cap, self.miss_streak))
+
+        # Learn on admission and initialize decayed metadata
+        self._sketch_add(cache_snapshot, key, 1)
+        self.last_time[key] = now
+        # Start with small score to reduce scan pollution
+        self.score[key] = 0.5
+
+        # ARC adaptive p tuning based on ghost refaults
+        if key in self.B1:
+            delta = max(1, len(self.B2) // max(1, len(self.B1)))
+            self.p = min(float(cap), self.p + float(delta))
+            self.B1.pop(key, None)
+            # Under scan cooldown, only place into T2 if modestly hot
+            if self.scan_cooldown > 0 and self._sketch_est(cache_snapshot, key) < 2:
+                self._move_to_mru(self.T1, key)
+            else:
+                self._move_to_mru(self.T2, key)
+        elif key in self.B2:
+            delta = max(1, len(self.B1) // max(1, len(self.B2)))
+            self.p = max(0.0, self.p - float(delta))
+            self.B2.pop(key, None)
+            if self.scan_cooldown > 0 and self._sketch_est(cache_snapshot, key) < 2:
+                self._move_to_mru(self.T1, key)
+            else:
+                self._move_to_mru(self.T2, key)
+        else:
+            # Fresh miss: early promotion if clearly hot
+            thr = 5 if self.scan_cooldown > 0 else 3
+            if self._sketch_est(cache_snapshot, key) >= thr:
+                self._move_to_mru(self.T2, key)
+            else:
+                self._move_to_mru(self.T1, key)
+
+        # Enforce protected target size: |T2| <= cap - p
+        p_int = int(round(max(0.0, min(float(cap), self.p))))
+        t2_target = max(0, cap - p_int)
+        while len(self.T2) > t2_target and self.T2:
+            demote_k, _ = self.T2.popitem(last=False)
+            self._move_to_mru(self.T1, demote_k)
+
+        # Bound ghosts
+        self._trim_ghosts(cache_snapshot)
+
+    def update_after_evict(self, cache_snapshot, obj, evicted_obj):
+        self._reset_if_new_run(cache_snapshot)
+        evk = evicted_obj.key
+
+        # Remove from resident sets, track origin
+        removed_from = None
+        if evk in self.T1:
+            self.T1.pop(evk, None)
+            removed_from = "T1"
+        elif evk in self.T2:
+            self.T2.pop(evk, None)
+            removed_from = "T2"
+        else:
+            removed_from = self.last_victim_from
+
+        # Place into ghost according to origin
+        if removed_from == "T1":
+            self.B1[evk] = None
+        elif removed_from == "T2":
+            self.B2[evk] = None
+
+        # Clean up LRFU metadata
+        self.score.pop(evk, None)
+        self.last_time.pop(evk, None)
+
+        # Bound ghosts and clear last-victim markers
+        self._trim_ghosts(cache_snapshot)
+        if self.last_victim_key == evk:
+            self.last_victim_key = None
+            self.last_victim_from = None
+        # Mild cooldown decay on eviction progression
+        if self.scan_cooldown > 0:
+            self.scan_cooldown = max(0, self.scan_cooldown - 1)
+
+
+# Singleton policy instance
+_policy = _ArcTinyLfuLrfu()
+
+
+def evict(cache_snapshot, obj):
+    return _policy.evict(cache_snapshot, obj)
+
+
+def update_after_hit(cache_snapshot, obj):
+    _policy.update_after_hit(cache_snapshot, obj)
+
+
+def update_after_insert(cache_snapshot, obj):
+    _policy.update_after_insert(cache_snapshot, obj)
+
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    _policy.update_after_evict(cache_snapshot, obj, evicted_obj)
+
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

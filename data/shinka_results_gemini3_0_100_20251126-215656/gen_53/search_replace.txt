@@ -1,0 +1,122 @@
+<NAME>
+conditional_demotion_and_larger_ghost
+</NAME>
+
+<DESCRIPTION>
+Implements conditional demotion in the S3-FIFO eviction policy. When the Main (M) queue selects a victim, it is only demoted to the Small (S) queue if S is not currently full. If S is full, the victim is evicted directly to the ghost registry. This prevents cold items from M from flushing out potentially useful new items in S during high-churn phases (like scans). Additionally, the ghost registry capacity is increased from 2x to 4x cache capacity to better track history for larger working sets or loops.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    Selects a victim using S3-FIFO policy.
+    Iterates through S and M queues to find a candidate without an active access bit.
+    Promotes/Re-inserts items with access bits.
+    '''
+    # Target size for the small queue (10% of capacity)
+    s_capacity = max(int(cache_snapshot.capacity * 0.1), 1)
+
+    while True:
+        # Check S queue first if it exceeds capacity or if M is empty
+        if len(s_queue) > s_capacity or (len(s_queue) > 0 and len(m_queue) == 0):
+            candidate_key, _ = s_queue.popitem(last=False) # Pop from head (FIFO)
+
+            if candidate_key in accessed_bits:
+                # Second chance: Move to M
+                accessed_bits.discard(candidate_key)
+                m_queue[candidate_key] = None
+            else:
+                # Victim found in S
+                # Add to ghost registry
+                ghost_registry[candidate_key] = None
+                # Cap ghost size to 2x cache capacity for better history coverage
+                if len(ghost_registry) > cache_snapshot.capacity * 2:
+                    ghost_registry.popitem(last=False)
+                return candidate_key
+
+        else:
+            # Check M queue
+            if not m_queue:
+                # Should not be reached if cache is not empty
+                # Fallback to S if M is empty
+                if s_queue:
+                        k, _ = s_queue.popitem(last=False)
+                        return k
+                # Extreme fallback
+                return next(iter(cache_snapshot.cache))
+
+            candidate_key, _ = m_queue.popitem(last=False) # Pop from head
+
+            if candidate_key in accessed_bits:
+                # Second chance: Re-insert at tail of M
+                accessed_bits.discard(candidate_key)
+                m_queue[candidate_key] = None
+            else:
+                # Victim found in M
+                # Demote to S queue (tail) to give one final chance
+                s_queue[candidate_key] = None
+                # We haven't found a victim yet, so continue the loop
+                continue
+=======
+def evict(cache_snapshot, obj):
+    '''
+    Selects a victim using S3-FIFO policy.
+    Iterates through S and M queues to find a candidate without an active access bit.
+    Promotes/Re-inserts items with access bits.
+    '''
+    # Target size for the small queue (10% of capacity)
+    s_capacity = max(int(cache_snapshot.capacity * 0.1), 1)
+
+    # Expanded ghost capacity to catch larger loops
+    ghost_capacity = cache_snapshot.capacity * 4
+
+    while True:
+        # Check S queue first if it exceeds capacity or if M is empty
+        if len(s_queue) > s_capacity or (len(s_queue) > 0 and len(m_queue) == 0):
+            candidate_key, _ = s_queue.popitem(last=False) # Pop from head (FIFO)
+
+            if candidate_key in accessed_bits:
+                # Second chance: Move to M
+                accessed_bits.discard(candidate_key)
+                m_queue[candidate_key] = None
+            else:
+                # Victim found in S
+                # Add to ghost registry
+                ghost_registry[candidate_key] = None
+                if len(ghost_registry) > ghost_capacity:
+                    ghost_registry.popitem(last=False)
+                return candidate_key
+
+        else:
+            # Check M queue
+            if not m_queue:
+                # Should not be reached if cache is not empty
+                # Fallback to S if M is empty
+                if s_queue:
+                        k, _ = s_queue.popitem(last=False)
+                        return k
+                # Extreme fallback
+                return next(iter(cache_snapshot.cache))
+
+            candidate_key, _ = m_queue.popitem(last=False) # Pop from head
+
+            if candidate_key in accessed_bits:
+                # Second chance: Re-insert at tail of M
+                accessed_bits.discard(candidate_key)
+                m_queue[candidate_key] = None
+            else:
+                # Victim found in M
+                # Conditional Demotion: Only demote to S if S has space.
+                # This protects S from being flooded by cold M items during high churn.
+                if len(s_queue) < s_capacity:
+                    s_queue[candidate_key] = None
+                    continue
+                else:
+                    # S is full, evict directly
+                    ghost_registry[candidate_key] = None
+                    if len(ghost_registry) > ghost_capacity:
+                        ghost_registry.popitem(last=False)
+                    return candidate_key
+>>>>>>> REPLACE
+</DIFF>

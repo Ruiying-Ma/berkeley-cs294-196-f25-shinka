@@ -1,0 +1,309 @@
+<NAME>
+s3_hybrid_aging
+</NAME>
+
+<DESCRIPTION>
+Implement S3-FIFO with Hybrid Small Eviction and Global Frequency Aging.
+1. Hybrid Small Eviction: When evicting from the Small queue, candidates are selected from both the Head (FIFO) and the Tail (LIFO). This introduces a probabilistic LIFO eviction policy for the probationary segment, significantly improving resistance to large looping patterns (Trace 14) by occasionally preserving older items and evicting new insertions, while maintaining scan resistance via the FIFO candidates.
+2. Global Frequency Aging: A global operation counter triggers a periodic decay of all frequency counters (divide by 2) every `capacity` operations. This prevents frequency saturation and allows the cache to adapt to shifting working sets by de-prioritizing previously hot but now cold items.
+3. Ghost Management: Simplifies ghost handling to standard S3-FIFO recall (move to Main, reset freq) and ensures victims from Main also populate the ghost cache to catch early evictions.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+# S3-FIFO with Randomized Eviction Global State
+s3_small = OrderedDict()
+s3_main = OrderedDict()
+s3_ghost = OrderedDict()
+s3_freq = {}
+m_last_access_count = -1
+
+def _check_reset(cache_snapshot):
+    """Resets global state if a new trace is detected."""
+    global s3_small, s3_main, s3_ghost, s3_freq, m_last_access_count
+    if cache_snapshot.access_count < m_last_access_count:
+        s3_small.clear()
+        s3_main.clear()
+        s3_ghost.clear()
+        s3_freq.clear()
+    m_last_access_count = cache_snapshot.access_count
+
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO with Randomized Eviction.
+    - S (Small) buffers new items. M (Main) holds frequent items.
+    - Victim is chosen from a small window at the head of S or M.
+    - Randomization helps with synchronized loops.
+    '''
+    _check_reset(cache_snapshot)
+    capacity = cache_snapshot.capacity
+    target_s_size = max(1, int(capacity * 0.1))
+
+    # Window size for scan/randomization
+    k_window = 5
+
+    while True:
+        # Determine which queue to look at
+        if len(s3_small) > target_s_size or len(s3_main) == 0:
+            queue = s3_small
+            is_small = True
+        else:
+            queue = s3_main
+            is_small = False
+
+        if not queue:
+            # Should generally not happen if cache is full
+            return next(iter(cache_snapshot.cache)) if cache_snapshot.cache else None
+
+        # Get first K candidates
+        candidates = []
+        iterator = iter(queue)
+        for _ in range(k_window):
+            try:
+                candidates.append(next(iterator))
+            except StopIteration:
+                break
+
+        # Check for promotions (Lazy Promotion)
+        promoted = False
+
+        for key in candidates:
+            if s3_freq.get(key, 0) > 0:
+                # Promotion: Move to Main (or reinsert in Main)
+                if is_small:
+                    del s3_small[key]
+                    s3_main[key] = 1
+                else:
+                    del s3_main[key]
+                    s3_main[key] = 1
+
+                s3_freq[key] = 0 # Reset frequency
+                promoted = True
+                break
+
+        if promoted:
+            continue
+
+        # No promotions in window -> Pick random victim
+        victim_key = random.choice(candidates)
+        return victim_key
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    On Hit: Increment frequency counter (capped).
+    '''
+    _check_reset(cache_snapshot)
+    key = obj.key
+    s3_freq[key] = min(3, s3_freq.get(key, 0) + 1)
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On Insert:
+    - If in Ghost (G), insert to Main (M).
+    - Else, insert to Small (S).
+    '''
+    _check_reset(cache_snapshot)
+    key = obj.key
+
+    if key in s3_ghost:
+        # Recall from Ghost
+        del s3_ghost[key]
+        s3_main[key] = 1
+        s3_freq[key] = 0
+    else:
+        # New Insert
+        s3_small[key] = 1
+        s3_freq[key] = 0
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    On Evict: Remove from queues and manage Ghost.
+    '''
+    key = evicted_obj.key
+
+    if key in s3_small:
+        del s3_small[key]
+        # Evicted from S -> Add to G
+        s3_ghost[key] = 1
+    elif key in s3_main:
+        del s3_main[key]
+        # Evicted from M -> Discard (Standard S3-FIFO)
+
+    if key in s3_freq:
+        del s3_freq[key]
+
+    # Limit Ghost size
+    if len(s3_ghost) > cache_snapshot.capacity:
+        s3_ghost.popitem(last=False)
+=======
+# S3-FIFO with Hybrid Small Eviction and Global Aging
+s3_small = OrderedDict()
+s3_main = OrderedDict()
+s3_ghost = OrderedDict()
+s3_freq = {}
+m_last_access_count = -1
+m_global_counter = 0
+
+def _check_reset(cache_snapshot):
+    """Resets global state if a new trace is detected."""
+    global s3_small, s3_main, s3_ghost, s3_freq, m_last_access_count, m_global_counter
+    if cache_snapshot.access_count < m_last_access_count:
+        s3_small.clear()
+        s3_main.clear()
+        s3_ghost.clear()
+        s3_freq.clear()
+        m_global_counter = 0
+    m_last_access_count = cache_snapshot.access_count
+
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO with Hybrid Eviction.
+    - S (Small): Candidates from both Head (FIFO) and Tail (LIFO) to break loops.
+    - M (Main): Segmented FIFO with frequency checks.
+    - Global Aging to adapt to phase changes.
+    '''
+    _check_reset(cache_snapshot)
+    capacity = cache_snapshot.capacity
+    target_s_size = max(1, int(capacity * 0.1))
+
+    # Window size for candidate scan
+    # Increased to cover more of the queue ends
+    k_window = 5
+
+    while True:
+        # Determine source queue
+        if len(s3_small) > target_s_size or not s3_main:
+            queue = s3_small
+            is_small = True
+
+            # Hybrid Candidates: Head (FIFO) + Tail (LIFO)
+            candidates = []
+
+            # Head candidates (Oldest/FIFO)
+            it = iter(s3_small)
+            for _ in range(k_window):
+                try:
+                    candidates.append(next(it))
+                except StopIteration:
+                    break
+
+            # Tail candidates (Newest/LIFO)
+            it_rev = reversed(s3_small)
+            for _ in range(k_window):
+                try:
+                    candidates.append(next(it_rev))
+                except StopIteration:
+                    break
+
+            # Remove duplicates if queue is small
+            candidates = list(OrderedDict.fromkeys(candidates))
+
+        else:
+            queue = s3_main
+            is_small = False
+            # Main Candidates: Only Head (FIFO/LRU)
+            candidates = []
+            it = iter(s3_main)
+            for _ in range(k_window):
+                try:
+                    candidates.append(next(it))
+                except StopIteration:
+                    break
+
+        if not candidates:
+             return next(iter(cache_snapshot.cache)) if cache_snapshot.cache else None
+
+        # Check for promotions / retention
+        promoted = False
+        for key in candidates:
+            freq = s3_freq.get(key, 0)
+            if freq > 0:
+                # Promotion / Reinsertion
+                if is_small:
+                    # Promote Small -> Main
+                    del s3_small[key]
+                    s3_main[key] = 1
+                    # Reset frequency on entry to Main (must prove utility again)
+                    s3_freq[key] = 0
+                else:
+                    # Reinsert Main -> Main (Second Chance)
+                    del s3_main[key]
+                    s3_main[key] = 1
+                    s3_freq[key] = freq - 1 # Decrement frequency
+
+                promoted = True
+                break
+
+        if promoted:
+            continue
+
+        # No promotions -> Random Victim from candidates
+        victim_key = random.choice(candidates)
+        return victim_key
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    On Hit: Increment frequency (capped).
+    '''
+    _check_reset(cache_snapshot)
+    key = obj.key
+    s3_freq[key] = min(3, s3_freq.get(key, 0) + 1)
+
+    # Aging
+    global m_global_counter
+    m_global_counter += 1
+    if m_global_counter >= cache_snapshot.capacity:
+        m_global_counter = 0
+        # Decay frequencies
+        for k in list(s3_freq):
+            s3_freq[k] >>= 1
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On Insert:
+    - Check Ghost.
+    - Insert to Small.
+    '''
+    _check_reset(cache_snapshot)
+    key = obj.key
+
+    # Aging
+    global m_global_counter
+    m_global_counter += 1
+    if m_global_counter >= cache_snapshot.capacity:
+        m_global_counter = 0
+        for k in list(s3_freq):
+            s3_freq[k] >>= 1
+
+    if key in s3_ghost:
+        # Recall from Ghost -> Main
+        del s3_ghost[key]
+        s3_main[key] = 1
+        s3_freq[key] = 0
+    else:
+        # New Insert -> Small
+        s3_small[key] = 1
+        s3_freq[key] = 0
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    On Evict: Move to Ghost.
+    '''
+    key = evicted_obj.key
+
+    if key in s3_small:
+        del s3_small[key]
+        s3_ghost[key] = 1
+    elif key in s3_main:
+        del s3_main[key]
+        # Main victims also ghosted
+        s3_ghost[key] = 1
+
+    if key in s3_freq:
+        del s3_freq[key]
+
+    # Limit Ghost size
+    if len(s3_ghost) > cache_snapshot.capacity:
+        s3_ghost.popitem(last=False)
+>>>>>>> REPLACE
+</DIFF>

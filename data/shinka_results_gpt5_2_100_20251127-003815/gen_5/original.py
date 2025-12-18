@@ -1,0 +1,122 @@
+# EVOLVE-BLOCK-START
+"""Adaptive LRFU-like eviction: combine recency and frequency with exponential decay"""
+
+# Configuration: half-life in number of accesses for score decay.
+# After DECAY_HALF_LIFE accesses without a hit, a key's score halves.
+DECAY_HALF_LIFE = 16
+DECAY_BASE = 2 ** (-1.0 / DECAY_HALF_LIFE)
+
+# Per-key metadata for cached objects
+_key_score = dict()      # key -> float decayed frequency score
+_key_last_time = dict()  # key -> int last access_count when we updated its score
+
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    global _key_score, _key_last_time
+    now = cache_snapshot.access_count
+
+    # Choose the object with the minimum decayed score; tie-break on older last access (LRU fallback).
+    min_key = None
+    min_score = None
+    min_old_time = None
+
+    # Lazily decay scores to "now" during victim selection to avoid global walks elsewhere.
+    for k in cache_snapshot.cache.keys():
+        # Initialize metadata if missing (robustness)
+        if k not in _key_last_time:
+            _key_last_time[k] = now
+        if k not in _key_score:
+            _key_score[k] = 0.0
+
+        old_time = _key_last_time[k]
+        dt = now - old_time
+        if dt > 0:
+            _key_score[k] *= pow(DECAY_BASE, dt)
+            _key_last_time[k] = now
+        s = _key_score[k]
+
+        if (min_score is None) or (s < min_score) or (s == min_score and old_time < min_old_time):
+            min_score = s
+            min_key = k
+            min_old_time = old_time
+
+    return min_key
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global _key_score, _key_last_time
+    now = cache_snapshot.access_count
+
+    # Ensure metadata exists
+    if obj.key not in _key_last_time:
+        _key_last_time[obj.key] = now
+    if obj.key not in _key_score:
+        _key_score[obj.key] = 0.0
+
+    dt = now - _key_last_time[obj.key]
+    if dt > 0:
+        _key_score[obj.key] *= pow(DECAY_BASE, dt)
+    _key_score[obj.key] += 1.0  # frequency boost
+    _key_last_time[obj.key] = now
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global _key_score, _key_last_time
+    now = cache_snapshot.access_count
+    _key_last_time[obj.key] = now
+    # Start with a modest score to reduce scan pollution; frequent re-references will quickly boost it.
+    _key_score[obj.key] = 0.5
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    global _key_score, _key_last_time
+    _key_score.pop(evicted_obj.key, None)
+    _key_last_time.pop(evicted_obj.key, None)
+
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

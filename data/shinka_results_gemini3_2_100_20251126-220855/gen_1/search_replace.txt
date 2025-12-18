@@ -1,0 +1,188 @@
+<NAME>
+two_queue_eviction
+</NAME>
+
+<DESCRIPTION>
+Implement a 2Q-like (Two Queues) cache eviction algorithm.
+This algorithm divides the cache into two logical segments: `A1in` (Probation) for new items and `Am` (Protected) for frequent items.
+1. **Segments**:
+   - New items are inserted into `A1in`.
+   - `Am` holds items that have proven to be useful (accessed again after being evicted from `A1in`).
+2. **Ghost Registry**:
+   - When an item is evicted from `A1in`, it is added to a ghost registry (`A1out`) which only stores metadata (keys and timestamps).
+   - The size of the ghost registry is limited to the cache capacity to bound memory usage.
+3. **Promotion Policy**:
+   - If an item is accessed (miss) and found in the ghost registry, it is promoted to `Am`.
+   - Hits on items already in `A1in` do *not* promote them to `Am` (preserving scan resistance and filtering correlated bursts); they simply update their LRU position in `A1in`.
+4. **Eviction Policy**:
+   - The algorithm targets keeping `A1in` size around 25% of the cache capacity.
+   - If `A1in` size exceeds this target, the LRU item from `A1in` is evicted.
+   - Otherwise, the LRU item from `Am` is evicted.
+This approach combines the benefits of LRU and frequency awareness, providing scan resistance (scans flush through `A1in` without disturbing `Am`) and loop handling.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+
+m_key_timestamp = dict()
+
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    candid_obj_key = None
+    min_ts = min(m_key_timestamp.values())
+    candid_obj_keys = list(key for key in cache_snapshot.cache if m_key_timestamp[key] == min_ts)
+    candid_obj_key = candid_obj_keys[0]
+    return candid_obj_key
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_key_timestamp
+    assert obj.key in m_key_timestamp
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp
+    assert obj.key not in m_key_timestamp
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp
+    assert obj.key not in m_key_timestamp
+    assert evicted_obj.key in m_key_timestamp
+    m_key_timestamp.pop(evicted_obj.key)
+=======
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+
+m_key_timestamp = dict()
+m_protected_keys = set()
+m_ghost_timestamp = dict()
+
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    global m_key_timestamp, m_protected_keys
+
+    # Calculate current size of A1in (items in cache but not protected)
+    a1in_keys = [k for k in cache_snapshot.cache if k not in m_protected_keys]
+    current_a1in_size = len(a1in_keys)
+
+    # Target size for A1in (Probation)
+    target_a1in = cache_snapshot.capacity * 0.25
+
+    victim_key = None
+    candidates = []
+
+    # Decide whether to evict from A1in or Am (Protected)
+    # If A1in exceeds target, evict from A1in.
+    # Also if Am is empty (all items are probationary), must evict from A1in.
+    if current_a1in_size > target_a1in or current_a1in_size == len(cache_snapshot.cache):
+        candidates = a1in_keys
+    else:
+        # Otherwise try to evict from Am
+        candidates = [k for k in cache_snapshot.cache if k in m_protected_keys]
+        # Fallback if candidates is empty (should be covered by condition above)
+        if not candidates:
+            candidates = a1in_keys
+
+    # LRU eviction within the chosen segment
+    victim_key = min(candidates, key=lambda k: m_key_timestamp.get(k, 0))
+    return victim_key
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_key_timestamp
+    # Update access time (LRU)
+    # In 2Q, hits in A1in do NOT promote to Am. They just refresh position in A1in.
+    if obj.key in m_key_timestamp:
+        m_key_timestamp[obj.key] = cache_snapshot.access_count
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp, m_protected_keys, m_ghost_timestamp
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+
+    # Check if object was in ghost registry
+    if obj.key in m_ghost_timestamp:
+        # Promote to Protected (Am)
+        m_protected_keys.add(obj.key)
+        del m_ghost_timestamp[obj.key]
+    else:
+        # Insert into Probation (A1in)
+        # Ensure it's not marked as protected (in case of re-use of key after long time)
+        if obj.key in m_protected_keys:
+            m_protected_keys.remove(obj.key)
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp, m_protected_keys, m_ghost_timestamp
+    if evicted_obj.key in m_key_timestamp:
+        del m_key_timestamp[evicted_obj.key]
+
+    if evicted_obj.key in m_protected_keys:
+        m_protected_keys.remove(evicted_obj.key)
+        # Evicted from Am: usually not added to ghost in standard 2Q
+    else:
+        # Evicted from A1in: add to ghost registry
+        m_ghost_timestamp[evicted_obj.key] = cache_snapshot.access_count
+
+        # Manage ghost size (limit to cache capacity)
+        if len(m_ghost_timestamp) > cache_snapshot.capacity:
+             # Remove oldest in ghost
+             oldest_ghost = min(m_ghost_timestamp, key=m_ghost_timestamp.get)
+             del m_ghost_timestamp[oldest_ghost]
+>>>>>>> REPLACE
+</DIFF>

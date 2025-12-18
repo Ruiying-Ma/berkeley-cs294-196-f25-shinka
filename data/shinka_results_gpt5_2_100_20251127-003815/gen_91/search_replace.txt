@@ -1,0 +1,231 @@
+<NAME>
+recently_boosted_tlfu_with_scan_guard
+</NAME>
+
+<DESCRIPTION>
+I introduce a lightweight “recent ring” to give a small admission/retention boost to very recent keys, improving responsiveness to bursts and short phases without polluting the main protected segment. This is implemented with an OrderedDict-based LRU set and integrated into:
+- coldness comparisons (TinyLFU estimate + recent bonus + decayed recency),
+- admission decisions (allow direct M2 insertion when the key is very recent and competitive),
+- touch operations (update recent ring per access/move).
+
+Additionally, I strengthen scan protection by:
+- increasing the bias during cooldown and disallowing M2 replacements while in cooldown,
+- using frequency-aware demotion for W2 on hits (previously simple LRU), further avoiding evicting useful items under churn.
+
+These changes aim to reduce misses under bursts and scans while preserving high hit rates on stable workloads with a minimal increment in metadata and logic.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    __slots__ = (
+        "W1", "W2", "M1", "M2", "capacity",
+        "win_frac", "w2_frac", "prot_frac",
+        "sketch", "_sample_k",
+        "last_touch",
+        # adaptive stats
+        "hits_w", "hits_w2", "hits_main", "prom_m2", "dem_m2",
+        "last_tune_time", "tune_period",
+        # scan handling
+        "miss_streak", "scan_cooldown",
+    )
+=======
+    __slots__ = (
+        "W1", "W2", "M1", "M2", "capacity",
+        "win_frac", "w2_frac", "prot_frac",
+        "sketch", "_sample_k",
+        "last_touch", "recent", "recent_cap",
+        # adaptive stats
+        "hits_w", "hits_w2", "hits_main", "prom_m2", "dem_m2",
+        "last_tune_time", "tune_period",
+        # scan handling
+        "miss_streak", "scan_cooldown",
+    )
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # last-touch timestamps (for tie-break on coldness)
+        self.last_touch = {}
+        # adaptive stats
+        self.hits_w = 0
+=======
+        # last-touch timestamps (for tie-break on coldness)
+        self.last_touch = {}
+        # recent ring (LRU set) for burst detection
+        self.recent = OrderedDict()
+        self.recent_cap = 0
+        # adaptive stats
+        self.hits_w = 0
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            except Exception:
+                pass
+            self.tune_period = max(256, cap * 4)
+            self.last_tune_time = 0
+            return
+=======
+            except Exception:
+                pass
+            self.tune_period = max(256, cap * 4)
+            self.last_tune_time = 0
+            self.recent_cap = max(128, min(4096, cap))
+            return
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            except Exception:
+                pass
+            self.tune_period = max(256, cap * 4)
+            self.last_tune_time = 0
+=======
+            except Exception:
+                pass
+            self.tune_period = max(256, cap * 4)
+            self.last_tune_time = 0
+            self.recent_cap = max(128, min(4096, cap))
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def _lru(self, od: OrderedDict):
+        return next(iter(od)) if od else None
+
+    def _touch(self, od: OrderedDict, key: str, now: int):
+        od[key] = None
+        od.move_to_end(key)
+        self.last_touch[key] = now
+=======
+    def _lru(self, od: OrderedDict):
+        return next(iter(od)) if od else None
+
+    def _recent_touch(self, key: str, now: int):
+        r = self.recent
+        r[key] = now
+        r.move_to_end(key)
+        # Trim to recent_cap
+        while len(r) > self.recent_cap:
+            r.popitem(last=False)
+
+    def _touch(self, od: OrderedDict, key: str, now: int):
+        od[key] = None
+        od.move_to_end(key)
+        self.last_touch[key] = now
+        self._recent_touch(key, now)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def _cold_tuple(self, key: str, now: int, bias: int = 0):
+        # Lexicographic coldness: lower TinyLFU estimate is colder; if tie, older last-touch (smaller) is colder.
+        f = self.sketch.estimate(key) + bias
+        lt = self.last_touch.get(key, 0)
+        return (f, lt)
+=======
+    def _cold_tuple(self, key: str, now: int, bias: int = 0):
+        # Lexicographic coldness: lower TinyLFU estimate is colder; if tie, older last-touch (smaller) is colder.
+        boost = 1 if key in self.recent else 0
+        f = self.sketch.estimate(key) + bias + boost
+        lt = self.last_touch.get(key, 0)
+        return (f, lt)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        bias = 3 if self.scan_cooldown > 0 else 1
+
+        # Decide competitively against main segments
+        replace_m1 = (cand_m1 is not None) and (f_new >= (f_m1 + bias))
+        replace_m2 = (cand_m2 is not None) and (f_new >= (f_m2 + bias + 1))
+=======
+        if self.scan_cooldown > 0:
+            bias = 4
+        else:
+            bias = 1
+
+        # Decide competitively against main segments
+        replace_m1 = (cand_m1 is not None) and (f_new >= (f_m1 + bias))
+        replace_m2 = (self.scan_cooldown == 0) and (cand_m2 is not None) and (f_new >= (f_m2 + bias + 1))
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        if key in self.W2:
+            self.hits_w += 1; self.hits_w2 += 1
+            self._touch(self.W2, key, now)
+            while len(self.W2) > w2_tgt:
+                demote = self._lru(self.W2)
+                if demote is None:
+                    break
+                self.W2.pop(demote, None)
+                self._touch(self.W1, demote, now)
+            self._maybe_tune(now)
+            return
+=======
+        if key in self.W2:
+            self.hits_w += 1; self.hits_w2 += 1
+            self._touch(self.W2, key, now)
+            while len(self.W2) > w2_tgt:
+                demote = self._sample_lru_cold(self.W2, now, bias=0)
+                if demote is None:
+                    break
+                self.W2.pop(demote, None)
+                self._touch(self.W1, demote, now)
+            self._maybe_tune(now)
+            return
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        else:
+            if cand_m2 is not None and f_new >= (f_m2 + bias + 1):
+                self._touch(self.M2, key, now)
+                placed = True
+            elif cand_m1 is not None and f_new >= (f_m1 + bias):
+                self._touch(self.M1, key, now)
+                placed = True
+=======
+        else:
+            if (cand_m2 is not None) and ((f_new >= (f_m2 + bias + 1)) or (key in self.recent and f_new >= f_m2)):
+                self._touch(self.M2, key, now)
+                placed = True
+            elif cand_m1 is not None and f_new >= (f_m1 + bias):
+                self._touch(self.M1, key, now)
+                placed = True
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Remove evicted key from all segments and metadata
+        self.W1.pop(k, None); self.W2.pop(k, None)
+        self.M1.pop(k, None); self.M2.pop(k, None)
+        # last_touch may remain; leave it to be overwritten on reuse
+=======
+        # Remove evicted key from all segments and metadata
+        self.W1.pop(k, None); self.W2.pop(k, None)
+        self.M1.pop(k, None); self.M2.pop(k, None)
+        self.recent.pop(k, None)
+        # last_touch may remain; leave it to be overwritten on reuse
+>>>>>>> REPLACE
+
+</DIFF>

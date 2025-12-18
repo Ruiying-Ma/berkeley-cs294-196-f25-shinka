@@ -1,0 +1,190 @@
+# EVOLVE-BLOCK-START
+from collections import OrderedDict
+
+# S3-FIFO with Ghost Registry and 2-Hit Promotion
+# Global state
+s3_small = OrderedDict()
+s3_main = OrderedDict()
+s3_ghosts = OrderedDict()
+s3_freq = {}
+s3_last_access_count = -1
+
+def _check_reset(cache_snapshot):
+    """
+    Resets global state if a new trace begins or the cache is cleared.
+    """
+    global s3_small, s3_main, s3_ghosts, s3_freq, s3_last_access_count
+    current_acc = cache_snapshot.access_count
+    
+    # Reset if time went backwards (new trace)
+    if current_acc < s3_last_access_count:
+        s3_small.clear()
+        s3_main.clear()
+        s3_ghosts.clear()
+        s3_freq.clear()
+    
+    # Safety: if cache is empty but we have state (start of new run)
+    if len(cache_snapshot.cache) == 0 and (len(s3_small) > 0 or len(s3_main) > 0):
+        s3_small.clear()
+        s3_main.clear()
+        s3_ghosts.clear()
+        s3_freq.clear()
+        
+    s3_last_access_count = current_acc
+
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO Eviction Policy with 2-Hit Promotion and Ghosts.
+    - Small Queue (10%): Filters one-hit wonders.
+    - Main Queue (90%): Protected items.
+    - Ghosts: Remembers recently evicted items to give them a head start (freq=1) on return.
+    - Promotion: Needs freq >= 2 (or Ghost + Hit) to enter Main.
+    '''
+    _check_reset(cache_snapshot)
+    global s3_small, s3_main, s3_freq
+    
+    capacity = cache_snapshot.capacity
+    s_capacity = max(1, int(capacity * 0.1))
+    
+    victim = None
+    
+    # Limit iterations to avoid infinite loops (though logic guarantees convergence)
+    # Worst case is 4 passes per item (freq 3 -> 2 -> 1 -> 0 -> evict)
+    limit = (len(s3_small) + len(s3_main)) * 4 + 100
+    loops = 0
+    
+    while loops < limit:
+        loops += 1
+        
+        # Logic: Evict from Small if it exceeds target size OR if Main is empty.
+        # Otherwise, evict from Main.
+        evict_from_small = False
+        if len(s3_small) > s_capacity:
+            evict_from_small = True
+        elif len(s3_main) == 0:
+            evict_from_small = True
+            
+        if evict_from_small:
+            # Check if Small is actually empty (can happen if capacity is tiny and logic overlaps)
+            if not s3_small:
+                if s3_main:
+                    evict_from_small = False
+                else:
+                    break 
+            
+            if evict_from_small:
+                key = next(iter(s3_small))
+                freq = s3_freq.get(key, 0)
+                
+                if freq >= 2:
+                    # High frequency -> Promote to Main
+                    # Remove from Small head, add to Main
+                    s3_small.popitem(last=False)
+                    s3_main[key] = None
+                    s3_freq[key] = 0 # Reset freq for aging in Main
+                    continue
+                    
+                elif freq == 1:
+                    # Warm frequency -> Give second chance in Small (Extended Probation)
+                    s3_small.move_to_end(key, last=True) # Move to tail
+                    s3_freq[key] = 0 # Decrement/Reset freq
+                    continue
+                    
+                else:
+                    # Cold (freq 0) -> Evict
+                    victim = key
+                    break
+        
+        if not evict_from_small:
+            # Evict from Main
+            if not s3_main:
+                continue # Should trigger small check next loop
+            
+            key = next(iter(s3_main))
+            freq = s3_freq.get(key, 0)
+            
+            if freq > 0:
+                # Active in Main -> Reinsert at tail
+                s3_main.move_to_end(key, last=True)
+                s3_freq[key] = 0 # Reset freq
+                continue
+            else:
+                # Inactive in Main -> Evict directly (don't demote to Small)
+                victim = key
+                break
+                
+    if victim is None:
+        # Emergency fallback: LRU from whatever is available
+        if s3_small: victim = next(iter(s3_small))
+        elif s3_main: victim = next(iter(s3_main))
+        elif cache_snapshot.cache: victim = next(iter(cache_snapshot.cache))
+        
+    return victim
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    Increment frequency on hit.
+    '''
+    _check_reset(cache_snapshot)
+    global s3_freq
+    key = obj.key
+    # Cap frequency at 3 to prevent overflow and ensure aging works
+    s3_freq[key] = min(s3_freq.get(key, 0) + 1, 3)
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Insert new item into Small queue.
+    Check Ghost registry for initial frequency.
+    '''
+    _check_reset(cache_snapshot)
+    global s3_small, s3_freq, s3_ghosts
+    key = obj.key
+    
+    # Check ghost history
+    initial_freq = 0
+    if key in s3_ghosts:
+        initial_freq = 1
+        del s3_ghosts[key]
+        
+    s3_small[key] = None
+    s3_freq[key] = initial_freq
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Clean up queues and add victim to Ghost registry.
+    '''
+    _check_reset(cache_snapshot)
+    global s3_small, s3_main, s3_freq, s3_ghosts
+    key = evicted_obj.key
+    
+    # Remove from queues
+    if key in s3_small: del s3_small[key]
+    if key in s3_main: del s3_main[key]
+    if key in s3_freq: del s3_freq[key]
+    
+    # Add to ghosts
+    s3_ghosts[key] = None
+    # Limit ghost size to cache capacity
+    if len(s3_ghosts) > cache_snapshot.capacity:
+        s3_ghosts.popitem(last=False)
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

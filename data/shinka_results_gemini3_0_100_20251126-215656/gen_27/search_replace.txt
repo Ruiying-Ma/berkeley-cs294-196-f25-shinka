@@ -1,0 +1,234 @@
+<NAME>
+s3_fifo_demotion_ghost_persistence
+</NAME>
+
+<DESCRIPTION>
+Implement S3-FIFO with Demotion and Enhanced Ghost Frequency.
+- Uses `_s3_small` (10%) and `_s3_main` (90%) queues.
+- Ghost Queue tracks evicted items.
+- **Key Improvement**: When an item is promoted from Ghost to Main (recurrence), it is assigned an initial frequency of 2 (instead of 0). This allows it to survive multiple passes in the Main queue, effectively handling loops that are larger than the cache capacity.
+- Main queue items with `freq=0` are demoted to Small (Probation) rather than evicted immediately.
+- Main queue items with `freq>0` are reinserted with decayed frequency (`freq-1`).
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+m_key_timestamp = dict()
+m_protected_keys = set()
+
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    global m_protected_keys
+
+    # Identify keys in the cache and split into protected and probationary
+    probationary_keys = []
+    protected_keys_in_cache = []
+
+    # We iterate over the cache to ensure we only consider currently cached objects
+    for key in cache_snapshot.cache:
+        if key in m_protected_keys:
+            protected_keys_in_cache.append(key)
+        else:
+            probationary_keys.append(key)
+
+    # SLRU Logic: Protected segment has a capacity limit (e.g., 80% of total capacity)
+    protected_capacity = int(cache_snapshot.capacity * 0.8)
+
+    # If protected segment is too full, demote the LRU protected item to probationary
+    if len(protected_keys_in_cache) > protected_capacity:
+        # Find LRU in protected items
+        victim_prot = min(protected_keys_in_cache, key=lambda k: m_key_timestamp.get(k, 0))
+        # Demote: remove from protected set and treat as probationary for this eviction decision
+        m_protected_keys.remove(victim_prot)
+        probationary_keys.append(victim_prot)
+
+    # Evict the LRU item from the probationary segment
+    if probationary_keys:
+        candid_obj_key = min(probationary_keys, key=lambda k: m_key_timestamp.get(k, 0))
+    else:
+        # Fallback if probationary is empty (e.g. strict capacity or strange state)
+        candid_obj_key = min(cache_snapshot.cache.keys(), key=lambda k: m_key_timestamp.get(k, 0))
+
+    return candid_obj_key
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_key_timestamp, m_protected_keys
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+    # Promote to protected on hit
+    m_protected_keys.add(obj.key)
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp, m_protected_keys
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+    # New items start as probationary (ensure not in protected set)
+    if obj.key in m_protected_keys:
+        m_protected_keys.remove(obj.key)
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp, m_protected_keys
+    if evicted_obj.key in m_key_timestamp:
+        m_key_timestamp.pop(evicted_obj.key)
+    if evicted_obj.key in m_protected_keys:
+        m_protected_keys.remove(evicted_obj.key)
+=======
+# S3-FIFO-D (Demotion) with robust frequency management
+_s3_small = {}
+_s3_main = {}
+_s3_ghost = {}
+_s3_freq = {}
+_last_ts = -1
+
+def _check_reset(snapshot):
+    global _s3_small, _s3_main, _s3_ghost, _s3_freq, _last_ts
+    if snapshot.access_count < _last_ts:
+        _s3_small.clear()
+        _s3_main.clear()
+        _s3_ghost.clear()
+        _s3_freq.clear()
+    _last_ts = snapshot.access_count
+
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO eviction with Demotion and Ghost-triggered protection.
+    '''
+    global _s3_small, _s3_main, _s3_freq
+    _check_reset(cache_snapshot)
+
+    curr_size = len(cache_snapshot.cache)
+    s_target = max(1, int(curr_size * 0.1))
+
+    while True:
+        # 1. Check Small (Probation)
+        if len(_s3_small) > s_target:
+            if not _s3_small:
+                break
+
+            candidate = next(iter(_s3_small))
+
+            # Clean consistency
+            if candidate not in cache_snapshot.cache:
+                _s3_small.pop(candidate, None)
+                _s3_freq.pop(candidate, None)
+                continue
+
+            freq = _s3_freq.get(candidate, 0)
+            if freq > 0:
+                # Promotion: Small -> Main
+                _s3_small.pop(candidate)
+                _s3_main[candidate] = None
+                # Reset frequency to 0 upon promotion (standard S3-FIFO)
+                _s3_freq[candidate] = 0
+                continue
+            else:
+                # Evict from Small
+                return candidate
+
+        # 2. Check Main (Protected)
+        if _s3_main:
+            candidate = next(iter(_s3_main))
+
+            if candidate not in cache_snapshot.cache:
+                _s3_main.pop(candidate, None)
+                _s3_freq.pop(candidate, None)
+                continue
+
+            freq = _s3_freq.get(candidate, 0)
+            if freq > 0:
+                # Reinsert with decay
+                _s3_main.pop(candidate)
+                _s3_main[candidate] = None
+                _s3_freq[candidate] = freq - 1
+                continue
+            else:
+                # Demotion: Main -> Small
+                _s3_main.pop(candidate)
+                _s3_small[candidate] = None
+                _s3_freq[candidate] = 0
+                continue
+
+        # 3. Fallback: Force eviction from Small if Main is empty or skipped
+        if _s3_small:
+            candidate = next(iter(_s3_small))
+            return candidate
+
+        # Final safety
+        if cache_snapshot.cache:
+            return next(iter(cache_snapshot.cache))
+        return None
+
+def update_after_hit(cache_snapshot, obj):
+    global _s3_freq
+    _check_reset(cache_snapshot)
+    # Cap frequency at 3
+    current = _s3_freq.get(obj.key, 0)
+    _s3_freq[obj.key] = min(current + 1, 3)
+
+def update_after_insert(cache_snapshot, obj):
+    global _s3_small, _s3_main, _s3_ghost, _s3_freq
+    _check_reset(cache_snapshot)
+
+    key = obj.key
+    if key in _s3_ghost:
+        # Ghost Hit: Promote to Main with protection
+        if key not in _s3_main and key not in _s3_small:
+            _s3_main[key] = None
+            # Start with freq=2 to survive initial Main passes
+            # This helps loops larger than cache to persist
+            _s3_freq[key] = 2
+        _s3_ghost.pop(key)
+    else:
+        # New Insert: Start in Small
+        if key not in _s3_small and key not in _s3_main:
+            _s3_small[key] = None
+            _s3_freq[key] = 0
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    global _s3_small, _s3_main, _s3_ghost, _s3_freq
+    _check_reset(cache_snapshot)
+
+    key = evicted_obj.key
+    # Track in Ghost
+    if key in _s3_small:
+        _s3_small.pop(key)
+        _s3_ghost[key] = None
+    elif key in _s3_main:
+        _s3_main.pop(key)
+        # Also track Main evictions in Ghost for robustness
+        _s3_ghost[key] = None
+
+    _s3_freq.pop(key, None)
+
+    # Cap Ghost Size
+    if len(_s3_ghost) > cache_snapshot.capacity:
+        _s3_ghost.pop(next(iter(_s3_ghost)), None)
+>>>>>>> REPLACE
+</DIFF>

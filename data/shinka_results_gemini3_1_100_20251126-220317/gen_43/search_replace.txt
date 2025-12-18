@@ -1,0 +1,270 @@
+<NAME>
+wtinylfu_approx
+</NAME>
+
+<DESCRIPTION>
+Implement a W-TinyLFU approximation using Python dictionaries.
+- **Structure**: Divides cache into a small Window (1% capacity) and a large Main segment (99%).
+- **Admission**: Uses a frequency-based admission policy (TinyLFU style) when the Window is full. Candidates from Window compete with victims from Main based on access frequency.
+- **Frequency Tracking**: Uses a simple frequency map and a "Doorkeeper" set to filter one-off events and estimate frequencies, with periodic aging (halving) to adapt to changing workloads.
+- **Main Cache**: Implemented as Segmented LRU (Probation + Protected) to protect popular items from scan pollution.
+This design aims to address the scan resistance issues (Trace 14) while maintaining high hit rates on recency/frequency workloads.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+# S3-FIFO-D Globals
+m_small = dict()
+m_main = dict()
+m_ghost = dict()
+m_hits = dict()
+
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO-D Eviction Logic:
+    - New items enter Small.
+    - Eviction prioritizes dropping from Small (if > 10% cap) or Main.
+    - Items in Small with hits promote to Main.
+    - Items in Main with hits get second chance (reinserted).
+    '''
+    global m_small, m_main, m_hits
+
+    capacity = cache_snapshot.capacity
+    # Small queue size target: 10% of capacity
+    s_capacity = max(1, int(capacity * 0.1))
+
+    while True:
+        # If Small is larger than target, or Main is empty, we evict from Small
+        if len(m_small) > s_capacity or len(m_main) == 0:
+            if not m_small:
+                # Should not happen if cache is full and Main is empty
+                # If Main has items, pick from Main
+                if m_main:
+                    return next(iter(m_main))
+                return next(iter(cache_snapshot.cache))
+
+            candidate = next(iter(m_small))
+            if m_hits.get(candidate, 0) > 0:
+                # Hit in Small -> Promote to Main
+                m_hits[candidate] = 0
+                del m_small[candidate]
+                m_main[candidate] = None
+            else:
+                # No hit -> Evict from Small
+                return candidate
+        else:
+            # Evict from Main
+            if not m_main:
+                # Fallback to Small
+                return next(iter(m_small))
+
+            candidate = next(iter(m_main))
+            if m_hits.get(candidate, 0) > 0:
+                # Hit in Main -> Reinsert at tail (Second Chance)
+                m_hits[candidate] = 0
+                del m_main[candidate]
+                m_main[candidate] = None
+            else:
+                # No hit -> Evict from Main
+                return candidate
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    On Cache Hit:
+    - Increment hit counter (saturated at 3).
+    '''
+    global m_hits
+    m_hits[obj.key] = min(m_hits.get(obj.key, 0) + 1, 3)
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On Cache Insert (Miss):
+    - Reset state if new trace.
+    - Insert into Small or Main (if in Ghost).
+    '''
+    global m_small, m_main, m_hits, m_ghost
+
+    if cache_snapshot.access_count <= 1:
+        m_small.clear()
+        m_main.clear()
+        m_hits.clear()
+        m_ghost.clear()
+
+    # S3-FIFO-D: If in ghost, insert to Main (rescue). Else Small.
+    if obj.key in m_ghost:
+        del m_ghost[obj.key]
+        m_main[obj.key] = None
+    else:
+        m_small[obj.key] = None
+
+    m_hits[obj.key] = 0
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    After Eviction:
+    - Manage Ghost list for items evicted from Small.
+    - Cleanup data structures.
+    '''
+    global m_small, m_main, m_hits, m_ghost
+
+    key = evicted_obj.key
+
+    if key in m_small:
+        # Evicted from Small without promotion -> Add to Ghost
+        del m_small[key]
+        m_ghost[key] = None
+    elif key in m_main:
+        del m_main[key]
+
+    if key in m_hits:
+        del m_hits[key]
+
+    # Limit Ghost size to Cache Capacity
+    while len(m_ghost) > cache_snapshot.capacity:
+        m_ghost.pop(next(iter(m_ghost)))
+=======
+# W-TinyLFU Globals
+w_lru = OrderedDict()      # Window Cache
+slru_prob = OrderedDict()  # Probation (Main)
+slru_prot = OrderedDict()  # Protected (Main)
+freq = {}                  # Frequency counters
+door = set()               # Doorkeeper (first access filter)
+
+def evict(cache_snapshot, obj):
+    '''
+    W-TinyLFU Eviction Decision:
+    - If Window has space (or Main is empty), evict from Main to make room.
+    - If Window is full, conduct a duel between Window LRU and Main LRU.
+    - Winner stays (or moves to Main), Loser is evicted.
+    '''
+    capacity = cache_snapshot.capacity
+    w_cap = max(1, int(capacity * 0.01))
+
+    # Identify Candidates
+    cand_w = next(iter(w_lru)) if w_lru else None
+
+    cand_m = None
+    if slru_prob:
+        cand_m = next(iter(slru_prob))
+    elif slru_prot:
+        cand_m = next(iter(slru_prot))
+
+    # Boundary Cases
+    if not cand_m: return cand_w if cand_w else next(iter(cache_snapshot.cache))
+    if not cand_w: return cand_m # Should ideally not happen if inserted correctly
+
+    # Logic
+    if len(w_lru) < w_cap:
+        return cand_m
+
+    # Duel
+    # Get frequencies (Doorkeeper logic applied on read)
+    fw = freq.get(cand_w, 0) + (1 if cand_w in door else 0)
+    fm = freq.get(cand_m, 0) + (1 if cand_m in door else 0)
+
+    if fw > fm:
+        return cand_m # Window wins, evict Main
+    else:
+        return cand_w # Main wins, evict Window
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    Update frequency and cache positions on hit.
+    '''
+    key = obj.key
+
+    # Update Frequency
+    if key in freq:
+        freq[key] += 1
+    elif key in door:
+        freq[key] = 1 # Move from door to freq
+        door.remove(key) # Keep set small
+    else:
+        door.add(key)
+
+    # Update Cache Structures
+    if key in w_lru:
+        w_lru.move_to_end(key)
+    elif key in slru_prot:
+        slru_prot.move_to_end(key)
+    elif key in slru_prob:
+        # Promote Probation -> Protected
+        del slru_prob[key]
+        slru_prot[key] = None
+
+        # Enforce Protected Capacity (80% of Main)
+        c = cache_snapshot.capacity
+        w_cap = max(1, int(c * 0.01))
+        main_cap = c - w_cap
+        prot_cap = int(main_cap * 0.8)
+
+        while len(slru_prot) > prot_cap:
+            # Demote Protected LRU -> Probation MRU
+            k, _ = slru_prot.popitem(last=False)
+            slru_prob[k] = None
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Handle new insertion into Window and maintain Frequency aging.
+    '''
+    key = obj.key
+
+    # Reset State on new trace detection
+    if cache_snapshot.access_count <= 1:
+        w_lru.clear()
+        slru_prob.clear()
+        slru_prot.clear()
+        freq.clear()
+        door.clear()
+
+    # Aging: periodic reset of frequencies
+    # Interval: 10 * Capacity
+    if cache_snapshot.access_count % (cache_snapshot.capacity * 10) == 0:
+        # Halve frequencies
+        rem = []
+        for k, v in freq.items():
+            freq[k] = v // 2
+            if freq[k] == 0: rem.append(k)
+        for k in rem: del freq[k]
+        door.clear()
+
+    # Track Frequency
+    if key in freq:
+        freq[key] += 1
+    elif key in door:
+        freq[key] = 1
+        door.remove(key)
+    else:
+        door.add(key)
+
+    # Always insert new items to Window
+    w_lru[key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Clean up after eviction and handle Window->Main migration if needed.
+    '''
+    key = evicted_obj.key
+
+    # Remove from structures
+    if key in w_lru:
+        del w_lru[key]
+    elif key in slru_prob:
+        del slru_prob[key]
+    elif key in slru_prot:
+        del slru_prot[key]
+
+    # Check if we need to migrate Window LRU to Probation
+    # This happens if we evicted from Main (Probation/Protected)
+    # but the Window was full, meaning Window LRU pushed into Main.
+    w_cap = max(1, int(cache_snapshot.capacity * 0.01))
+
+    # If Window is still full (or overfull) after eviction, it means
+    # we evicted from Main. To make space for the NEW item entering Window,
+    # the current Window LRU must move to Probation.
+    if len(w_lru) >= w_cap:
+        k, _ = w_lru.popitem(last=False)
+        slru_prob[k] = None
+>>>>>>> REPLACE
+
+</DIFF>

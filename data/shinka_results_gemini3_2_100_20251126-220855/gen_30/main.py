@@ -1,0 +1,167 @@
+# EVOLVE-BLOCK-START
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+from collections import OrderedDict
+import random
+
+# Global State
+s3_small = OrderedDict() # FIFO for new/probationary items
+s3_main = OrderedDict()  # LRU for promoted/protected items
+s3_ghost = OrderedDict() # FIFO for evicted items to track history
+s3_freq = {}             # Frequency counter for items in Small
+s3_config = {}           # Config storage (e.g. jitter params)
+last_access_count = -1
+
+def _reset_state(cache_snapshot):
+    """Resets global state if a new trace is detected."""
+    global s3_small, s3_main, s3_ghost, s3_freq, s3_config, last_access_count
+    if cache_snapshot.access_count < last_access_count:
+        s3_small.clear()
+        s3_main.clear()
+        s3_ghost.clear()
+        s3_freq.clear()
+        s3_config.clear()
+    last_access_count = cache_snapshot.access_count
+    
+    # Initialize config once per trace
+    if not s3_config:
+        cap = cache_snapshot.capacity
+        # Target ~10% for small, but allow jitter
+        s3_config['small_ratio'] = 0.1
+        # Jitter magnitude: +/- 5% of capacity, min 1
+        s3_config['jitter_mag'] = max(1, int(cap * 0.05))
+
+def evict(cache_snapshot, obj):
+    '''
+    S3-LRU Eviction Policy with Jitter:
+    - Maintains Small (FIFO) and Main (LRU) queues.
+    - Eviction mostly from Small, but promotes useful items to Main.
+    - Uses randomized threshold for Small queue size to prevent loop thrashing.
+    '''
+    _reset_state(cache_snapshot)
+    capacity = cache_snapshot.capacity
+    
+    # Calculate jittered target size for Small queue
+    jitter = random.randint(-s3_config['jitter_mag'], s3_config['jitter_mag'])
+    target_small = int(capacity * s3_config['small_ratio']) + jitter
+    target_small = max(1, target_small) # Ensure at least 1
+    
+    # Eviction loop: process Small queue until we find a victim or Small is small enough
+    while True:
+        evict_from_small = False
+        
+        # Decide which queue to evict from
+        # If Small is larger than target, prefer Small.
+        # If Main is empty, must use Small (if not empty).
+        if len(s3_small) > target_small:
+            evict_from_small = True
+        elif len(s3_main) == 0:
+            evict_from_small = True
+            
+        if evict_from_small and s3_small:
+            # Peek at the oldest item in Small (FIFO head)
+            victim_key = next(iter(s3_small))
+            
+            # Check if it has earned promotion
+            # Threshold: > 0 hits (so 1+ accesses while in Small)
+            if s3_freq.get(victim_key, 0) > 0:
+                # Promote to Main
+                s3_small.popitem(last=False) # Remove from Small
+                if victim_key in s3_freq:
+                    del s3_freq[victim_key]
+                
+                # Add to Main (MRU position)
+                s3_main[victim_key] = 1
+                s3_main.move_to_end(victim_key)
+                
+                # We promoted, so we haven't evicted yet. Loop continues.
+            else:
+                # No hits, valid victim
+                # Do NOT remove here, update_after_evict will handle it
+                return victim_key
+        else:
+            # Evict from Main
+            if s3_main:
+                # Main is LRU, evict LRU (head)
+                return next(iter(s3_main))
+            else:
+                # Fallback
+                if s3_small:
+                    return next(iter(s3_small))
+                return None
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    On Hit:
+    - If in Main: Move to MRU (LRU update).
+    - If in Small: Increment freq (lazy promotion).
+    '''
+    _reset_state(cache_snapshot)
+    key = obj.key
+    
+    if key in s3_main:
+        s3_main.move_to_end(key)
+    elif key in s3_small:
+        s3_freq[key] = s3_freq.get(key, 0) + 1
+    else:
+        # Recover missing item
+        s3_main[key] = 1
+        s3_main.move_to_end(key)
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On Insert:
+    - If in Ghost: Insert to Main (MRU), remove from Ghost.
+    - Else: Insert to Small (FIFO), freq=0.
+    '''
+    _reset_state(cache_snapshot)
+    key = obj.key
+    
+    if key in s3_ghost:
+        s3_main[key] = 1
+        s3_main.move_to_end(key)
+        del s3_ghost[key]
+    else:
+        s3_small[key] = 1
+        s3_freq[key] = 0
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    On Evict:
+    - Remove from internal queues.
+    - Add to Ghost list.
+    '''
+    key = evicted_obj.key
+    
+    if key in s3_small:
+        del s3_small[key]
+        if key in s3_freq:
+            del s3_freq[key]
+    elif key in s3_main:
+        del s3_main[key]
+        
+    # Add to Ghost (FIFO)
+    s3_ghost[key] = 1
+    # Limit Ghost size to Capacity
+    if len(s3_ghost) > cache_snapshot.capacity:
+        s3_ghost.popitem(last=False)
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

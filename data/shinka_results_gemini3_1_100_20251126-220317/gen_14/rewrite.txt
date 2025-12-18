@@ -1,0 +1,156 @@
+# EVOLVE-BLOCK-START
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+from collections import OrderedDict
+
+# LIRS State
+algo_state = {
+    'S': OrderedDict(),       # Stack S: key -> is_LIR (bool)
+    'Q': OrderedDict(),       # Queue Q: key -> None (Resident HIR blocks)
+    'resident_set': set(),    # Set of keys currently in cache
+    'lir_count': 0,           # Number of LIR blocks
+    'max_time': 0             # To detect resets
+}
+
+def _check_reset(current_time):
+    if current_time < algo_state['max_time']:
+        algo_state['S'].clear()
+        algo_state['Q'].clear()
+        algo_state['resident_set'].clear()
+        algo_state['lir_count'] = 0
+        algo_state['max_time'] = 0
+    algo_state['max_time'] = current_time
+
+def _prune_S():
+    S = algo_state['S']
+    # Remove HIR blocks from the bottom of the stack
+    while S:
+        k, is_lir = next(iter(S.items()))
+        if not is_lir:
+            S.popitem(last=False)
+        else:
+            break
+
+def _enforce_S_limit(capacity):
+    S = algo_state['S']
+    Q = algo_state['Q']
+    # Limit S to prevent memory explosion on scans (e.g. 3x capacity)
+    if len(S) > capacity * 3:
+        # Remove from bottom
+        k, is_lir = S.popitem(last=False)
+        if is_lir:
+            # We dropped a LIR, so update count and move to Q (demote)
+            algo_state['lir_count'] -= 1
+            if k in algo_state['resident_set']:
+                Q[k] = None
+        _prune_S()
+
+def evict(cache_snapshot, obj):
+    '''
+    LIRS Eviction:
+    1. Evict from Q (Resident HIR).
+    2. If Q empty, evict from S (Resident LIR).
+    '''
+    Q = algo_state['Q']
+    S = algo_state['S']
+    
+    # Primary victim: LRU of Q
+    if Q:
+        return next(iter(Q))
+    
+    # Fallback: Evict from S (LIR)
+    # This happens if Q is empty (all cache is LIR)
+    # We pick the bottom-most resident LIR.
+    # _prune_S ensures bottom of S is LIR.
+    if S:
+        return next(iter(S))
+    
+    # Absolute fallback
+    return next(iter(algo_state['resident_set']))
+
+def update_after_hit(cache_snapshot, obj):
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+    S = algo_state['S']
+    Q = algo_state['Q']
+    
+    capacity = cache_snapshot.capacity
+    h_cap = max(1, int(capacity * 0.05)) # 5% for HIR
+    l_cap = capacity - h_cap
+    
+    is_lir = S.get(key)
+    
+    if is_lir is True:
+        # Case 1: LIR accessed. Move to top S.
+        S.move_to_end(key)
+        _prune_S()
+        
+    elif is_lir is False:
+        # Case 2: HIR accessed (in S). Promote to LIR.
+        S.move_to_end(key)
+        S[key] = True
+        
+        if key in Q:
+            del Q[key]
+        # If not in Q, it was non-resident HIR, now resident LIR.
+            
+        algo_state['lir_count'] += 1
+        
+        # Demote LIRs if needed
+        while algo_state['lir_count'] > l_cap:
+            _prune_S()
+            if not S: break
+            
+            # Demote bottom LIR
+            demoted_key, demoted_is_lir = S.popitem(last=False)
+            if demoted_is_lir: # Should be true
+                algo_state['lir_count'] -= 1
+                if demoted_key in algo_state['resident_set']:
+                    Q[demoted_key] = None
+            
+        _prune_S()
+            
+    else:
+        # Case 3: Key not in S (but hit). Must be resident HIR.
+        # Move to top S as HIR, Move to top Q.
+        S[key] = False
+        if key in Q:
+            Q.move_to_end(key)
+        else:
+            Q[key] = None # Should exist if resident
+            
+    _enforce_S_limit(capacity)
+
+def update_after_insert(cache_snapshot, obj):
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+    S = algo_state['S']
+    Q = algo_state['Q']
+    resident_set = algo_state['resident_set']
+    
+    # Insert as HIR
+    S[key] = False
+    Q[key] = None
+    resident_set.add(key)
+    
+    _enforce_S_limit(cache_snapshot.capacity)
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    v_key = evicted_obj.key
+    S = algo_state['S']
+    Q = algo_state['Q']
+    resident_set = algo_state['resident_set']
+    
+    if v_key in resident_set:
+        resident_set.remove(v_key)
+        
+    if v_key in Q:
+        del Q[v_key]
+        
+    # If evicted object was LIR (e.g. forced eviction from S), update state
+    is_lir = S.get(v_key)
+    if is_lir is True:
+        algo_state['lir_count'] -= 1
+        del S[v_key]
+        _prune_S()
+    # Note: If it was HIR in S, it stays in S (Ghost) until pruned
+# EVOLVE-BLOCK-END

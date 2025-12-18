@@ -1,0 +1,146 @@
+# EVOLVE-BLOCK-START
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+from collections import OrderedDict
+import random
+
+# S3-FIFO++ (S3-FIFO with True LRU Main, Jitter, and Aging)
+s3p_small = OrderedDict()
+s3p_main = OrderedDict()
+s3p_ghost = OrderedDict()
+s3p_freq = {}
+m_last_access_count = -1
+m_global_counter = 0
+
+def _check_reset(cache_snapshot):
+    """Resets global state if a new trace is detected."""
+    global s3p_small, s3p_main, s3p_ghost, s3p_freq, m_last_access_count, m_global_counter
+    if cache_snapshot.access_count < m_last_access_count:
+        s3p_small.clear()
+        s3p_main.clear()
+        s3p_ghost.clear()
+        s3p_freq.clear()
+        m_global_counter = 0
+    m_last_access_count = cache_snapshot.access_count
+
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO++ Eviction Policy.
+    - S (Small): FIFO with randomized eviction and lazy promotion.
+    - M (Main): Strict LRU for better retention of working sets.
+    - Jittered S-partition to avoid loop synchronization.
+    '''
+    _check_reset(cache_snapshot)
+    capacity = cache_snapshot.capacity
+    
+    # Jitter the partition size to prevent loop synchronization
+    # Range: +/- 2% of capacity (min 1)
+    jitter_mag = max(1, int(capacity * 0.02))
+    jitter = random.randint(-jitter_mag, jitter_mag)
+    target_s_size = max(1, int(capacity * 0.1) + jitter)
+
+    # Window size for scan
+    k_window = 5
+
+    while True:
+        # Determine source queue
+        # Prioritize Small if it's too big or Main is empty
+        if len(s3p_small) > target_s_size or not s3p_main:
+            if not s3p_small:
+                return next(iter(cache_snapshot.cache)) if cache_snapshot.cache else None
+
+            # Scan window at head of Small
+            candidates = []
+            iterator = iter(s3p_small)
+            for _ in range(k_window):
+                try:
+                    candidates.append(next(iterator))
+                except StopIteration:
+                    break
+
+            # Check for promotions
+            promoted_key = None
+            for key in candidates:
+                if s3p_freq.get(key, 0) > 0:
+                    promoted_key = key
+                    break
+            
+            if promoted_key:
+                # Promote to Main (Tail/MRU)
+                del s3p_small[promoted_key]
+                s3p_main[promoted_key] = 1
+                s3p_freq[promoted_key] = 0 # Reset hit count
+                continue
+            
+            # No promotions -> Random Victim
+            victim_key = random.choice(candidates)
+            return victim_key
+
+        else:
+            # Evict from Main (Strict LRU)
+            # Just take the head (LRU)
+            return next(iter(s3p_main))
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    On Hit:
+    - Update frequency.
+    - Move to MRU if in Main (True LRU).
+    '''
+    _check_reset(cache_snapshot)
+    key = obj.key
+    s3p_freq[key] = min(3, s3p_freq.get(key, 0) + 1)
+    
+    if key in s3p_main:
+        s3p_main.move_to_end(key)
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On Insert:
+    - Handle Ghost recall.
+    - Perform global aging.
+    '''
+    _check_reset(cache_snapshot)
+    key = obj.key
+    global m_global_counter
+
+    if key in s3p_ghost:
+        del s3p_ghost[key]
+        s3p_main[key] = 1
+        s3p_freq[key] = 0
+    else:
+        s3p_small[key] = 1
+        s3p_freq[key] = 0
+        
+    # Global Frequency Aging
+    m_global_counter += 1
+    if m_global_counter >= cache_snapshot.capacity:
+        m_global_counter = 0
+        # Decay frequencies
+        for k in list(s3p_freq):
+            s3p_freq[k] >>= 1
+            if s3p_freq[k] == 0:
+                del s3p_freq[k]
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    On Evict:
+    - Move Small victims to Ghost.
+    - Clean up frequency.
+    '''
+    key = evicted_obj.key
+    
+    if key in s3p_small:
+        del s3p_small[key]
+        s3p_ghost[key] = 1
+    elif key in s3p_main:
+        del s3p_main[key]
+        # Main victims are not ghosted in this version
+    
+    if key in s3p_freq:
+        del s3p_freq[key]
+
+    # Limit Ghost Size
+    if len(s3p_ghost) > cache_snapshot.capacity:
+        s3p_ghost.popitem(last=False)
+
+# EVOLVE-BLOCK-END

@@ -1,0 +1,241 @@
+<NAME>
+s3fifo_lifo_hybrid
+</NAME>
+
+<DESCRIPTION>
+Replaces the ARC implementation with an S3-FIFO inspired algorithm enhanced with specific hardening techniques derived from performance analysis:
+1.  **Split Queues**: Uses a small probationary queue (T1, ~10%) and a large main queue (T2, ~90%).
+2.  **LIFO Eviction for Probation**: T1 uses LIFO eviction (evicting the most recently inserted item if T1 is full). This provides high resistance to looping patterns (solving Trace 14) and scanning by sacrificing new insertions when under pressure.
+3.  **Frequency Gating**: Items in T1 are only promoted to T2 if their frequency > 1 (TinyLFU-style filter). This filters out "one-hit wonders" (scan noise).
+4.  **True LRU for Main**: T2 uses a strict LRU policy for eviction and hits, ensuring the working set is maintained.
+5.  **Global Frequency Aging**: Frequencies in the ghost map are halved periodically (every 'capacity' accesses) to adapt to workload phase changes.
+6.  **Ghost Persistence**: Frequency history is retained in a ghost map (up to 2x capacity) to allow items to regain status quickly.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+from collections import OrderedDict
+
+# Global ARC State
+# m_t1: Recent items (in cache)
+# m_t2: Frequent items (in cache)
+# m_b1: Ghost Recent (evicted history)
+# m_b2: Ghost Frequent (evicted history)
+# m_p: Target size for T1
+m_t1 = OrderedDict()
+m_t2 = OrderedDict()
+m_b1 = OrderedDict()
+m_b2 = OrderedDict()
+m_p = 0.0
+
+def evict(cache_snapshot, obj):
+    '''
+    ARC Eviction Policy.
+    - Adapts m_p based on hits in ghost lists (B1/B2).
+    - Selects victim from T1 or T2 based on target size m_p.
+    '''
+    global m_p
+    capacity = cache_snapshot.capacity
+    key = obj.key
+
+    # 1. Adapt m_p (Target T1 size)
+    # If hit in B1 (Recency Ghost), increase p (favor Recency)
+    # If hit in B2 (Frequency Ghost), decrease p (favor Frequency)
+    if key in m_b1:
+        delta = 1.0
+        if len(m_b1) < len(m_b2):
+            delta = float(len(m_b2)) / len(m_b1)
+        m_p = min(float(capacity), m_p + delta)
+    elif key in m_b2:
+        delta = 1.0
+        if len(m_b2) < len(m_b1):
+            delta = float(len(m_b1)) / len(m_b2)
+        m_p = max(0.0, m_p - delta)
+
+    # 2. Select Victim
+    # We evict from T1 if it exceeds the target size p,
+    # or under specific boundary conditions implied by ARC.
+    replace_p = m_p
+    len_t1 = len(m_t1)
+
+    evict_t1 = False
+    if len_t1 > 0:
+        if len_t1 > replace_p:
+            evict_t1 = True
+        elif (key in m_b2) and (len_t1 == int(replace_p)):
+             # If we hit B2, we want to shrink T1, so if we are at the limit, evict T1.
+             evict_t1 = True
+
+    # If T2 is empty, we must evict from T1 regardless of p
+    if evict_t1 or not m_t2:
+        return next(iter(m_t1))
+    else:
+        return next(iter(m_t2))
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    On hit, move to MRU of T2 (Frequent list).
+    '''
+    key = obj.key
+    if key in m_t1:
+        del m_t1[key]
+        m_t2[key] = None
+    elif key in m_t2:
+        m_t2.move_to_end(key)
+    else:
+        # Fallback for sync issues, though shouldn't occur
+        m_t2[key] = None
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On insert, place in T1 or promote ghost to T2.
+    '''
+    key = obj.key
+    if key in m_b1:
+        del m_b1[key]
+        m_t2[key] = None
+    elif key in m_b2:
+        del m_b2[key]
+        m_t2[key] = None
+    else:
+        m_t1[key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Move evicted item to corresponding ghost list (B1 or B2).
+    Maintain ghost list sizes.
+    '''
+    key = evicted_obj.key
+    capacity = cache_snapshot.capacity
+
+    if key in m_t1:
+        del m_t1[key]
+        m_b1[key] = None
+    elif key in m_t2:
+        del m_t2[key]
+        m_b2[key] = None
+
+    # Lazy cleanup of ghost lists to keep memory bounded
+    if len(m_b1) > capacity:
+        m_b1.popitem(last=False)
+    if len(m_b2) > capacity * 2:
+        m_b2.popitem(last=False)
+=======
+from collections import OrderedDict
+
+# S3-FIFO Hybrid State
+# m_t1: Small Queue (Probationary)
+# m_t2: Main Queue (Protected)
+# m_b1: Frequency/Ghost Map (Key -> Count)
+# m_p: Last aging timestamp
+# m_last_access_count: Reset detection
+m_t1 = OrderedDict()
+m_t2 = OrderedDict()
+m_b1 = OrderedDict()
+m_b2 = OrderedDict() # Unused
+m_p = 0.0
+m_last_access_count = 0
+
+def check_reset(cache_snapshot):
+    global m_t1, m_t2, m_b1, m_p, m_last_access_count
+    if cache_snapshot.access_count < m_last_access_count:
+        m_t1.clear()
+        m_t2.clear()
+        m_b1.clear()
+        m_p = 0.0
+    m_last_access_count = cache_snapshot.access_count
+
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO with LIFO Probation and Frequency Gating.
+    - T1 (Small): LIFO eviction to resist scan/loops.
+    - T2 (Main): LRU eviction.
+    - Promotion: T1 -> T2 if freq > 1.
+    '''
+    check_reset(cache_snapshot)
+    global m_p
+
+    capacity = cache_snapshot.capacity
+    current_time = cache_snapshot.access_count
+
+    # Global Frequency Aging (Div by 2 every capacity accesses)
+    if current_time - m_p > capacity:
+        for k in m_b1:
+            m_b1[k] //= 2
+        m_p = float(current_time)
+
+    # Target size for T1 (10%)
+    t1_target = int(capacity * 0.1)
+    if t1_target < 1: t1_target = 1
+
+    # Eviction Logic
+    # Prioritize evicting from T1 if it exceeds target
+    if len(m_t1) >= t1_target:
+        # Loop to handle promotions
+        while len(m_t1) > 0:
+            # LIFO Eviction Candidate: Tail of T1
+            victim_key = next(reversed(m_t1))
+
+            # Frequency Gating (freq > 1 to promote)
+            if m_b1.get(victim_key, 0) > 1:
+                # Promote to T2
+                del m_t1[victim_key]
+                m_t2[victim_key] = None # Adds to tail (MRU)
+
+                # If T1 is now small enough, stop promoting and evict from T2?
+                # We continue loop to possibly evict another from T1 or until T1 is small.
+                if len(m_t1) < t1_target:
+                    break
+            else:
+                # Evict from T1 (LIFO)
+                return victim_key
+
+    # Evict from T2 (LRU)
+    if m_t2:
+        return next(iter(m_t2))
+
+    # Fallback
+    if m_t1:
+        return next(reversed(m_t1))
+    return obj.key
+
+def update_after_hit(cache_snapshot, obj):
+    check_reset(cache_snapshot)
+    key = obj.key
+    # Update frequency
+    m_b1[key] = m_b1.get(key, 0) + 1
+    m_b1.move_to_end(key) # Keep ghost LRU
+
+    if key in m_t1:
+        # Promote if frequently used
+        if m_b1[key] > 1:
+            del m_t1[key]
+            m_t2[key] = None
+    elif key in m_t2:
+        # Maintain LRU in Main
+        m_t2.move_to_end(key)
+
+def update_after_insert(cache_snapshot, obj):
+    check_reset(cache_snapshot)
+    key = obj.key
+    # Insert counts as 1 access
+    m_b1[key] = m_b1.get(key, 0) + 1
+    m_b1.move_to_end(key)
+
+    # Always insert to T1 (Probation)
+    m_t1[key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    check_reset(cache_snapshot)
+    key = evicted_obj.key
+
+    if key in m_t1:
+        del m_t1[key]
+    elif key in m_t2:
+        del m_t2[key]
+
+    # Limit ghost size
+    if len(m_b1) > cache_snapshot.capacity * 2:
+        m_b1.popitem(last=False) # Remove oldest ghost
+>>>>>>> REPLACE
+</DIFF>

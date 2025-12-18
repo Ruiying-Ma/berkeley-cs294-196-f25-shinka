@@ -1,0 +1,206 @@
+<NAME>
+arc_resiliency_improvements
+</NAME>
+
+<DESCRIPTION>
+I strengthen ARC invariants and fallbacks to reduce metadata drift and over-promotion, which leads to fewer misses on mixed and scanning workloads.
+
+Key changes:
+1) Add a metadata rebuild helper. When both resident lists are empty due to drift, rebuild T1 from current residents ordered by timestamp and retry REPLACE. This preserves recency information and avoids arbitrary evictions.
+2) Proactively resync metadata during inserts to maintain ARC invariants between evictions.
+3) Avoid over-promotion on hits when metadata drifted: place such keys into T1 rather than T2 so that only real frequent items get promoted, reducing cache pollution.
+4) Improve the evict fallback ordering to prefer rebuilding ARC state before resorting to global timestamp LRU.
+
+These updates align more strictly with ARC mechanics while providing robust recovery in edge cases, minimizing miss rate on diverse traces.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def _resync(cache_snapshot):
+    # Ensure resident metadata tracks actual cache content and ghosts are disjoint
+    cache_keys = set(cache_snapshot.cache.keys())
+
+    # Remove non-residents from T1/T2
+    for k in list(arc_T1.keys()):
+        if k not in cache_keys:
+            arc_T1.pop(k, None)
+    for k in list(arc_T2.keys()):
+        if k not in cache_keys:
+            arc_T2.pop(k, None)
+
+    # Add any cached keys that are missing from T1/T2 into T1 (as recent)
+    for k in cache_keys:
+        if k not in arc_T1 and k not in arc_T2:
+            _move_to_mru(arc_T1, k)
+
+    # Ghosts must be disjoint from residents
+    for k in list(arc_B1.keys()):
+        if k in arc_T1 or k in arc_T2:
+            arc_B1.pop(k, None)
+    for k in list(arc_B2.keys()):
+        if k in arc_T1 or k in arc_T2:
+            arc_B2.pop(k, None)
+
+    # Bound p within [0, C]
+    if arc_capacity is not None:
+        global arc_p
+        arc_p = min(max(arc_p, 0), arc_capacity)
+
+    _trim_ghosts()
+=======
+def _resync(cache_snapshot):
+    # Ensure resident metadata tracks actual cache content and ghosts are disjoint
+    cache_keys = set(cache_snapshot.cache.keys())
+
+    # Remove non-residents from T1/T2
+    for k in list(arc_T1.keys()):
+        if k not in cache_keys:
+            arc_T1.pop(k, None)
+    for k in list(arc_T2.keys()):
+        if k not in cache_keys:
+            arc_T2.pop(k, None)
+
+    # Add any cached keys that are missing from T1/T2 into T1 (as recent)
+    for k in cache_keys:
+        if k not in arc_T1 and k not in arc_T2:
+            _move_to_mru(arc_T1, k)
+
+    # Ghosts must be disjoint from residents
+    for k in list(arc_B1.keys()):
+        if k in arc_T1 or k in arc_T2:
+            arc_B1.pop(k, None)
+    for k in list(arc_B2.keys()):
+        if k in arc_T1 or k in arc_T2:
+            arc_B2.pop(k, None)
+
+    # Bound p within [0, C]
+    if arc_capacity is not None:
+        global arc_p
+        arc_p = min(max(arc_p, 0), arc_capacity)
+
+    _trim_ghosts()
+
+
+def _rebuild_T1_from_cache(cache_snapshot):
+    # Rebuild a consistent resident state: place all current residents into T1
+    # ordered by their last-seen timestamp (ascending -> LRU at front).
+    arc_T1.clear()
+    arc_T2.clear()
+    keys = list(cache_snapshot.cache.keys())
+    # Order by known timestamp; unknowns get +inf so they go to MRU side last
+    keys.sort(key=lambda k: m_key_timestamp.get(k, float('inf')))
+    for k in keys:
+        arc_T1[k] = True
+    # Keep ghosts disjoint with residents
+    for k in list(arc_B1.keys()):
+        if k in arc_T1:
+            arc_B1.pop(k, None)
+    for k in list(arc_B2.keys()):
+        if k in arc_T1:
+            arc_B2.pop(k, None)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    candidate = _choose_replace_victim_key(obj.key)
+
+    # If the chosen list is empty, try the other list explicitly
+    if candidate is None:
+        if arc_T1:
+            candidate = next(iter(arc_T1))
+        elif arc_T2:
+            candidate = next(iter(arc_T2))
+
+    # Extremely rare fallback (if metadata drifted despite resync): use LRU by timestamp
+    if candidate is None and cache_snapshot.cache:
+        if m_key_timestamp:
+            # Oldest resident by timestamp
+            min_ts = float('inf')
+            best = None
+            for k in cache_snapshot.cache.keys():
+                ts = m_key_timestamp.get(k, float('inf'))
+                if ts < min_ts:
+                    min_ts = ts
+                    best = k
+            candidate = best
+        if candidate is None:
+            candidate = next(iter(cache_snapshot.cache.keys()))
+    return candidate
+=======
+    candidate = _choose_replace_victim_key(obj.key)
+
+    # If the chosen list is empty, try the other list explicitly
+    if candidate is None:
+        if arc_T1:
+            candidate = next(iter(arc_T1))
+        elif arc_T2:
+            candidate = next(iter(arc_T2))
+
+    # Rebuild resident metadata once before falling back to raw LRU
+    if candidate is None and cache_snapshot.cache:
+        _rebuild_T1_from_cache(cache_snapshot)
+        candidate = _choose_replace_victim_key(obj.key)
+        if candidate is None and arc_T1:
+            candidate = next(iter(arc_T1))
+
+    # Extremely rare fallback (still none): use global LRU by timestamp or any key
+    if candidate is None and cache_snapshot.cache:
+        if m_key_timestamp:
+            # Oldest resident by timestamp
+            min_ts = float('inf')
+            best = None
+            for k in cache_snapshot.cache.keys():
+                ts = m_key_timestamp.get(k, float('inf'))
+                if ts < min_ts:
+                    min_ts = ts
+                    best = k
+            candidate = best
+        if candidate is None:
+            candidate = next(iter(cache_snapshot.cache.keys()))
+    return candidate
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    key = obj.key
+    # ARC: on hit, promote to T2 if in T1; otherwise refresh T2 MRU
+    if key in arc_T1:
+        arc_T1.pop(key, None)
+        _move_to_mru(arc_T2, key)
+    elif key in arc_T2:
+        _move_to_mru(arc_T2, key)
+    else:
+        # Defensive: if metadata drifted, place into T2 to protect frequent access
+        _move_to_mru(arc_T2, key)
+=======
+    key = obj.key
+    # ARC: on hit, promote to T2 if in T1; otherwise refresh T2 MRU
+    if key in arc_T1:
+        arc_T1.pop(key, None)
+        _move_to_mru(arc_T2, key)
+    elif key in arc_T2:
+        _move_to_mru(arc_T2, key)
+    else:
+        # Metadata drift: place into T1 first to confirm frequency on next hit
+        _move_to_mru(arc_T1, key)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    global m_key_timestamp, arc_p
+    _ensure_capacity(cache_snapshot)
+    key = obj.key
+=======
+    global m_key_timestamp, arc_p
+    _ensure_capacity(cache_snapshot)
+    _resync(cache_snapshot)
+    key = obj.key
+>>>>>>> REPLACE
+
+</DIFF>

@@ -1,0 +1,148 @@
+# EVOLVE-BLOCK-START
+"""S3-FIFO Cache Eviction Algorithm"""
+
+from collections import OrderedDict
+
+# Global S3-FIFO State
+# S: Small queue (Probationary, 10% of cache)
+# M: Main queue (Protected, 90% of cache)
+# G: Ghost queue (History of evicted S items)
+m_small = OrderedDict()
+m_main = OrderedDict()
+m_ghost = OrderedDict()
+m_accessed = set()
+m_last_access_count = 0
+
+def check_reset(cache_snapshot):
+    global m_small, m_main, m_ghost, m_accessed, m_last_access_count
+    # Check for trace reset or new trace based on timestamp regression
+    if cache_snapshot.access_count < m_last_access_count:
+        m_small.clear()
+        m_main.clear()
+        m_ghost.clear()
+        m_accessed.clear()
+    m_last_access_count = cache_snapshot.access_count
+
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO eviction policy.
+    - Moves accessed items from S to M (Promotion).
+    - Reinserts accessed items in M (Second Chance).
+    - Evicts unaccessed items from S or M.
+    '''
+    check_reset(cache_snapshot)
+    global m_small, m_main, m_accessed
+    
+    capacity = cache_snapshot.capacity
+    # Target size for S is usually 10% of capacity
+    target_s = max(1, int(capacity * 0.1))
+    
+    # We loop until we find a victim to evict.
+    # The loop modifies m_small/m_main by moving items (Promotion/Reinsertion)
+    # until an unaccessed victim is found at the tail of the selected queue.
+    while True:
+        # Determine whether to process S (Small) or M (Main).
+        # Process S if it's larger than target OR if M is empty (startup/scan phase).
+        process_s = False
+        if len(m_small) > target_s:
+            process_s = True
+        elif len(m_main) == 0:
+            process_s = True
+            
+        if process_s:
+            # Inspection of S (Small Queue)
+            if not m_small:
+                # Safety fallback: if S is empty but M is not (logic overlap), switch to M
+                if m_main:
+                    process_s = False
+                else:
+                    # Cache implies full, so at least one item must exist. 
+                    # If this hits, something is wrong with state, pick arbitrary.
+                    return next(iter(cache_snapshot.cache))
+
+            if process_s:
+                # Peek at the tail (oldest) of S
+                key = next(iter(m_small))
+                
+                if key in m_accessed:
+                    # Item was accessed in S: Promote to M
+                    m_accessed.remove(key)
+                    del m_small[key]
+                    m_main[key] = None # Insert at MRU of Main
+                    # Continue loop to find next candidate
+                else:
+                    # Item not accessed: Evict from S
+                    return key
+        
+        # If we didn't process S (or decided to switch to M), process M
+        if not process_s:
+            if not m_main:
+                # Should be covered by logic above, but restart loop if state shifts
+                continue
+                
+            # Peek at the tail of M
+            key = next(iter(m_main))
+            
+            if key in m_accessed:
+                # Item was accessed in M: Give Second Chance (Reinsert at MRU)
+                m_accessed.remove(key)
+                m_main.move_to_end(key)
+            else:
+                # Item not accessed: Evict from M
+                return key
+
+def update_after_hit(cache_snapshot, obj):
+    check_reset(cache_snapshot)
+    global m_accessed
+    # Lazy promotion: just mark as accessed. 
+    # Do not move in lists to keep overhead low and preserve FIFO order for scanning.
+    m_accessed.add(obj.key)
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Handle new insertion.
+    Check ghost history to decide between S (Probation) and M (Main).
+    '''
+    check_reset(cache_snapshot)
+    global m_small, m_main, m_ghost, m_accessed
+    
+    key = obj.key
+    # Ensure clean slate for new object
+    if key in m_accessed:
+        m_accessed.remove(key)
+        
+    if key in m_ghost:
+        # Ghost Hit: It was evicted from S recently. Bypass S and insert to M.
+        del m_ghost[key]
+        m_main[key] = None
+    else:
+        # New Item: Insert into S.
+        m_small[key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Clean up internal structures after eviction.
+    Add evicted S-items to Ghost list.
+    '''
+    check_reset(cache_snapshot)
+    global m_small, m_main, m_ghost, m_accessed
+    
+    key = evicted_obj.key
+    
+    # Remove from the queue it was in
+    if key in m_small:
+        del m_small[key]
+        # Only add to ghost if evicted from S (Probation)
+        m_ghost[key] = None
+    elif key in m_main:
+        del m_main[key]
+        # Evicted from M means it had its chance. No ghost entry.
+        
+    # Manage Ghost size (limit to Cache Capacity)
+    if len(m_ghost) > cache_snapshot.capacity:
+        m_ghost.popitem(last=False) # Remove oldest ghost
+        
+    # Clean accessed bit if it lingers
+    if key in m_accessed:
+        m_accessed.remove(key)
+# EVOLVE-BLOCK-END

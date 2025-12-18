@@ -1,0 +1,253 @@
+<NAME>
+freq_gating_and_s_cap
+</NAME>
+
+<DESCRIPTION>
+1.  **Global Frequency Map**: Introduce `freq_map` to track the total frequency of items across their lifetime (persisting across evictions within a trace). This helps distinguish true working set items from one-time scans better than a simple boolean access bit.
+2.  **S-Queue Cap**: Cap the adaptive `s_dist` at 0.5. This ensures the Main (protected) queue always retains at least 50% of the cache capacity. This is crucial for scan resistance and handling loops larger than cache, preventing the Small queue from monopolizing the cache during high churn.
+3.  **Frequency-Gated Promotion**: In `evict`, strictly require `freq_map.get(key) > 1` (i.e., at least 2 accesses total) to promote an item from S to M. This filters "one-hit wonders" (insert + 0 hits) or very weak signals more effectively.
+4.  **Ghost Rescue Gating**: In `update_after_insert`, when an item hits in Ghost S, only promote it to M if `freq > 1`. Otherwise, return it to S. This prevents ghost hits from low-frequency scan items (which cycle through ghosts) from polluting M.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+# Global State
+small_q = OrderedDict()       # Probationary queue (FIFO)
+main_q = OrderedDict()        # Protected queue (FIFO)
+ghost_s = OrderedDict()       # Ghost S (History of S evictions)
+ghost_m = OrderedDict()       # Ghost M (History of M evictions)
+accessed_bits = set()         # Track hits
+s_dist = 0.1                  # Target fraction for S queue
+last_access_count = 0         # For detecting trace changes
+
+def check_reset(cache_snapshot):
+    """Detects new trace and resets globals."""
+    global small_q, main_q, ghost_s, ghost_m, accessed_bits, s_dist, last_access_count
+
+    current_acc = cache_snapshot.access_count
+    # Heuristic: access count reset/drop OR cache empty with residual state
+    if current_acc < last_access_count or (len(cache_snapshot.cache) <= 1 and len(small_q) > 1):
+        small_q.clear()
+        main_q.clear()
+        ghost_s.clear()
+        ghost_m.clear()
+        accessed_bits.clear()
+        s_dist = 0.1
+        last_access_count = 0
+
+    last_access_count = current_acc
+
+def evict(cache_snapshot, obj):
+    '''
+    Selects a victim using Dynamic S3-FIFO.
+    Lazy migration: Moves items between S/M or to Ghost during eviction scan.
+    '''
+    global s_dist
+
+    capacity = cache_snapshot.capacity
+    s_target = max(1, int(capacity * s_dist))
+    ghost_limit = max(capacity, int(2 * capacity))
+
+    # Iterate until a victim is found (Scan resistant loop)
+    while True:
+        # Determine which queue to evict from
+        # Prioritize evicting from S if it's over target, or if M is empty
+        evict_s = (len(small_q) > s_target) or (len(main_q) == 0)
+
+        if evict_s:
+            if not small_q:
+                # Should not happen if logic matches cache state, fallback to M
+                evict_s = False
+            else:
+                key, _ = small_q.popitem(last=False) # Head of FIFO
+
+                if key in accessed_bits:
+                    # Second Chance: Promote to M
+                    accessed_bits.discard(key)
+                    main_q[key] = None
+                    # We moved item S->M, but cache is still full. Loop continues.
+                else:
+                    # Victim found
+                    ghost_s[key] = None
+                    if len(ghost_s) > ghost_limit:
+                        ghost_s.popitem(last=False)
+                    return key
+
+        if not evict_s:
+            if not main_q:
+                # Emergency fallback
+                return next(iter(cache_snapshot.cache))
+
+            key, _ = main_q.popitem(last=False) # Head of FIFO
+
+            if key in accessed_bits:
+                # Second Chance: Reinsert to M Tail
+                accessed_bits.discard(key)
+                main_q[key] = None
+            else:
+                # Victim found
+                ghost_m[key] = None
+                if len(ghost_m) > ghost_limit:
+                    ghost_m.popitem(last=False)
+                return key
+
+def update_after_hit(cache_snapshot, obj):
+    check_reset(cache_snapshot)
+    accessed_bits.add(obj.key)
+
+def update_after_insert(cache_snapshot, obj):
+    check_reset(cache_snapshot)
+
+    global s_dist
+    key = obj.key
+    capacity = cache_snapshot.capacity
+
+    # Adaptive sizing delta
+    delta = 1.0 / capacity if capacity > 0 else 0.01
+
+    if key in ghost_s:
+        # Hit in Ghost S: S was too small. Increase S target.
+        s_dist = min(0.9, s_dist + delta)
+        # Rescue: promote to M
+        main_q[key] = None
+        del ghost_s[key]
+        accessed_bits.discard(key) # Reset bit on rescue
+
+    elif key in ghost_m:
+        # Hit in Ghost M: M was too small. Decrease S target (Grow M).
+        s_dist = max(0.01, s_dist - delta)
+        # Rescue: promote to M
+        main_q[key] = None
+        del ghost_m[key]
+        accessed_bits.discard(key)
+
+    else:
+        # New insert: Insert into S
+        small_q[key] = None
+        accessed_bits.discard(key)
+=======
+# Global State
+small_q = OrderedDict()       # Probationary queue (FIFO)
+main_q = OrderedDict()        # Protected queue (FIFO)
+ghost_s = OrderedDict()       # Ghost S (History of S evictions)
+ghost_m = OrderedDict()       # Ghost M (History of M evictions)
+accessed_bits = set()         # Track hits
+freq_map = {}                 # Frequency counter (Global across trace)
+s_dist = 0.1                  # Target fraction for S queue
+last_access_count = 0         # For detecting trace changes
+
+def check_reset(cache_snapshot):
+    """Detects new trace and resets globals."""
+    global small_q, main_q, ghost_s, ghost_m, accessed_bits, freq_map, s_dist, last_access_count
+
+    current_acc = cache_snapshot.access_count
+    # Heuristic: access count reset/drop OR cache empty with residual state
+    if current_acc < last_access_count or (len(cache_snapshot.cache) <= 1 and len(small_q) > 1):
+        small_q.clear()
+        main_q.clear()
+        ghost_s.clear()
+        ghost_m.clear()
+        accessed_bits.clear()
+        freq_map.clear()
+        s_dist = 0.1
+        last_access_count = 0
+
+    last_access_count = current_acc
+
+def evict(cache_snapshot, obj):
+    '''
+    Selects a victim using Dynamic S3-FIFO with Frequency Gating.
+    '''
+    global s_dist
+
+    capacity = cache_snapshot.capacity
+    # Cap S-queue at 50% to ensure M protection. This prevents S from
+    # eating the whole cache during scans/loops larger than cache.
+    s_target = max(1, int(capacity * min(s_dist, 0.5)))
+    ghost_limit = max(capacity, int(2 * capacity))
+
+    while True:
+        # Determine which queue to evict from
+        evict_s = (len(small_q) > s_target) or (len(main_q) == 0)
+
+        if evict_s:
+            if not small_q:
+                evict_s = False
+            else:
+                key, _ = small_q.popitem(last=False)
+
+                if key in accessed_bits:
+                    # Second Chance
+                    accessed_bits.discard(key)
+                    # Frequency Gating: Only promote to M if freq > 1 (at least 2 accesses)
+                    # This filters one-hit wonders better than simple access bit.
+                    if freq_map.get(key, 0) > 1:
+                        main_q[key] = None
+                    else:
+                        # Keep in S (Reinsert at tail) for another chance in S
+                        small_q[key] = None
+                else:
+                    # Victim found
+                    ghost_s[key] = None
+                    if len(ghost_s) > ghost_limit:
+                        ghost_s.popitem(last=False)
+                    return key
+
+        if not evict_s:
+            if not main_q:
+                return next(iter(cache_snapshot.cache))
+
+            key, _ = main_q.popitem(last=False)
+
+            if key in accessed_bits:
+                accessed_bits.discard(key)
+                main_q[key] = None
+            else:
+                ghost_m[key] = None
+                if len(ghost_m) > ghost_limit:
+                    ghost_m.popitem(last=False)
+                return key
+
+def update_after_hit(cache_snapshot, obj):
+    check_reset(cache_snapshot)
+    accessed_bits.add(obj.key)
+    freq_map[obj.key] = freq_map.get(obj.key, 0) + 1
+
+def update_after_insert(cache_snapshot, obj):
+    check_reset(cache_snapshot)
+
+    global s_dist
+    key = obj.key
+    capacity = cache_snapshot.capacity
+
+    freq_map[key] = freq_map.get(key, 0) + 1
+
+    # Adaptive sizing delta
+    delta = 1.0 / capacity if capacity > 0 else 0.01
+
+    if key in ghost_s:
+        # Hit in Ghost S: Increase S target
+        s_dist = min(0.9, s_dist + delta)
+        # Rescue to M only if freq suggests it's worth it (freq > 1)
+        # Otherwise, put back in S
+        if freq_map.get(key, 0) > 1:
+            main_q[key] = None
+        else:
+            small_q[key] = None
+
+        del ghost_s[key]
+        accessed_bits.discard(key)
+
+    elif key in ghost_m:
+        # Hit in Ghost M: Grow M (Decrease S target)
+        s_dist = max(0.01, s_dist - delta)
+        main_q[key] = None
+        del ghost_m[key]
+        accessed_bits.discard(key)
+
+    else:
+        # New insert: Insert into S
+        small_q[key] = None
+        accessed_bits.discard(key)
+>>>>>>> REPLACE
+</DIFF>

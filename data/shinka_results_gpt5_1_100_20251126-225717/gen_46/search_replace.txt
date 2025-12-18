@@ -1,0 +1,332 @@
+<NAME>
+arc_cross_override_pcooldown
+</NAME>
+
+<DESCRIPTION>
+I introduce two focused improvements to reduce misses without destabilizing adaptation:
+
+1) Cooldown and clamped momentum for p-updates: The previous momentum-based p updates could overreact in scan windows, hurting steady workloads (as seen in early traces). I added a cooldown so non-ghost-driven p updates are throttled to about one change per cap/20 accesses, and I clamp momentum amplitude. Ghost-based p updates remain immediate via a force flag. This keeps ARC adaptation responsive to history while preventing overcorrection during short scans.
+
+2) Cross-segment override on eviction: While ARC’s REPLACE chooses a segment, there are cases where the LRU candidate in the other segment is clearly colder (much lower frequency). I now sample candidates from both T1 and T2 and, when the frequency gap exceeds a small margin, override the initial segment choice if the chosen segment is sufficiently populated. This reduces cases where protected space holds weak entries that should be evicted before probation items, improving hit rates in mixed workloads.
+
+Additionally, I slightly reduce the scan-mode p step and make it respect the new cooldown, further stabilizing behavior without losing scan resistance.
+
+These changes preserve existing structures and logic, adjust only targeted functions and tunables, and aim to regain performance on recency/frequency traces while keeping the improvements on scan-heavy traces.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+# Tunables
+_P_INIT_RATIO = 0.30             # initial share for T1
+_FREQ_MAX = 7                    # 3-bit saturating counter
+_FRESH_WINDOW_RATIO = 0.5        # ghost freshness window = 0.5 * cap
+_SCAN_TRIGGER_INS = 0.7          # insert EWMA threshold
+_SCAN_TRIGGER_HIT = 0.15         # hit EWMA threshold
+_SCAN_WINDOW_MULT = 1.0          # scan window length ~= cap accesses
+=======
+# Tunables
+_P_INIT_RATIO = 0.30             # initial share for T1
+_FREQ_MAX = 7                    # 3-bit saturating counter
+_FRESH_WINDOW_RATIO = 0.5        # ghost freshness window = 0.5 * cap
+_SCAN_TRIGGER_INS = 0.7          # insert EWMA threshold
+_SCAN_TRIGGER_HIT = 0.15         # hit EWMA threshold
+_SCAN_WINDOW_MULT = 1.0          # scan window length ~= cap accesses
+_P_COOLDOWN_DIV = 20             # min spacing between non-ghost p-updates (~cap/20 accesses)
+_CROSS_EVICT_FREQ_MARGIN = 1     # freq gap to override segment choice
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def _adjust_p(sign, step, now, freshness_scale=1.0):
+    """Momentum-based adjustment of ARC's p with clamping."""
+    global _p_target, _p_momentum, _p_last_update_tick
+    # Scale step by freshness and bound to 0.25*cap to avoid wild swings
+    bounded = min(max(1.0, float(step) * float(freshness_scale)), max(1.0, 0.25 * float(_cap_est)))
+    _p_momentum = 0.5 * _p_momentum + float(sign) * bounded
+    _p_target += _p_momentum
+    if _p_target < 0.0:
+        _p_target = 0.0
+        _p_momentum = 0.0
+    if _p_target > float(_cap_est):
+        _p_target = float(_cap_est)
+        _p_momentum = 0.0
+    _p_last_update_tick = now
+=======
+def _adjust_p(sign, step, now, freshness_scale=1.0, force=False):
+    """Momentum-based adjustment of ARC's p with cooldown and clamping."""
+    global _p_target, _p_momentum, _p_last_update_tick
+    # Throttle non-ghost adjustments to avoid oscillation
+    if not force:
+        cool = max(1, int(max(1, _cap_est) // max(1, _P_COOLDOWN_DIV)))
+        if now - _p_last_update_tick < cool:
+            return
+    # Scale step by freshness and bound to 0.25*cap to avoid wild swings
+    bounded = min(max(1.0, float(step) * float(freshness_scale)), max(1.0, 0.25 * float(_cap_est)))
+    # Momentum update with clamp
+    _p_momentum = 0.5 * _p_momentum + float(sign) * bounded
+    max_mom = 0.25 * float(_cap_est)
+    if _p_momentum > max_mom:
+        _p_momentum = max_mom
+    elif _p_momentum < -max_mom:
+        _p_momentum = -max_mom
+    # Apply and clamp p
+    _p_target += _p_momentum
+    if _p_target < 0.0:
+        _p_target = 0.0
+        _p_momentum = 0.0
+    if _p_target > float(_cap_est):
+        _p_target = float(_cap_est)
+        _p_momentum = 0.0
+    _p_last_update_tick = now
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    Evict using ARC replace with dynamic sampling and scan bias:
+    - Prefer T1 when |T1| > p or when upcoming key is in B2 and |T1| == p.
+    - During scan window, always prefer T1 if non-empty.
+    - Within the chosen segment, sample a few LRU entries and pick (freq asc, timestamp asc).
+    '''
+    _ensure_capacity(cache_snapshot)
+
+    t1_size = len(_T1_probation)
+    t2_size = len(_T2_protected)
+    x_in_b2 = (obj is not None) and (obj.key in _B2_ghost)
+    choose_t1 = (t1_size >= 1) and ((x_in_b2 and t1_size == int(round(_p_target))) or (t1_size > _p_target))
+
+    # Scan bias: keep evictions in probation when scanning
+    if cache_snapshot.access_count <= _scan_until and t1_size > 0:
+        choose_t1 = True
+
+    # Adaptive sampling sizes based on pressure and scan
+    cap = max(1, _cap_est)
+    t1_pressure = (t1_size > _p_target + 0.1 * cap) or (cache_snapshot.access_count <= _scan_until)
+    t2_pressure = (t2_size > (cap - int(round(_p_target)))) or False
+
+    T1_SAMPLE = 1 if t1_pressure else 2
+    if cache_snapshot.access_count <= _scan_until:
+        T1_SAMPLE = 1
+    T2_SAMPLE = 5 if t2_pressure else 3
+    # If the overall recent hit rate is low, reduce T2 sampling slightly
+    if _hit_ewma < 0.2:
+        T2_SAMPLE = max(2, T2_SAMPLE - 1)
+
+    victim_key = None
+    if choose_t1 and t1_size > 0:
+        victim_key = _pick_from(_T1_probation, T1_SAMPLE, cache_snapshot)
+    if victim_key is None and t2_size > 0:
+        victim_key = _pick_from(_T2_protected, T2_SAMPLE, cache_snapshot)
+    if victim_key is None and t1_size > 0:
+        victim_key = _pick_from(_T1_probation, T1_SAMPLE, cache_snapshot)
+    if victim_key is None:
+        victim_key = _fallback_choose(cache_snapshot)
+    return victim_key
+=======
+def evict(cache_snapshot, obj):
+    '''
+    Evict using ARC replace with dynamic sampling and scan bias:
+    - Prefer T1 when |T1| > p or when upcoming key is in B2 and |T1| == p.
+    - During scan window, always prefer T1 if non-empty.
+    - Cross-segment override: if the other segment's LRU-sampled candidate is clearly colder
+      (lower frequency by a margin) and the segment has room, evict it instead.
+    '''
+    _ensure_capacity(cache_snapshot)
+
+    t1_size = len(_T1_probation)
+    t2_size = len(_T2_protected)
+    x_in_b2 = (obj is not None) and (obj.key in _B2_ghost)
+    choose_t1 = (t1_size >= 1) and ((x_in_b2 and t1_size == int(round(_p_target))) or (t1_size > _p_target))
+
+    # Scan bias: keep evictions in probation when scanning
+    if cache_snapshot.access_count <= _scan_until and t1_size > 0:
+        choose_t1 = True
+
+    # Adaptive sampling sizes based on pressure and scan
+    cap = max(1, _cap_est)
+    t1_pressure = (t1_size > _p_target + 0.1 * cap) or (cache_snapshot.access_count <= _scan_until)
+    t2_pressure = (t2_size > (cap - int(round(_p_target)))) or False
+
+    T1_SAMPLE = 1 if t1_pressure else 2
+    if cache_snapshot.access_count <= _scan_until:
+        T1_SAMPLE = 1
+    T2_SAMPLE = 5 if t2_pressure else 3
+    if _hit_ewma < 0.2:
+        T2_SAMPLE = max(2, T2_SAMPLE - 1)
+
+    # Sample candidates from both segments
+    cand_t1 = _pick_from(_T1_probation, T1_SAMPLE, cache_snapshot) if t1_size > 0 else None
+    cand_t2 = _pick_from(_T2_protected, T2_SAMPLE, cache_snapshot) if t2_size > 0 else None
+
+    # Initial choice by ARC
+    if choose_t1:
+        victim_key = cand_t1 if cand_t1 is not None else cand_t2
+    else:
+        victim_key = cand_t2 if cand_t2 is not None else cand_t1
+
+    # Cross-segment override when there's a significant frequency gap
+    if cand_t1 is not None and cand_t2 is not None:
+        sc1 = _score_key(cand_t1)
+        sc2 = _score_key(cand_t2)
+        f1, f2 = sc1[0], sc2[0]
+        min_seg = max(1, int(0.3 * cap))
+        if choose_t1 and (f2 + _CROSS_EVICT_FREQ_MARGIN < f1) and (len(_T2_protected) > min_seg):
+            victim_key = cand_t2
+        elif (not choose_t1) and (f1 + _CROSS_EVICT_FREQ_MARGIN < f2) and (len(_T1_probation) > min_seg):
+            victim_key = cand_t1
+
+    if victim_key is None:
+        victim_key = _fallback_choose(cache_snapshot)
+    return victim_key
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On miss and insert:
+    - Update EWMA and age frequencies.
+    - If key in ghosts: momentum-adjust p; fresh ghosts re-admit to T2 (seed freq), stale to T1.
+    - Else: insert to T1; during guard/scan, place at T1 LRU; also gently lower p in scan to bias T1 evictions.
+    '''
+    _ensure_capacity(cache_snapshot)
+    _maybe_age(cache_snapshot)
+    _update_activity(False, cache_snapshot)
+
+    key = obj.key
+    now = cache_snapshot.access_count
+    m_key_timestamp[key] = now
+
+    in_b1 = key in _B1_ghost
+    in_b2 = key in _B2_ghost
+
+    fresh_window = max(1, int(_FRESH_WINDOW_RATIO * _cap_est))
+
+    if in_b1 or in_b2:
+        # Compute step based on opposing ghost sizes
+        if in_b1:
+            step = max(1.0, float(len(_B2_ghost)) / max(1.0, float(len(_B1_ghost))))
+            ev_ts = _B1_ghost.get(key, None)
+            age = (now - ev_ts) if isinstance(ev_ts, int) else (fresh_window + 1)
+            fresh = age <= fresh_window
+            _adjust_p(+1, step, now, freshness_scale=(1.2 if fresh else 1.0))
+            _B1_ghost.pop(key, None)
+            if fresh:
+                # Admit to T2 as recently valuable
+                _T2_protected[key] = True
+                _freq[key] = max(3, min(_FREQ_MAX, _freq.get(key, 0) + 2))
+                _demote_protected_if_needed(cache_snapshot, avoid_key=key)
+            else:
+                _T1_probation[key] = True
+                _freq[key] = _freq.get(key, 0)
+        else:
+            step = max(1.0, float(len(_B1_ghost)) / max(1.0, float(len(_B2_ghost))))
+            ev_ts = _B2_ghost.get(key, None)
+            age = (now - ev_ts) if isinstance(ev_ts, int) else (fresh_window + 1)
+            fresh = age <= fresh_window
+            _adjust_p(-1, step, now, freshness_scale=(1.2 if fresh else 1.0))
+            _B2_ghost.pop(key, None)
+            if fresh:
+                _T2_protected[key] = True
+                _freq[key] = max(3, min(_FREQ_MAX, _freq.get(key, 0) + 2))
+                _demote_protected_if_needed(cache_snapshot, avoid_key=key)
+            else:
+                _T1_probation[key] = True
+                _freq[key] = _freq.get(key, 0)
+    else:
+        # New key: insert into T1
+        _T1_probation[key] = True
+        _freq[key] = _freq.get(key, 0)
+        # Guard and scan handling: bias newcomer colder
+        if (_last_victim_strength >= _VICTIM_GUARD_THRESH) or (now <= _scan_until):
+            _T1_probation.move_to_end(key, last=False)
+            # During scan, gently lower p to keep pressure in T1
+            if now <= _scan_until:
+                _adjust_p(-1, max(1.0, 0.1 * float(_cap_est)), now)
+
+    # Avoid duplicates across structures
+    if key in _T1_probation and key in _T2_protected:
+        _T1_probation.pop(key, None)
+    if key in _B1_ghost:
+        _B1_ghost.pop(key, None)
+    if key in _B2_ghost:
+        _B2_ghost.pop(key, None)
+    _ghost_trim()
+=======
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On miss and insert:
+    - Update EWMA and age frequencies.
+    - If key in ghosts: momentum-adjust p; fresh ghosts re-admit to T2 (seed freq), stale to T1.
+    - Else: insert to T1; during guard/scan, place at T1 LRU; also gently lower p in scan to bias T1 evictions (with cooldown).
+    '''
+    _ensure_capacity(cache_snapshot)
+    _maybe_age(cache_snapshot)
+    _update_activity(False, cache_snapshot)
+
+    key = obj.key
+    now = cache_snapshot.access_count
+    m_key_timestamp[key] = now
+
+    in_b1 = key in _B1_ghost
+    in_b2 = key in _B2_ghost
+
+    fresh_window = max(1, int(_FRESH_WINDOW_RATIO * _cap_est))
+
+    if in_b1 or in_b2:
+        # Compute step based on opposing ghost sizes
+        if in_b1:
+            step = max(1.0, float(len(_B2_ghost)) / max(1.0, float(len(_B1_ghost))))
+            ev_ts = _B1_ghost.get(key, None)
+            age = (now - ev_ts) if isinstance(ev_ts, int) else (fresh_window + 1)
+            fresh = age <= fresh_window
+            _adjust_p(+1, step, now, freshness_scale=(1.2 if fresh else 1.0), force=True)
+            _B1_ghost.pop(key, None)
+            if fresh:
+                # Admit to T2 as recently valuable
+                _T2_protected[key] = True
+                _freq[key] = max(3, min(_FREQ_MAX, _freq.get(key, 0) + 2))
+                _demote_protected_if_needed(cache_snapshot, avoid_key=key)
+            else:
+                _T1_probation[key] = True
+                _freq[key] = _freq.get(key, 0)
+        else:
+            step = max(1.0, float(len(_B1_ghost)) / max(1.0, float(len(_B2_ghost))))
+            ev_ts = _B2_ghost.get(key, None)
+            age = (now - ev_ts) if isinstance(ev_ts, int) else (fresh_window + 1)
+            fresh = age <= fresh_window
+            _adjust_p(-1, step, now, freshness_scale=(1.2 if fresh else 1.0), force=True)
+            _B2_ghost.pop(key, None)
+            if fresh:
+                _T2_protected[key] = True
+                _freq[key] = max(3, min(_FREQ_MAX, _freq.get(key, 0) + 2))
+                _demote_protected_if_needed(cache_snapshot, avoid_key=key)
+            else:
+                _T1_probation[key] = True
+                _freq[key] = _freq.get(key, 0)
+    else:
+        # New key: insert into T1
+        _T1_probation[key] = True
+        _freq[key] = _freq.get(key, 0)
+        # Guard and scan handling: bias newcomer colder
+        if (_last_victim_strength >= _VICTIM_GUARD_THRESH) or (now <= _scan_until):
+            _T1_probation.move_to_end(key, last=False)
+            # During scan, gently lower p to keep pressure in T1 (cooldowned)
+            if now <= _scan_until:
+                _adjust_p(-1, max(1.0, 0.05 * float(_cap_est)), now, force=False)
+
+    # Avoid duplicates across structures
+    if key in _T1_probation and key in _T2_protected:
+        _T1_probation.pop(key, None)
+    if key in _B1_ghost:
+        _B1_ghost.pop(key, None)
+    if key in _B2_ghost:
+        _B2_ghost.pop(key, None)
+    _ghost_trim()
+>>>>>>> REPLACE
+
+</DIFF>

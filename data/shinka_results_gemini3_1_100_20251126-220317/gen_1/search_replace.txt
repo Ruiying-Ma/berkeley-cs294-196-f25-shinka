@@ -1,0 +1,163 @@
+<NAME>
+lfuda_eviction
+</NAME>
+
+<DESCRIPTION>
+Implement LFU-DA (Least Frequently Used with Dynamic Aging) eviction policy.
+This algorithm combines the benefits of LFU (frequency awareness) and LRU (recency via aging) to improve hit rates.
+It maintains frequency counts and calculates a priority $P = F + L$, where $L$ is an aging factor that increases as items are evicted.
+- High frequency items have high priority and resist eviction.
+- New items start with priority $1 + L$.
+- When an item is evicted, $L$ is updated to the victim's priority, effectively raising the bar for existing items (aging them).
+- Tie-breaking is done using recency (LRU).
+- Includes logic to reset global state when a new trace is detected (based on timestamp regression) to avoid cross-trace pollution.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+m_key_timestamp = dict()
+
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    candid_obj_key = None
+    min_ts = min(m_key_timestamp.values())
+    candid_obj_keys = list(key for key in cache_snapshot.cache if m_key_timestamp[key] == min_ts)
+    candid_obj_key = candid_obj_keys[0]
+    return candid_obj_key
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_key_timestamp
+    assert obj.key in m_key_timestamp
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp
+    assert obj.key not in m_key_timestamp
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp
+    assert obj.key not in m_key_timestamp
+    assert evicted_obj.key in m_key_timestamp
+    m_key_timestamp.pop(evicted_obj.key)
+=======
+# LFU-DA State
+algo_state = {
+    'priority': {},      # key -> priority (float)
+    'freq': {},          # key -> frequency (int)
+    'last_access': {},   # key -> last access timestamp (int)
+    'L': 0.0,            # Aging factor
+    'max_time': 0        # Track time to detect trace resets
+}
+
+def _check_reset(current_time):
+    # If time goes backwards, we are likely processing a new trace
+    if current_time < algo_state['max_time']:
+        algo_state['priority'].clear()
+        algo_state['freq'].clear()
+        algo_state['last_access'].clear()
+        algo_state['L'] = 0.0
+        algo_state['max_time'] = 0
+    algo_state['max_time'] = current_time
+
+def evict(cache_snapshot, obj):
+    '''
+    LFU-DA Eviction:
+    Choose the item with minimum priority.
+    Tie-break using LRU (minimum last_access).
+    '''
+    # Find candidate with min priority, break ties with min last_access (LRU)
+    victim = None
+    min_p = float('inf')
+    min_la = float('inf')
+
+    P = algo_state['priority']
+    LA = algo_state['last_access']
+
+    for key in cache_snapshot.cache:
+        p = P.get(key, 0.0)
+        la = LA.get(key, 0)
+
+        if p < min_p:
+            min_p = p
+            min_la = la
+            victim = key
+        elif p == min_p:
+            if la < min_la:
+                min_la = la
+                victim = key
+
+    return victim
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    Hit: F = F + 1, P = F + L
+    '''
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+    # Update frequency
+    freq = algo_state['freq'].get(key, 0) + 1
+    algo_state['freq'][key] = freq
+    # Update priority
+    algo_state['priority'][key] = freq + algo_state['L']
+    # Update access time (for tie breaking)
+    algo_state['last_access'][key] = cache_snapshot.access_count
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Insert: F = 1, P = 1 + L
+    '''
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+    algo_state['freq'][key] = 1
+    algo_state['priority'][key] = 1.0 + algo_state['L']
+    algo_state['last_access'][key] = cache_snapshot.access_count
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Evict: Update L to the priority of the evicted object.
+    '''
+    # Note: _check_reset not needed here as it usually follows evict/insert sequence
+    key = evicted_obj.key
+    if key in algo_state['priority']:
+        # L becomes the priority of the victim
+        algo_state['L'] = algo_state['priority'][key]
+        del algo_state['priority'][key]
+
+    if key in algo_state['freq']:
+        del algo_state['freq'][key]
+
+    if key in algo_state['last_access']:
+        del algo_state['last_access'][key]
+>>>>>>> REPLACE
+
+</DIFF>

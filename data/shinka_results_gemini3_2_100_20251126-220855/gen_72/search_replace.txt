@@ -1,0 +1,220 @@
+<NAME>
+freq_decay_ghost_expand
+</NAME>
+
+<DESCRIPTION>
+Implement decayed frequency restoration and extended ghost registry.
+1. In `update_after_insert`, when an item re-enters (ghost hit), its frequency is decayed (halved) before incrementing. This prevents ancient history from dominating and ensures items must prove they are still hot.
+2. In `evict`, implement a "Second Chance" mechanism for the Main queue (T2). Instead of strict LRU, items with high frequency are moved to MRU and their frequency is decayed. This protects valuable data from transient flush.
+3. In `update_after_evict`, increase the ghost registry capacity limit from 2x to 4x cache capacity. This addresses the 0% hit rate on Trace 14 by capturing larger loops.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO with LIFO Probation and Frequency Gating.
+    - T1 (Small): LIFO eviction to resist scan/loops.
+    - T2 (Main): LRU eviction.
+    - Promotion: T1 -> T2 if freq > 1.
+    '''
+    check_reset(cache_snapshot)
+    global m_p
+
+    capacity = cache_snapshot.capacity
+    current_time = cache_snapshot.access_count
+
+    # Global Frequency Aging (Div by 2 every capacity accesses)
+    if current_time - m_p > capacity:
+        for k in m_b1:
+            m_b1[k] //= 2
+        m_p = float(current_time)
+
+    # Target size for T1 (10%)
+    t1_target = int(capacity * 0.1)
+    if t1_target < 1: t1_target = 1
+
+    # Eviction Logic
+    # Prioritize evicting from T1 if it exceeds target
+    if len(m_t1) >= t1_target:
+        # Loop to handle promotions
+        while len(m_t1) > 0:
+            # LIFO Eviction Candidate: Tail of T1
+            victim_key = next(reversed(m_t1))
+
+            # Frequency Gating (freq > 1 to promote)
+            if m_b1.get(victim_key, 0) > 1:
+                # Promote to T2
+                del m_t1[victim_key]
+                m_t2[victim_key] = None # Adds to tail (MRU)
+
+                # If T1 is now small enough, stop promoting and evict from T2?
+                # We continue loop to possibly evict another from T1 or until T1 is small.
+                if len(m_t1) < t1_target:
+                    break
+            else:
+                # Evict from T1 (LIFO)
+                return victim_key
+
+    # Evict from T2 (LRU)
+    if m_t2:
+        return next(iter(m_t2))
+
+    # Fallback
+    if m_t1:
+        return next(reversed(m_t1))
+    return obj.key
+
+def update_after_hit(cache_snapshot, obj):
+    check_reset(cache_snapshot)
+    key = obj.key
+    # Update frequency
+    m_b1[key] = m_b1.get(key, 0) + 1
+    m_b1.move_to_end(key) # Keep ghost LRU
+
+    if key in m_t1:
+        # Promote if frequently used
+        if m_b1[key] > 1:
+            del m_t1[key]
+            m_t2[key] = None
+    elif key in m_t2:
+        # Maintain LRU in Main
+        m_t2.move_to_end(key)
+
+def update_after_insert(cache_snapshot, obj):
+    check_reset(cache_snapshot)
+    key = obj.key
+    # Insert counts as 1 access
+    m_b1[key] = m_b1.get(key, 0) + 1
+    m_b1.move_to_end(key)
+
+    # Always insert to T1 (Probation)
+    m_t1[key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    check_reset(cache_snapshot)
+    key = evicted_obj.key
+
+    if key in m_t1:
+        del m_t1[key]
+    elif key in m_t2:
+        del m_t2[key]
+
+    # Limit ghost size
+    if len(m_b1) > cache_snapshot.capacity * 2:
+        m_b1.popitem(last=False) # Remove oldest ghost
+=======
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO with LIFO Probation and Frequency Gating.
+    - T1 (Small): LIFO eviction to resist scan/loops.
+    - T2 (Main): Segmented LRU with Second Chance.
+    - Promotion: T1 -> T2 if freq > 1.
+    '''
+    check_reset(cache_snapshot)
+    global m_p
+
+    capacity = cache_snapshot.capacity
+    current_time = cache_snapshot.access_count
+
+    # Global Frequency Aging (Div by 2 every capacity accesses)
+    if current_time - m_p > capacity:
+        for k in m_b1:
+            m_b1[k] //= 2
+        m_p = float(current_time)
+
+    # Target size for T1 (10%)
+    t1_target = int(capacity * 0.1)
+    if t1_target < 1: t1_target = 1
+
+    # Eviction Logic
+    # 1. Evict from T1 (Probation) if it exceeds target
+    if len(m_t1) >= t1_target:
+        # Loop to handle promotions
+        while len(m_t1) > 0:
+            # LIFO Eviction Candidate: Tail of T1
+            victim_key = next(reversed(m_t1))
+
+            # Frequency Gating (freq > 1 to promote)
+            if m_b1.get(victim_key, 0) > 1:
+                # Promote to T2
+                del m_t1[victim_key]
+                m_t2[victim_key] = None # Adds to tail (MRU)
+
+                # Stop promoting if T1 is healthy
+                if len(m_t1) < t1_target:
+                    break
+            else:
+                # Evict from T1 (LIFO)
+                return victim_key
+
+    # 2. Evict from T2 (Main)
+    # Use Second Chance based on frequency
+    retries = 10
+    while m_t2 and retries > 0:
+        candidate = next(iter(m_t2))
+        freq = m_b1.get(candidate, 0)
+
+        # Second chance if high frequency
+        if freq > 1:
+            m_t2.move_to_end(candidate) # Reinsert at MRU
+            m_b1[candidate] = freq // 2 # Decay frequency
+            retries -= 1
+        else:
+            return candidate
+
+    # Fallback if no victim found in loop or retries exhausted
+    if m_t2:
+        return next(iter(m_t2))
+
+    # Absolute Fallback
+    if m_t1:
+        return next(reversed(m_t1))
+    return obj.key
+
+def update_after_hit(cache_snapshot, obj):
+    check_reset(cache_snapshot)
+    key = obj.key
+    # Update frequency
+    m_b1[key] = m_b1.get(key, 0) + 1
+    m_b1.move_to_end(key) # Keep ghost LRU
+
+    if key in m_t1:
+        # Promote if frequently used
+        if m_b1[key] > 1:
+            del m_t1[key]
+            m_t2[key] = None
+    elif key in m_t2:
+        # Maintain LRU in Main
+        m_t2.move_to_end(key)
+
+def update_after_insert(cache_snapshot, obj):
+    check_reset(cache_snapshot)
+    key = obj.key
+
+    # Restore frequency with decay if it was a ghost
+    old_freq = m_b1.get(key, 0)
+    if old_freq > 0:
+         m_b1[key] = (old_freq // 2) + 1
+    else:
+         m_b1[key] = 1
+
+    m_b1.move_to_end(key)
+
+    # Always insert to T1 (Probation)
+    m_t1[key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    check_reset(cache_snapshot)
+    key = evicted_obj.key
+
+    if key in m_t1:
+        del m_t1[key]
+    elif key in m_t2:
+        del m_t2[key]
+
+    # Limit ghost size (Expanded for better loop capture)
+    if len(m_b1) > cache_snapshot.capacity * 4:
+        m_b1.popitem(last=False) # Remove oldest ghost
+>>>>>>> REPLACE
+</DIFF>

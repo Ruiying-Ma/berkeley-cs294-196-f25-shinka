@@ -1,0 +1,357 @@
+<NAME>
+arc_tinylfu_sampling
+</NAME>
+
+<DESCRIPTION>
+I improved the ARC-based eviction policy by integrating TinyLFU-style frequency awareness more effectively and by sampling multiple LRU candidates within segments. The main issues addressed were:
+- Frequency counts were not updated for misses before eviction choice, so evict couldn’t leverage the incoming object’s popularity. Now, we increment the requested object’s frequency once per access (on miss: in evict; on hit: in update_after_hit), tracked via m_last_freq_inc_access to avoid double counting.
+- Eviction chose only the single LRU from T1 or T2, which can evict a very frequent but temporarily cold item. I added multi-candidate sampling (top few LRU items) from both segments and pick the least frequent within the sampled set, with ARC’s p preference guiding segment choice. If the alternate segment’s best candidate is significantly less frequent (TinyLFU-protective override), the algorithm evicts from the alternate segment to protect hot items.
+- On non-full cache inserts (no evict), we still need to count the access. update_after_insert now increments frequency only if it wasn’t already incremented in evict for the same access.
+
+These changes approximate W-TinyLFU behavior (window + protected) layered on ARC’s adaptive balancing, improving resistance to scans and protecting frequently accessed items, while keeping metadata overhead small.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+from collections import OrderedDict, defaultdict
+=======
+from collections import OrderedDict, defaultdict
+from itertools import islice
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+m_decay_last = 0  # last access_count when decay happened
+=======
+m_decay_last = 0  # last access_count when decay happened
+# Track last access_count when we incremented frequency to avoid double counting per access
+m_last_freq_inc_access = -1
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    global arc_p, arc_last_adj
+    _ensure_capacity(cache_snapshot)
+    _resync(cache_snapshot)
+    _maybe_decay(cache_snapshot)
+
+    # Adjust ARC target p once per access based on ghost membership
+    if arc_last_adj != cache_snapshot.access_count:
+        if obj.key in arc_B1:
+            inc = max(1, len(arc_B2) // max(1, len(arc_B1)))
+            arc_p = min(arc_capacity, arc_p + inc)
+            arc_last_adj = cache_snapshot.access_count
+        elif obj.key in arc_B2:
+            dec = max(1, len(arc_B1) // max(1, len(arc_B2)))
+            arc_p = max(0, arc_p - dec)
+            arc_last_adj = cache_snapshot.access_count
+
+    # ARC replacement: choose between T1 and T2 depending on arc_p and ghost hit type
+    x_in_B2 = obj.key in arc_B2
+    t1_sz = len(arc_T1)
+
+    # LRU candidates from segments
+    cand_t1 = next(iter(arc_T1)) if arc_T1 else None
+    cand_t2 = next(iter(arc_T2)) if arc_T2 else None
+
+    # ARC preferred segment
+    prefer_t1 = (t1_sz >= 1 and (t1_sz > arc_p or (x_in_B2 and t1_sz == arc_p)))
+
+    # Frequency-aware choice: avoid evicting frequent items when both exist
+    def _freq(k):
+        return m_freq.get(k, 0)
+
+    candidate = None
+    if cand_t1 is None and cand_t2 is None:
+        # Fallback: choose the oldest by timestamp if available, else any key
+        if m_key_timestamp:
+            min_ts = min(m_key_timestamp.get(k, float('inf')) for k in cache_snapshot.cache.keys())
+            for k in cache_snapshot.cache.keys():
+                if m_key_timestamp.get(k, float('inf')) == min_ts:
+                    candidate = k
+                    break
+        if candidate is None:
+            candidate = next(iter(cache_snapshot.cache.keys()))
+        return candidate
+
+    if cand_t1 is None:
+        candidate = cand_t2
+    elif cand_t2 is None:
+        candidate = cand_t1
+    else:
+        # Both exist: choose lower frequency; break ties with older timestamp (LRU timestamp map)
+        if prefer_t1:
+            primary, secondary = cand_t1, cand_t2
+        else:
+            primary, secondary = cand_t2, cand_t1
+        # Compare frequencies
+        f_primary = _freq(primary)
+        f_secondary = _freq(secondary)
+        if f_primary < f_secondary:
+            candidate = primary
+        elif f_secondary < f_primary:
+            candidate = secondary
+        else:
+            # Tie on frequency: use older timestamp if available, else ARC preference
+            ts_primary = m_key_timestamp.get(primary, float('inf'))
+            ts_secondary = m_key_timestamp.get(secondary, float('inf'))
+            if ts_primary <= ts_secondary:
+                candidate = primary
+            else:
+                candidate = secondary
+
+    return candidate
+=======
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    global arc_p, arc_last_adj, m_last_freq_inc_access
+    _ensure_capacity(cache_snapshot)
+    _resync(cache_snapshot)
+    _maybe_decay(cache_snapshot)
+
+    # Count this access for the requested object once (TinyLFU-like)
+    if m_last_freq_inc_access != cache_snapshot.access_count:
+        m_freq[obj.key] += 1
+        m_last_freq_inc_access = cache_snapshot.access_count
+
+    # Adjust ARC target p once per access based on ghost membership
+    if arc_last_adj != cache_snapshot.access_count:
+        if obj.key in arc_B1:
+            inc = max(1, len(arc_B2) // max(1, len(arc_B1)))
+            arc_p = min(arc_capacity, arc_p + inc)
+            arc_last_adj = cache_snapshot.access_count
+        elif obj.key in arc_B2:
+            dec = max(1, len(arc_B1) // max(1, len(arc_B2)))
+            arc_p = max(0, arc_p - dec)
+            arc_last_adj = cache_snapshot.access_count
+
+    # ARC preference between T1 and T2 for replacement
+    x_in_B2 = obj.key in arc_B2
+    t1_sz = len(arc_T1)
+    prefer_t1 = (t1_sz >= 1 and (t1_sz > arc_p or (x_in_B2 and t1_sz == arc_p)))
+
+    def _freq(k):
+        return m_freq.get(k, 0)
+
+    # Sample a few LRU candidates from each segment and pick least frequent
+    S = 3  # small sample size to limit overhead
+    keys_t1 = list(islice(arc_T1.keys(), 0, S))
+    keys_t2 = list(islice(arc_T2.keys(), 0, S))
+
+    def pick_best(keys):
+        if not keys:
+            return None, None
+        best = None
+        best_f = None
+        best_ts = None
+        for k in keys:
+            f = _freq(k)
+            ts = m_key_timestamp.get(k, float('inf'))
+            if best is None or f < best_f or (f == best_f and ts <= best_ts):
+                best = k
+                best_f = f
+                best_ts = ts
+        return best, best_f
+
+    b1, f1 = pick_best(keys_t1)
+    b2, f2 = pick_best(keys_t2)
+
+    # Fallback if both lists are empty (shouldn't happen often)
+    if b1 is None and b2 is None:
+        candidate = None
+        if m_key_timestamp:
+            min_ts = min(m_key_timestamp.get(k, float('inf')) for k in cache_snapshot.cache.keys())
+            for k in cache_snapshot.cache.keys():
+                if m_key_timestamp.get(k, float('inf')) == min_ts:
+                    candidate = k
+                    break
+        if candidate is None and cache_snapshot.cache:
+            candidate = next(iter(cache_snapshot.cache.keys()))
+        return candidate
+
+    if b1 is None:
+        return b2
+    if b2 is None:
+        return b1
+
+    # Choose segment per ARC, but override if alternate is much less frequent
+    if prefer_t1:
+        cand, c_f = b1, f1
+        alt, a_f = b2, f2
+    else:
+        cand, c_f = b2, f2
+        alt, a_f = b1, f1
+
+    # If alternate frequency is significantly smaller, prefer evicting from alternate
+    # Criterion: a_f*2 + 1 < c_f (avoid evicting a very hot item)
+    if a_f is not None and c_f is not None and (a_f * 2 + 1) < c_f:
+        return alt
+
+    # Otherwise, break ties on frequency with timestamp
+    if c_f == a_f:
+        ts_c = m_key_timestamp.get(cand, float('inf'))
+        ts_a = m_key_timestamp.get(alt, float('inf'))
+        return cand if ts_c <= ts_a else alt
+    else:
+        return cand
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_key_timestamp
+    _ensure_capacity(cache_snapshot)
+    _maybe_decay(cache_snapshot)
+    # ARC: on hit, move to T2 MRU
+    key = obj.key
+    if key in arc_T1:
+        arc_T1.pop(key, None)
+        _move_to_mru(arc_T2, key)
+    else:
+        # If already in T2, refresh; if not present due to drift, place in T2
+        if key in arc_T2:
+            _move_to_mru(arc_T2, key)
+        else:
+            _move_to_mru(arc_T2, key)
+    # Update frequency and timestamp for tie-breaking/fallback
+    m_freq[key] += 1
+    m_key_timestamp[key] = cache_snapshot.access_count
+=======
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_key_timestamp, m_last_freq_inc_access
+    _ensure_capacity(cache_snapshot)
+    _maybe_decay(cache_snapshot)
+    # ARC: on hit, move to T2 MRU
+    key = obj.key
+    if key in arc_T1:
+        arc_T1.pop(key, None)
+        _move_to_mru(arc_T2, key)
+    else:
+        # If already in T2, refresh; if not present due to drift, place in T2
+        if key in arc_T2:
+            _move_to_mru(arc_T2, key)
+        else:
+            _move_to_mru(arc_T2, key)
+    # Update frequency once per access and timestamp for tie-breaking/fallback
+    if m_last_freq_inc_access != cache_snapshot.access_count:
+        m_freq[key] += 1
+        m_last_freq_inc_access = cache_snapshot.access_count
+    m_key_timestamp[key] = cache_snapshot.access_count
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp, arc_p, arc_last_adj
+    _ensure_capacity(cache_snapshot)
+    _maybe_decay(cache_snapshot)
+    key = obj.key
+    # ARC admission policy (also handles non-full cache case).
+    # Avoid double adjustment within the same access if already done in evict.
+    if arc_last_adj != cache_snapshot.access_count and key in arc_B1:
+        # Previously evicted from T1: favor recency by increasing p
+        inc = max(1, len(arc_B2) // max(1, len(arc_B1)))
+        arc_p = min(arc_capacity, arc_p + inc)
+        arc_last_adj = cache_snapshot.access_count
+        arc_B1.pop(key, None)
+        _move_to_mru(arc_T2, key)
+    elif arc_last_adj != cache_snapshot.access_count and key in arc_B2:
+        # Previously frequent: favor frequency by decreasing p
+        dec = max(1, len(arc_B1) // max(1, len(arc_B2)))
+        arc_p = max(0, arc_p - dec)
+        arc_last_adj = cache_snapshot.access_count
+        arc_B2.pop(key, None)
+        _move_to_mru(arc_T2, key)
+    else:
+        # Brand new: insert into T1 (recent)
+        _move_to_mru(arc_T1, key)
+    _trim_ghosts()
+    # Seed a small frequency for new/inserted item
+    m_freq[key] += 1
+    m_key_timestamp[key] = cache_snapshot.access_count
+=======
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp, arc_p, arc_last_adj, m_last_freq_inc_access
+    _ensure_capacity(cache_snapshot)
+    _maybe_decay(cache_snapshot)
+    key = obj.key
+    # ARC admission policy (also handles non-full cache case).
+    # Avoid double adjustment within the same access if already done in evict.
+    if arc_last_adj != cache_snapshot.access_count and key in arc_B1:
+        # Previously evicted from T1: favor recency by increasing p
+        inc = max(1, len(arc_B2) // max(1, len(arc_B1)))
+        arc_p = min(arc_capacity, arc_p + inc)
+        arc_last_adj = cache_snapshot.access_count
+        arc_B1.pop(key, None)
+        _move_to_mru(arc_T2, key)
+    elif arc_last_adj != cache_snapshot.access_count and key in arc_B2:
+        # Previously frequent: favor frequency by decreasing p
+        dec = max(1, len(arc_B1) // max(1, len(arc_B2)))
+        arc_p = max(0, arc_p - dec)
+        arc_last_adj = cache_snapshot.access_count
+        arc_B2.pop(key, None)
+        _move_to_mru(arc_T2, key)
+    else:
+        # Brand new: insert into T1 (recent)
+        _move_to_mru(arc_T1, key)
+    _trim_ghosts()
+    # Count this access if it wasn't already counted in evict (non-full cache case)
+    if m_last_freq_inc_access != cache_snapshot.access_count:
+        m_freq[key] += 1
+        m_last_freq_inc_access = cache_snapshot.access_count
+    m_key_timestamp[key] = cache_snapshot.access_count
+>>>>>>> REPLACE
+
+</DIFF>

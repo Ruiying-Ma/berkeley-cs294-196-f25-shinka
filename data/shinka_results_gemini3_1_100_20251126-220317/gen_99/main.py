@@ -1,0 +1,206 @@
+# EVOLVE-BLOCK-START
+"""Cache eviction algorithm for optimizing hit rates using W-TinyLFU with improved admission and management"""
+from collections import OrderedDict
+
+# W-TinyLFU State
+algo_state = {
+    'window': OrderedDict(),    # Window Cache (LRU)
+    'probation': OrderedDict(), # Main Cache - Probation (SLRU)
+    'protected': OrderedDict(), # Main Cache - Protected (SLRU)
+    'probation_eligible': set(),# Items in Probation eligible for promotion (Second Chance)
+    'freq': {},                 # Frequency Counter (4-bit equivalent)
+    'doorkeeper': set(),        # Doorkeeper filter
+    'freq_count': 0,            # Counter for aging
+    'max_time': 0               # Reset detection
+}
+
+def _check_reset(current_time):
+    # Reset state if time traveled backwards (new trace or reset)
+    if current_time < algo_state['max_time']:
+        algo_state['window'].clear()
+        algo_state['probation'].clear()
+        algo_state['protected'].clear()
+        algo_state['probation_eligible'].clear()
+        algo_state['freq'].clear()
+        algo_state['doorkeeper'].clear()
+        algo_state['freq_count'] = 0
+        algo_state['max_time'] = 0
+    algo_state['max_time'] = current_time
+
+def _update_freq(key, count_limit):
+    freq = algo_state['freq']
+    dk = algo_state['doorkeeper']
+
+    # Update frequency with saturation at 15
+    if key in freq:
+        freq[key] = min(freq[key] + 1, 15)
+    elif key in dk:
+        freq[key] = 1
+        dk.remove(key)
+    else:
+        dk.add(key)
+
+    # Doorkeeper reset based on size to maintain filter effectiveness
+    if len(dk) > count_limit * 2:
+        dk.clear()
+
+    # Aging process
+    algo_state['freq_count'] += 1
+    if algo_state['freq_count'] >= count_limit * 5:
+        to_remove = []
+        for k in freq:
+            freq[k] //= 2
+            if freq[k] == 0: to_remove.append(k)
+        for k in to_remove: del freq[k]
+        algo_state['freq_count'] = 0
+
+def evict(cache_snapshot, obj):
+    window = algo_state['window']
+    probation = algo_state['probation']
+    protected = algo_state['protected']
+    freq = algo_state['freq']
+
+    # Dynamic Window size based on item count
+    total_items = len(window) + len(probation) + len(protected)
+    w_cap = max(1, int(total_items * 0.01))
+
+    candidate_w = next(iter(window)) if window else None
+
+    # Main candidate: Probation LRU, else Protected LRU
+    candidate_m = None
+    victim_is_probation = False
+
+    if probation:
+        candidate_m = next(iter(probation))
+        victim_is_probation = True
+    elif protected:
+        candidate_m = next(iter(protected))
+        victim_is_probation = False
+
+    victim = None
+
+    # Admission/Eviction Logic
+    # 1. If Window is below capacity, we prioritize evicting from Main to allow Window to grow
+    if len(window) < w_cap and candidate_m:
+        victim = candidate_m
+    elif not candidate_m:
+        victim = candidate_w
+    elif not candidate_w:
+        victim = candidate_m
+    else:
+        # 2. Window is full. Duel: Window LRU vs Main LRU
+        fw = freq.get(candidate_w, 0)
+        fm = freq.get(candidate_m, 0)
+
+        if victim_is_probation:
+            # If Main victim is Probation (unproven), bias towards Window (New) on ties
+            if fw >= fm:
+                victim = candidate_m
+            else:
+                victim = candidate_w
+        else:
+            # If Main victim is Protected (proven), bias towards Main on ties
+            if fw > fm:
+                victim = candidate_m
+            else:
+                victim = candidate_w
+
+    return victim
+
+def update_after_hit(cache_snapshot, obj):
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+    total_items = len(cache_snapshot.cache)
+    _update_freq(key, max(total_items, 10))
+
+    window = algo_state['window']
+    probation = algo_state['probation']
+    protected = algo_state['protected']
+    probation_eligible = algo_state['probation_eligible']
+
+    if key in window:
+        window.move_to_end(key)
+    elif key in protected:
+        protected.move_to_end(key)
+    elif key in probation:
+        if key in probation_eligible:
+            # Promote from Probation to Protected
+            del probation[key]
+            probation_eligible.remove(key)
+            protected[key] = None
+
+            # SLRU Protected Capacity Management (80% of Main)
+            curr_count = len(window) + len(probation) + len(protected)
+            w_cap = max(1, int(curr_count * 0.01))
+            main_cap = curr_count - w_cap
+            p_cap = int(main_cap * 0.8)
+
+            while len(protected) > p_cap:
+                # Demote Protected LRU to Probation MRU
+                k, _ = protected.popitem(last=False)
+                probation[k] = None
+                probation.move_to_end(k)
+                # Demoted items get Second Chance (eligible for immediate promotion)
+                probation_eligible.add(k)
+        else:
+            # First hit in Probation: Mark as eligible for promotion next time
+            probation_eligible.add(key)
+            probation.move_to_end(key)
+
+def update_after_insert(cache_snapshot, obj):
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+    total_items = len(cache_snapshot.cache)
+    _update_freq(key, max(total_items, 10))
+
+    # Insert new items into Window MRU
+    algo_state['window'][key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    v_key = evicted_obj.key
+    window = algo_state['window']
+    probation = algo_state['probation']
+    protected = algo_state['protected']
+    probation_eligible = algo_state['probation_eligible']
+
+    if v_key in window:
+        del window[v_key]
+    elif v_key in probation:
+        del probation[v_key]
+        if v_key in probation_eligible:
+            probation_eligible.remove(v_key)
+    elif v_key in protected:
+        del protected[v_key]
+
+    # Post-Eviction Rebalance
+    total_items = len(window) + len(probation) + len(protected)
+    w_cap = max(1, int(total_items * 0.01))
+
+    while len(window) > w_cap:
+        k, _ = window.popitem(last=False)
+        probation[k] = None
+        probation.move_to_end(k)
+        # New items from Window start as ineligible for promotion (need 2 hits)
+        if k in probation_eligible:
+            probation_eligible.remove(k)
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

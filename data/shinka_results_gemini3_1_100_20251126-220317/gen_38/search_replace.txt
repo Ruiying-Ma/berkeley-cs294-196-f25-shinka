@@ -1,0 +1,202 @@
+<NAME>
+w_tinylfu_doorkeeper_aging
+</NAME>
+
+<DESCRIPTION>
+I will implement a Doorkeeper mechanism (using a set) to filter one-off items (scans). Items are first added to the Doorkeeper; only upon a second access are they added to the main frequency counter. This ensures scan items (seen once) have an effective frequency of 0 in the main counter comparison, losing to incumbent items.
+I will also cap the maximum frequency at 15 to prevent long-standing items from becoming immune to eviction, and accelerate the frequency aging process (resetting every 5*capacity accesses instead of 10) to adapt faster to workload changes.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+# W-TinyLFU inspired State
+algo_state = {
+    'window': OrderedDict(),    # Window Cache (SLRU or LRU)
+    'probation': OrderedDict(), # Main Cache - Probation (SLRU)
+    'protected': OrderedDict(), # Main Cache - Protected (SLRU)
+    'freq': {},                 # Frequency Counter
+    'freq_count': 0,            # Total increments for reset
+    'max_time': 0
+}
+=======
+# W-TinyLFU inspired State
+algo_state = {
+    'window': OrderedDict(),    # Window Cache (SLRU or LRU)
+    'probation': OrderedDict(), # Main Cache - Probation (SLRU)
+    'protected': OrderedDict(), # Main Cache - Protected (SLRU)
+    'freq': {},                 # Frequency Counter
+    'doorkeeper': set(),        # Doorkeeper filter
+    'freq_count': 0,            # Total increments for reset
+    'max_time': 0
+}
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def _check_reset(current_time):
+    if current_time < algo_state['max_time']:
+        algo_state['window'].clear()
+        algo_state['probation'].clear()
+        algo_state['protected'].clear()
+        algo_state['freq'].clear()
+        algo_state['freq_count'] = 0
+        algo_state['max_time'] = 0
+    algo_state['max_time'] = current_time
+=======
+def _check_reset(current_time):
+    if current_time < algo_state['max_time']:
+        algo_state['window'].clear()
+        algo_state['probation'].clear()
+        algo_state['protected'].clear()
+        algo_state['freq'].clear()
+        algo_state['doorkeeper'].clear()
+        algo_state['freq_count'] = 0
+        algo_state['max_time'] = 0
+    algo_state['max_time'] = current_time
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_hit(cache_snapshot, obj):
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+    window = algo_state['window']
+    probation = algo_state['probation']
+    protected = algo_state['protected']
+    freq = algo_state['freq']
+
+    # Frequency
+    freq[key] = freq.get(key, 0) + 1
+    algo_state['freq_count'] += 1
+    if algo_state['freq_count'] >= cache_snapshot.capacity * 10:
+        to_remove = []
+        for k in freq:
+            freq[k] //= 2
+            if freq[k] == 0: to_remove.append(k)
+        for k in to_remove: del freq[k]
+        algo_state['freq_count'] = 0
+
+    # Cache Maintenance
+    if key in window:
+        window.move_to_end(key)
+    elif key in protected:
+        protected.move_to_end(key)
+    elif key in probation:
+        # Promote
+        del probation[key]
+        protected[key] = None
+
+        # Enforce Protected Limit
+        w_cap = max(1, int(cache_snapshot.capacity * 0.05))
+        m_cap = cache_snapshot.capacity - w_cap
+        p_cap = int(m_cap * 0.8) # 80% of Main
+
+        while len(protected) > p_cap:
+            k, _ = protected.popitem(last=False)
+            probation[k] = None # Move to Probation MRU
+            probation.move_to_end(k)
+=======
+def update_after_hit(cache_snapshot, obj):
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+    window = algo_state['window']
+    probation = algo_state['probation']
+    protected = algo_state['protected']
+    freq = algo_state['freq']
+    dk = algo_state['doorkeeper']
+
+    # Frequency with Doorkeeper and Cap
+    if key in freq:
+        freq[key] = min(freq[key] + 1, 15)
+    elif key in dk:
+        freq[key] = 1
+        dk.remove(key)
+    else:
+        dk.add(key)
+
+    algo_state['freq_count'] += 1
+    # Accelerated Aging (5x capacity instead of 10x)
+    if algo_state['freq_count'] >= cache_snapshot.capacity * 5:
+        to_remove = []
+        dk.clear()
+        for k in freq:
+            freq[k] //= 2
+            if freq[k] == 0: to_remove.append(k)
+        for k in to_remove: del freq[k]
+        algo_state['freq_count'] = 0
+
+    # Cache Maintenance
+    if key in window:
+        window.move_to_end(key)
+    elif key in protected:
+        protected.move_to_end(key)
+    elif key in probation:
+        # Promote
+        del probation[key]
+        protected[key] = None
+
+        # Enforce Protected Limit
+        w_cap = max(1, int(cache_snapshot.capacity * 0.05))
+        m_cap = cache_snapshot.capacity - w_cap
+        p_cap = int(m_cap * 0.8) # 80% of Main
+
+        while len(protected) > p_cap:
+            k, _ = protected.popitem(last=False)
+            probation[k] = None # Move to Probation MRU
+            probation.move_to_end(k)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+    freq = algo_state['freq']
+
+    # Frequency
+    freq[key] = freq.get(key, 0) + 1
+    algo_state['freq_count'] += 1
+    if algo_state['freq_count'] >= cache_snapshot.capacity * 10:
+        to_remove = []
+        for k in freq:
+            freq[k] //= 2
+            if freq[k] == 0: to_remove.append(k)
+        for k in to_remove: del freq[k]
+        algo_state['freq_count'] = 0
+
+    # Insert to Window MRU
+    algo_state['window'][key] = None
+=======
+def update_after_insert(cache_snapshot, obj):
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+    freq = algo_state['freq']
+    dk = algo_state['doorkeeper']
+
+    # Frequency with Doorkeeper and Cap
+    if key in freq:
+        freq[key] = min(freq[key] + 1, 15)
+    elif key in dk:
+        freq[key] = 1
+        dk.remove(key)
+    else:
+        dk.add(key)
+
+    algo_state['freq_count'] += 1
+    # Accelerated Aging
+    if algo_state['freq_count'] >= cache_snapshot.capacity * 5:
+        to_remove = []
+        dk.clear()
+        for k in freq:
+            freq[k] //= 2
+            if freq[k] == 0: to_remove.append(k)
+        for k in to_remove: del freq[k]
+        algo_state['freq_count'] = 0
+
+    # Insert to Window MRU
+    algo_state['window'][key] = None
+>>>>>>> REPLACE
+</DIFF>

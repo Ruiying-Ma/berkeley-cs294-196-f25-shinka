@@ -1,0 +1,117 @@
+<NAME>
+conditional_demotion_and_larger_ghost
+</NAME>
+
+<DESCRIPTION>
+1.  **Conditional Demotion**: In `evict`, when processing the Main queue, check if the Small queue is full (`len < s_target`). If Small is full, do not demote the Main victim to Small; instead, evict it directly. This prevents cold items from the Main queue from clogging the probation (Small) queue during high churn/scan phases, allowing Small to better filter new incoming traffic.
+2.  **Unified Ghost Tracking**: Update `update_after_evict` to add evicted items to the Ghost queue regardless of whether they came from Main or Small. This ensures that valuable items evicted directly from Main (due to the conditional demotion) are still tracked and can be recovered (promoted) if accessed again.
+3.  **Expanded Ghost Capacity**: Increase Ghost queue capacity to 4x cache size (up from 2x) to better detect and recover from larger loops or cyclic patterns that exceed the standard lookback window.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        # 2. Check Main FIFO (Protected)
+        # We process Main if Small is small enough.
+        if _s3_main:
+            candidate = next(iter(_s3_main))
+
+            if candidate not in cache_snapshot.cache:
+                _s3_main.pop(candidate, None)
+                _s3_freq.pop(candidate, None)
+                continue
+
+            freq = _s3_freq.get(candidate, 0)
+            if freq > 0:
+                # Accessed while in Main -> Second Chance (Reinsert)
+                _s3_main.pop(candidate)
+                _s3_main[candidate] = None # Reinsert at tail
+                _s3_freq[candidate] = 0
+                continue
+            else:
+                # Not visited in Main: Demote to Small instead of immediate eviction
+                # This gives the item a chance to survive in the probationary queue
+                # while allowing Small queue logic to decide the final victim.
+                _s3_main.pop(candidate)
+                _s3_small[candidate] = None # Insert at tail of Small
+                _s3_freq[candidate] = 0
+                continue
+=======
+        # 2. Check Main FIFO (Protected)
+        # We process Main if Small is small enough.
+        if _s3_main:
+            candidate = next(iter(_s3_main))
+
+            if candidate not in cache_snapshot.cache:
+                _s3_main.pop(candidate, None)
+                _s3_freq.pop(candidate, None)
+                continue
+
+            freq = _s3_freq.get(candidate, 0)
+            if freq > 0:
+                # Accessed while in Main -> Second Chance (Reinsert)
+                _s3_main.pop(candidate)
+                _s3_main[candidate] = None # Reinsert at tail
+                _s3_freq[candidate] = 0
+                continue
+            else:
+                # Not visited in Main: Conditional Demotion
+                # Only demote to Small if Small is not overflowing.
+                # This protects Small from being flooded by cold Main items during scans.
+                if len(_s3_small) < s_target:
+                    _s3_main.pop(candidate)
+                    _s3_small[candidate] = None # Insert at tail of Small
+                    _s3_freq[candidate] = 0
+                    continue
+                else:
+                    # Small is full/overflowing: Evict directly from Main
+                    # This item will be added to Ghost in update_after_evict
+                    return candidate
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    global _s3_small, _s3_main, _s3_ghost, _s3_freq
+    _check_reset(cache_snapshot)
+
+    key = evicted_obj.key
+
+    # If evicted from Small, track in Ghost.
+    # Note: With demotion, items from Main go to Small before eviction,
+    # so they will also pass through here.
+    if key in _s3_small:
+        _s3_small.pop(key)
+        _s3_ghost[key] = None
+        # Limit ghost size to avoid unbounded memory usage
+        # Increased to 2x capacity to capture longer loops
+        if len(_s3_ghost) > cache_snapshot.capacity * 2:
+            # Remove oldest (FIFO head)
+            _s3_ghost.pop(next(iter(_s3_ghost)), None)
+
+    elif key in _s3_main:
+        _s3_main.pop(key)
+
+    _s3_freq.pop(key, None)
+=======
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    global _s3_small, _s3_main, _s3_ghost, _s3_freq
+    _check_reset(cache_snapshot)
+
+    key = evicted_obj.key
+
+    # Track eviction in Ghost regardless of source queue
+    # This helps recovery of both scan items (Small) and working set items (Main)
+    if key in _s3_small:
+        _s3_small.pop(key)
+    elif key in _s3_main:
+        _s3_main.pop(key)
+
+    # Add to Ghost
+    _s3_ghost[key] = None
+
+    # Limit ghost size
+    # Increased to 4x capacity to capture even larger loops/patterns
+    if len(_s3_ghost) > cache_snapshot.capacity * 4:
+        _s3_ghost.pop(next(iter(_s3_ghost)), None)
+
+    _s3_freq.pop(key, None)
+>>>>>>> REPLACE
+</DIFF>

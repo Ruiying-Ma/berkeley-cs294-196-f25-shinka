@@ -1,0 +1,209 @@
+--- a/original.py
++++ b/original.py
+@@ -1,95 +1,156 @@
+ # EVOLVE-BLOCK-START
+ """Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+ 
+-from collections import OrderedDict
++from collections import deque, OrderedDict
+ 
+-m_probationary = OrderedDict()
+-m_protected = OrderedDict()
+-m_protected_size = 0
++# W-TinyLFU style state
++algo_state = {
++    'window': deque(),        # Queue of (key, size)
++    'window_size': 0,         # Current size of window
++    'probation': OrderedDict(), # key -> size
++    'protected': OrderedDict(), # key -> size
++    'protected_size': 0,
++    'freq': {},               # key -> count
++    'access_count': 0
++}
+ 
+ def evict(cache_snapshot, obj):
+     '''
+-    This function defines how the algorithm chooses the eviction victim.
+-    - Args:
+-        - `cache_snapshot`: A snapshot of the current cache state.
+-        - `obj`: The new object that needs to be inserted into the cache.
+-    - Return:
+-        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
++    W-TinyLFU Eviction:
++    - Maintains a small Window (1%) and a Main SLRU (Probation + Protected).
++    - If Window is not full, evict from Main (to allow Window to grow).
++    - If Window is full, duel the Window victim vs Main victim using frequency.
+     '''
+-    if m_probationary:
+-        return next(iter(m_probationary))
+-    if m_protected:
+-        return next(iter(m_protected))
+-    return None
++    window = algo_state['window']
++    probation = algo_state['probation']
++    protected = algo_state['protected']
++    freq = algo_state['freq']
++
++    capacity = cache_snapshot.capacity
++    w_cap = max(1, int(capacity * 0.01))
++
++    # 1. If Window has space, prefer evicting from Main (Probation -> Protected)
++    if algo_state['window_size'] < w_cap:
++        if probation:
++            return next(iter(probation))
++        if protected:
++            return next(iter(protected))
++        if window:
++            return window[0][0]
++
++    # 2. Window is full. Find candidates.
++    if not window:
++        # Fallback if window empty (rare)
++        if probation: return next(iter(probation))
++        if protected: return next(iter(protected))
++        return None
++
++    cand_w_key = window[0][0]
++
++    if probation:
++        cand_m_key = next(iter(probation))
++    elif protected:
++        cand_m_key = next(iter(protected))
++    else:
++        return cand_w_key
++
++    # Duel: Keep the one with higher frequency
++    freq_w = freq.get(cand_w_key, 0)
++    freq_m = freq.get(cand_m_key, 0)
++
++    if freq_w > freq_m:
++        return cand_m_key
++    else:
++        return cand_w_key
+ 
+ def update_after_hit(cache_snapshot, obj):
+     '''
+-    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+-    - Args:
+-        - `cache_snapshot`: A snapshot of the current cache state.
+-        - `obj`: The object accessed during the cache hit.
+-    - Return: `None`
++    Update frequency and manage SLRU promotion.
+     '''
+-    global m_protected_size
+     key = obj.key
+-    if key in m_protected:
+-        m_protected.move_to_end(key)
+-    elif key in m_probationary:
+-        val = m_probationary.pop(key)
+-        m_protected[key] = val
+-        m_protected_size += val
++    algo_state['access_count'] += 1
+ 
+-        limit = cache_snapshot.capacity * 0.8
+-        while m_protected_size > limit and m_protected:
+-            k, v = m_protected.popitem(last=False)
+-            m_protected_size -= v
+-            m_probationary[k] = v
++    # Frequency Update & Aging
++    f = algo_state['freq']
++    f[key] = f.get(key, 0) + 1
++    if algo_state['access_count'] > cache_snapshot.capacity * 10:
++        algo_state['freq'] = {k: v // 2 for k, v in f.items() if v > 1}
++        algo_state['access_count'] = 0
++
++    # SLRU Management
++    if key in algo_state['protected']:
++        algo_state['protected'].move_to_end(key)
++    elif key in algo_state['probation']:
++        # Promote from Probation to Protected
++        val = algo_state['probation'].pop(key)
++        algo_state['protected'][key] = val
++        algo_state['protected_size'] += val
++
++        # Enforce Protected Limit (80% of capacity)
++        limit = int(cache_snapshot.capacity * 0.8)
++        while algo_state['protected_size'] > limit and algo_state['protected']:
++            k, v = algo_state['protected'].popitem(last=False)
++            algo_state['protected_size'] -= v
++            algo_state['probation'][k] = v
+ 
+ def update_after_insert(cache_snapshot, obj):
+     '''
+-    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+-    - Args:
+-        - `cache_snapshot`: A snapshot of the current cache state.
+-        - `obj`: The object that was just inserted into the cache.
+-    - Return: `None`
++    Insert new object into Window and handle overflow to Probation.
+     '''
+-    m_probationary[obj.key] = obj.size
++    key = obj.key
++    size = obj.size
++    algo_state['access_count'] += 1
++
++    # Frequency Update
++    f = algo_state['freq']
++    f[key] = f.get(key, 0) + 1
++
++    # Insert into Window
++    algo_state['window'].append((key, size))
++    algo_state['window_size'] += size
++
++    # Check Window Overflow -> Move to Probation
++    w_cap = max(1, int(cache_snapshot.capacity * 0.01))
++    while algo_state['window_size'] > w_cap and algo_state['window']:
++        k, s = algo_state['window'].popleft()
++        algo_state['window_size'] -= s
++        algo_state['probation'][k] = s
+ 
+ def update_after_evict(cache_snapshot, obj, evicted_obj):
+     '''
+-    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+-    - Args:
+-        - `cache_snapshot`: A snapshot of the current cache state.
+-        - `obj`: The object to be inserted into the cache.
+-        - `evicted_obj`: The object that was just evicted from the cache.
+-    - Return: `None`
++    Remove evicted object from internal structures.
+     '''
+-    global m_protected_size
+     key = evicted_obj.key
+-    if key in m_probationary:
+-        del m_probationary[key]
+-    if key in m_protected:
+-        val = m_protected.pop(key)
+-        m_protected_size -= val
++    size = evicted_obj.size
++
++    # Check and remove from locations
++    if algo_state['window'] and algo_state['window'][0][0] == key:
++        algo_state['window'].popleft()
++        algo_state['window_size'] -= size
++    elif key in algo_state['probation']:
++        del algo_state['probation'][key]
++    elif key in algo_state['protected']:
++        val = algo_state['protected'].pop(key)
++        algo_state['protected_size'] -= val
+ 
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

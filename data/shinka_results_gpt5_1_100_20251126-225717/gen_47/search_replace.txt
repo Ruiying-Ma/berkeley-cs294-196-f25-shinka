@@ -1,0 +1,432 @@
+<NAME>
+incoming_aware_evict_and_arc_tuning
+</NAME>
+
+<DESCRIPTION>
+I introduce an incoming-aware victim selection that avoids evicting objects hotter than the incoming request (a TinyLFU-like admission guard), plus ARC-inspired protected-fraction tuning based on ghost hits and eviction mix. Specifically:
+
+1) Incoming-aware eviction: In evict, candidates are scored with a primary bit indicating whether the candidate is hotter than the incoming object. This prefers evicting colder or comparable items first, greatly reducing pollution by low-frequency insertions.
+
+2) Ghost-driven tuning: On insert, a recent ghost in probation decreases the protected fraction (favor recency) and a recent ghost in protected increases it (favor frequency), like ARC’s p-adjustment but mapped to our protected fraction.
+
+3) Smarter admission: If the incoming key’s decayed frequency score is not higher than the last victim’s, we insert it at the probation LRU (deprioritized) unless a strong ghost signal or high score warrants better placement. Hot or recently protected-ghost items are admitted to protected.
+
+4) Eviction-mix adaptation: Over a small window of evictions, if we evict more from protected than probation, we decrease the protected fraction (it’s too large); if the opposite holds, we increase it. This keeps the SLRU balance aligned with workload dynamics.
+
+These changes keep metadata consistent, respect scan-mode behavior, and should reduce miss rates across varied traces by avoiding evicting hot items for cold arrivals and by adapting the protected/probation split based on observed signals.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+# Sampling parameters for LRFU-like victim selection
+_BASE_PROB_SAMPLE = 3
+_BASE_PROT_SAMPLE = 2
+=======
+# Sampling parameters for LRFU-like victim selection
+_BASE_PROB_SAMPLE = 3
+_BASE_PROT_SAMPLE = 2
+
+# Admission guard and adaptation helpers
+# We bias eviction choice to avoid evicting items hotter than the incoming object (TinyLFU-like).
+# Additionally, adapt protected fraction based on eviction mix over a small window.
+_ADMISSION_GUARD = True
+_evict_prob_cnt = 0
+_evict_prot_cnt = 0
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    # Keep metadata consistent and properly segmented before choosing a victim
+    _maybe_age(cache_snapshot)
+    _sync_metadata(cache_snapshot)
+    _rebalance(cache_snapshot)
+
+    # Track key for scan detection unique density
+    try:
+        _epoch_unique.add(obj.key)
+    except Exception:
+        pass
+
+    # Clean up stale entries (if any)
+    for k in list(_probation.keys()):
+        if k not in cache_snapshot.cache:
+            _probation.pop(k, None)
+            _key_seg.pop(k, None)
+    for k in list(_protected.keys()):
+        if k not in cache_snapshot.cache:
+            _protected.pop(k, None)
+            _key_seg.pop(k, None)
+
+    # If metadata is empty, fallback
+    if not cache_snapshot.cache:
+        return None
+
+    # Adaptive sampling sizes
+    prob_sample = _BASE_PROB_SAMPLE
+    prot_sample = _BASE_PROT_SAMPLE
+    if _scan_mode:
+        prob_sample += 1
+        prot_sample = max(1, prot_sample - 1)
+    if len(_probation) > len(_protected) + 2:
+        prob_sample += 1
+
+    # Build candidate tuples from both segments' LRU sides
+    candidates = []
+    # Probation candidates
+    pkeys = _sample_lru_keys(_probation, prob_sample)
+    for idx, pk in enumerate(pkeys):
+        if pk in cache_snapshot.cache:
+            candidates.append(_victim_tuple(pk, 'prob', idx))
+    # Protected candidates
+    tkeys = _sample_lru_keys(_protected, prot_sample)
+    for idx, tk in enumerate(tkeys):
+        if tk in cache_snapshot.cache:
+            candidates.append(_victim_tuple(tk, 'prot', idx))
+
+    if not candidates:
+        # Fallback: pick any key from cache if metadata got desynced
+        return next(iter(cache_snapshot.cache.keys()))
+
+    # Choose coldest by (score, segment preference, recency)
+    best = min(candidates)
+    candid_obj_key = best[3]
+    victim_from_protected = (_key_seg.get(candid_obj_key) == 'prot')
+
+    # Adaptive tuning: if we are forced to evict from protected, reduce its target fraction slightly
+    if victim_from_protected:
+        _decrease_protected()
+
+    return candid_obj_key
+=======
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    # Keep metadata consistent and properly segmented before choosing a victim
+    _maybe_age(cache_snapshot)
+    _sync_metadata(cache_snapshot)
+    _rebalance(cache_snapshot)
+
+    # Track key for scan detection unique density
+    try:
+        _epoch_unique.add(obj.key)
+    except Exception:
+        pass
+
+    # Clean up stale entries (if any)
+    for k in list(_probation.keys()):
+        if k not in cache_snapshot.cache:
+            _probation.pop(k, None)
+            _key_seg.pop(k, None)
+    for k in list(_protected.keys()):
+        if k not in cache_snapshot.cache:
+            _protected.pop(k, None)
+            _key_seg.pop(k, None)
+
+    # If metadata is empty, fallback
+    if not cache_snapshot.cache:
+        return None
+
+    # Adaptive sampling sizes
+    prob_sample = _BASE_PROB_SAMPLE
+    prot_sample = _BASE_PROT_SAMPLE
+    if _scan_mode:
+        prob_sample += 1
+        prot_sample = max(1, prot_sample - 1)
+    if len(_probation) > len(_protected) + 2:
+        prob_sample += 1
+
+    # Incoming-aware admission guard: avoid evicting hotter items if possible
+    incoming_score = _score(obj.key)
+
+    # Build candidate tuples from both segments' LRU sides
+    candidates = []
+    # Probation candidates
+    pkeys = _sample_lru_keys(_probation, prob_sample)
+    for idx, pk in enumerate(pkeys):
+        if pk in cache_snapshot.cache:
+            s = _score(pk)
+            hotter = 1 if (_ADMISSION_GUARD and s > incoming_score) else 0
+            segpref = 0  # probation preferred
+            candidates.append((hotter, s, segpref, idx, pk))
+    # Protected candidates
+    tkeys = _sample_lru_keys(_protected, prot_sample)
+    for idx, tk in enumerate(tkeys):
+        if tk in cache_snapshot.cache:
+            s = _score(tk)
+            hotter = 1 if (_ADMISSION_GUARD and s > incoming_score) else 0
+            segpref = 1  # protected less preferred
+            candidates.append((hotter, s, segpref, idx, tk))
+
+    if not candidates:
+        # Fallback: pick any key from cache if metadata got desynced
+        return next(iter(cache_snapshot.cache.keys()))
+
+    # Choose coldest by (hotter_than_incoming, score, segment preference, recency)
+    best = min(candidates)
+    candid_obj_key = best[4]
+    victim_from_protected = (_key_seg.get(candid_obj_key) == 'prot')
+
+    # Adaptive tuning: if we are forced to evict from protected, reduce its target fraction slightly
+    if victim_from_protected:
+        _decrease_protected()
+
+    return candid_obj_key
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    _maybe_age(cache_snapshot)
+    _sync_metadata(cache_snapshot)
+    k = obj.key
+    _inc(k)
+    try:
+        _epoch_unique.add(k)
+    except Exception:
+        pass
+
+    # Decide segment placement using ghost history (segment-aware)
+    g_prot_epoch = _ghost_protected.get(k)
+    g_prob_epoch = _ghost_probation.get(k)
+    recent_prot_ghost = (g_prot_epoch is not None) and (_epoch - g_prot_epoch <= 2)
+    recent_prob_ghost = (g_prob_epoch is not None) and (_epoch - g_prob_epoch <= 2)
+
+    # Reset any existing placement
+    if _key_seg.get(k) == 'prot':
+        _protected.pop(k, None)
+    else:
+        _probation.pop(k, None)
+
+    if _scan_mode:
+        # Scan resistance: insert at probation LRU to minimize pollution,
+        # require two-touch before promotion via update_after_hit.
+        _probation[k] = None
+        _probation.move_to_end(k, last=False)  # LRU side
+        _key_seg[k] = 'prob'
+    else:
+        if recent_prot_ghost:
+            # Re-admit into protected due to recent protected ghost hit
+            _protected[k] = None
+            _key_seg[k] = 'prot'
+            _increase_protected()
+        else:
+            # Default admission into probation
+            _probation[k] = None
+            _key_seg[k] = 'prob'
+            if recent_prob_ghost:
+                # Slight boost for recently evicted probation ghost to accelerate useful re-references
+                _probation.move_to_end(k, last=True)  # ensure MRU
+                _inc(k)
+
+    _rebalance(cache_snapshot)
+=======
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    _maybe_age(cache_snapshot)
+    _sync_metadata(cache_snapshot)
+    k = obj.key
+    _inc(k)
+    try:
+        _epoch_unique.add(k)
+    except Exception:
+        pass
+
+    # Decide segment placement using ghost history (segment-aware)
+    g_prot_epoch = _ghost_protected.get(k)
+    g_prob_epoch = _ghost_probation.get(k)
+    recent_prot_ghost = (g_prot_epoch is not None) and (_epoch - g_prot_epoch <= 2)
+    recent_prob_ghost = (g_prob_epoch is not None) and (_epoch - g_prob_epoch <= 2)
+    incoming_score = _score(k)
+
+    # Reset any existing placement
+    if _key_seg.get(k) == 'prot':
+        _protected.pop(k, None)
+    else:
+        _probation.pop(k, None)
+
+    if _scan_mode:
+        # Scan resistance: insert at probation LRU to minimize pollution,
+        # require two-touch before promotion via update_after_hit.
+        _probation[k] = None
+        _probation.move_to_end(k, last=False)  # LRU side
+        _key_seg[k] = 'prob'
+    else:
+        if recent_prot_ghost:
+            # Re-admit into protected due to recent protected ghost hit
+            _protected[k] = None
+            _key_seg[k] = 'prot'
+            _increase_protected()
+        elif recent_prob_ghost:
+            # A B1-like hit suggests we need more recency; bias towards probation and shrink protected a bit
+            _decrease_protected()
+            _probation[k] = None
+            _key_seg[k] = 'prob'
+            _probation.move_to_end(k, last=True)  # MRU in probation
+            _inc(k)
+        else:
+            # Admission guard: if incoming is not hotter than last victim, insert cold at probation LRU
+            if _ADMISSION_GUARD and incoming_score <= _last_victim_score:
+                _probation[k] = None
+                _key_seg[k] = 'prob'
+                _probation.move_to_end(k, last=False)  # LRU side (deprioritize)
+            elif incoming_score >= 2:
+                # Strongly hot objects can be admitted protected
+                _protected[k] = None
+                _key_seg[k] = 'prot'
+                _increase_protected()
+            else:
+                # Default: probation MRU
+                _probation[k] = None
+                _key_seg[k] = 'prob'
+                _probation.move_to_end(k, last=True)
+
+    _rebalance(cache_snapshot)
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    _maybe_age(cache_snapshot)
+    # Record into ghost according to the segment it was evicted from
+    k = evicted_obj.key
+    seg = _key_seg.get(k, None)
+    # Store last victim score for potential future enhancements
+    global _last_victim_score
+    _last_victim_score = _score(k)
+
+    if seg == 'prob':
+        _ghost_probation[k] = _epoch
+        _probation.pop(k, None)
+    elif seg == 'prot':
+        _ghost_protected[k] = _epoch
+        _protected.pop(k, None)
+
+    # Clean any stale two-touch markers
+    _touched_once.pop(k, None)
+
+    _key_seg.pop(k, None)
+
+    # Trim ghost histories to bounded size
+    limit = max(1, _GHOST_LIMIT_MULT * max(cache_snapshot.capacity, 1))
+    while len(_ghost_probation) > limit:
+        _ghost_probation.popitem(last=False)
+    while len(_ghost_protected) > limit:
+        _ghost_protected.popitem(last=False)
+
+    # Adaptive protected tuning: if we evicted from probation but the incoming object is hotter,
+    # increase protected to preserve hot items better.
+    try:
+        if seg == 'prob' and _score(obj.key) > _last_victim_score:
+            _increase_protected()
+    except Exception:
+        pass
+
+    # After an eviction, ensure protected segment still respects target (it might shrink due to target change)
+    _rebalance(cache_snapshot)
+=======
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    _maybe_age(cache_snapshot)
+    # Record into ghost according to the segment it was evicted from
+    k = evicted_obj.key
+    seg = _key_seg.get(k, None)
+    # Store last victim score for potential future enhancements
+    global _last_victim_score, _evict_prob_cnt, _evict_prot_cnt
+    _last_victim_score = _score(k)
+
+    if seg == 'prob':
+        _ghost_probation[k] = _epoch
+        _probation.pop(k, None)
+        _evict_prob_cnt += 1
+    elif seg == 'prot':
+        _ghost_protected[k] = _epoch
+        _protected.pop(k, None)
+        _evict_prot_cnt += 1
+
+    # Clean any stale two-touch markers
+    _touched_once.pop(k, None)
+
+    _key_seg.pop(k, None)
+
+    # Trim ghost histories to bounded size
+    limit = max(1, _GHOST_LIMIT_MULT * max(cache_snapshot.capacity, 1))
+    while len(_ghost_probation) > limit:
+        _ghost_probation.popitem(last=False)
+    while len(_ghost_protected) > limit:
+        _ghost_protected.popitem(last=False)
+
+    # Adaptive protected tuning: if we evicted from probation but the incoming object is hotter,
+    # increase protected to preserve hot items better.
+    try:
+        if seg == 'prob' and _score(obj.key) > _last_victim_score:
+            _increase_protected()
+    except Exception:
+        pass
+
+    # Eviction-mix adaptation over a short window
+    try:
+        total = _evict_prob_cnt + _evict_prot_cnt
+        window = max(8, min(int(max(cache_snapshot.capacity, 1)), 128))
+        if total >= window:
+            if _evict_prot_cnt > _evict_prob_cnt:
+                _decrease_protected()
+            elif _evict_prob_cnt > _evict_prot_cnt:
+                _increase_protected()
+            _evict_prot_cnt = 0
+            _evict_prob_cnt = 0
+    except Exception:
+        # Be conservative if anything goes wrong
+        _evict_prot_cnt = 0
+        _evict_prob_cnt = 0
+
+    # After an eviction, ensure protected segment still respects target (it might shrink due to target change)
+    _rebalance(cache_snapshot)
+>>>>>>> REPLACE
+
+</DIFF>

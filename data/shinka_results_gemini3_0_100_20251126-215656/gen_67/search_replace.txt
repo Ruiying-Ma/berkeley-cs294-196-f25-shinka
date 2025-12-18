@@ -1,0 +1,85 @@
+<NAME>
+optimize_ghost_and_demotion
+</NAME>
+
+<DESCRIPTION>
+1. Increase Ghost Registry size from 2x to 4x capacity. This helps capture longer loops (improving traces like 27, 28, 29) by retaining history longer without consuming cache space.
+2. Implement "Soft Reset" for demotion from Main to Small. When an item is demoted from Main to Small (which only happens if Small is not full), it is inserted at the HEAD (LRU position) of the Small queue instead of the TAIL. This grants it a shorter "second chance" probation period proportional to the available space in S. If S is nearly full, the item must be accessed almost immediately to survive. If S is empty, it gets longer. This prevents demoted items from clogging S and displacing new insertions, while still rescuing hot items.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+            if candidate_key in accessed_bits:
+                # Hit in S -> Promote to M (Probation passed)
+                accessed_bits.discard(candidate_key)
+                m_queue[candidate_key] = None
+            else:
+                # Victim found in S
+                # Record in Ghost to catch loops later
+                ghost_registry[candidate_key] = None
+                # Extended Ghost Size: 2x Capacity to catch longer loops (Trace 29 optimization)
+                if len(ghost_registry) > capacity * 2:
+                    ghost_registry.popitem(last=False)
+                return candidate_key
+
+        # 2. Evict from Main Queue
+        else:
+            # S is within target size, and M is not empty.
+            candidate_key, _ = m_queue.popitem(last=False) # FIFO head
+
+            if candidate_key in accessed_bits:
+                # Hit in M -> Reinsert at tail (Second Chance)
+                accessed_bits.discard(candidate_key)
+                m_queue[candidate_key] = None
+            else:
+                # Victim found in M
+                # Conditional Demotion: Demote to S only if S has room.
+                # If S is full (or above target), we drop the M-victim to prevent clogging S.
+                if len(s_queue) < s_target:
+                    s_queue[candidate_key] = None # Insert at tail of S
+                else:
+                    # Drop and add to Ghost
+                    ghost_registry[candidate_key] = None
+                    if len(ghost_registry) > capacity * 2:
+                        ghost_registry.popitem(last=False)
+                    return candidate_key
+=======
+            if candidate_key in accessed_bits:
+                # Hit in S -> Promote to M (Probation passed)
+                accessed_bits.discard(candidate_key)
+                m_queue[candidate_key] = None
+            else:
+                # Victim found in S
+                # Record in Ghost to catch loops later
+                ghost_registry[candidate_key] = None
+                # Extended Ghost Size: 4x Capacity to catch longer loops
+                if len(ghost_registry) > capacity * 4:
+                    ghost_registry.popitem(last=False)
+                return candidate_key
+
+        # 2. Evict from Main Queue
+        else:
+            # S is within target size, and M is not empty.
+            candidate_key, _ = m_queue.popitem(last=False) # FIFO head
+
+            if candidate_key in accessed_bits:
+                # Hit in M -> Reinsert at tail (Second Chance)
+                accessed_bits.discard(candidate_key)
+                m_queue[candidate_key] = None
+            else:
+                # Victim found in M
+                # Conditional Demotion: Demote to S only if S has room.
+                # If S is full (or above target), we drop the M-victim to prevent clogging S.
+                if len(s_queue) < s_target:
+                    s_queue[candidate_key] = None
+                    # Soft Reset: Insert at HEAD of S (LRU position) to test quickly.
+                    # This ensures demoted items don't hog S-space if they are dead.
+                    s_queue.move_to_end(candidate_key, last=False)
+                else:
+                    # Drop and add to Ghost
+                    ghost_registry[candidate_key] = None
+                    if len(ghost_registry) > capacity * 4:
+                        ghost_registry.popitem(last=False)
+                    return candidate_key
+>>>>>>> REPLACE
+</DIFF>

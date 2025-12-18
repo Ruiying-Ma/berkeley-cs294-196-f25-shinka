@@ -1,0 +1,249 @@
+--- a/original.py
++++ b/original.py
+@@ -1,156 +1,160 @@
+ # EVOLVE-BLOCK-START
+ """
+-Optimized S3-FIFO (Simple, Scalable, Static) with Conditional Demotion.
+-Implements a segmented cache with a small probationary queue (S) and a main protected queue (M).
+-Key Features:
+-- Conditional Demotion: M-victims are only demoted to S if S is not full, preserving S for new insertions.
+-- Ghost Registry: Tracks evicted items to rescue returning loop patterns directly to M.
+-- One-Hit Promotion: Simplifies promotion logic to capture working sets faster.
+-- Auto-Reset: Detects new trace starts to clear global state.
++Adaptive S3-FIFO with Conditional Demotion (AS3-CD)
++Combines the adaptive sizing of ARC/A-S3-FIFO with the conditional demotion strategy.
++- S/M Queues: Partitioned cache.
++- Adaptive Sizing: s_dist adjusts based on ghost hits to find optimal S/M split.
++- Conditional Demotion: M-victims are demoted to S (giving a second chance) only if S is under its target size. 
++  Otherwise, they are evicted to Ghost M.
++- Ghost S: Tracks items evicted from S. Hits -> Grow S.
++- Ghost M: Tracks items evicted from M (when S was full). Hits -> Grow M (Shrink S).
+ """
+ 
+ from collections import OrderedDict
+ 
+-# Global structures
+-# s_queue: Small FIFO queue (probationary)
+-# m_queue: Main FIFO queue (protected)
+-# ghost_registry: Keeps track of recently evicted keys to detect loops/recurrence
+-# accessed_bits: Simulates reference bits for CLOCK-like policies within queues
+-
+-s_queue = OrderedDict()
+-m_queue = OrderedDict()
+-ghost_registry = OrderedDict()
+-accessed_bits = set()
++# Global state
++s_queue = OrderedDict()    # Small/Probationary FIFO
++m_queue = OrderedDict()    # Main/Protected FIFO
++ghost_s = OrderedDict()    # Ghost registry for S
++ghost_m = OrderedDict()    # Ghost registry for M
++accessed_bits = set()      # Tracks access status
++s_dist = 0.1               # Target fraction for S queue (0.0 to 1.0)
+ 
+ def reset_globals_if_new_trace(cache_snapshot):
+     """
+-    Heuristic to reset global state if a new trace starts.
+-    We detect this if the cache size is very small (start of trace) 
+-    but our internal queues have leftover data.
++    Reset globals if a new trace is detected.
+     """
+-    global s_queue, m_queue, ghost_registry, accessed_bits
++    global s_queue, m_queue, ghost_s, ghost_m, accessed_bits, s_dist
+     if len(cache_snapshot.cache) <= 1 and (len(s_queue) > 1 or len(m_queue) > 1):
+         s_queue.clear()
+         m_queue.clear()
+-        ghost_registry.clear()
++        ghost_s.clear()
++        ghost_m.clear()
+         accessed_bits.clear()
++        s_dist = 0.1
+ 
+ def evict(cache_snapshot, obj):
+     '''
+-    Executes the S3-FIFO eviction policy with conditional demotion.
++    Adaptive S3-FIFO eviction with Conditional Demotion.
+     '''
++    global s_dist
++    
+     capacity = cache_snapshot.capacity
+-    # Target size for the small queue (10% of capacity, min 1)
+-    s_target = max(int(capacity * 0.1), 1)
++    # Target size for S based on adaptive distribution
++    s_target = max(1, int(capacity * s_dist))
+     
+-    # Safety check for state consistency: if cache is full but queues are empty
++    # Safety: if queues empty but cache full
+     if not s_queue and not m_queue:
+-        return next(iter(cache_snapshot.cache))
++         return next(iter(cache_snapshot.cache))
+ 
+     while True:
+-        # 1. Evict from Small Queue if it's too big OR Main is empty
+-        # If Main is empty, we must evict from Small (if it has items)
+-        if len(s_queue) > s_target or len(m_queue) == 0:
++        # Determine if we should evict from S or M
++        # Evict from S if it exceeds its target share, or if M is empty
++        evict_s = (len(s_queue) > s_target) or (len(m_queue) == 0)
++        
++        if evict_s:
+             if not s_queue:
+-                # Fallback if S is empty but M is not (logic implies M is 0 here, so both 0)
+-                # But we checked both 0 above. So this handles rare edge cases.
++                # Fallback (rare consistency fix)
+                 if m_queue:
+-                    candidate_key, _ = m_queue.popitem(last=False)
+-                    return candidate_key
++                    key, _ = m_queue.popitem(last=False)
++                    return key
+                 return next(iter(cache_snapshot.cache))
+-
+-            candidate_key, _ = s_queue.popitem(last=False) # FIFO head
+             
+-            if candidate_key in accessed_bits:
+-                # Hit in S -> Promote to M (Probation passed)
+-                accessed_bits.discard(candidate_key)
+-                m_queue[candidate_key] = None
++            key, _ = s_queue.popitem(last=False) # FIFO head
++            
++            if key in accessed_bits:
++                # Hit in S -> Promote to M (Pass probation)
++                accessed_bits.discard(key)
++                m_queue[key] = None
+             else:
+-                # Victim found in S
+-                # Record in Ghost to catch loops later
+-                ghost_registry[candidate_key] = None
+-                if len(ghost_registry) > capacity:
+-                    ghost_registry.popitem(last=False)
+-                return candidate_key
+-        
+-        # 2. Evict from Main Queue
++                # Evict from S -> Ghost S
++                ghost_s[key] = None
++                if len(ghost_s) > capacity:
++                    ghost_s.popitem(last=False)
++                return key
+         else:
+-            # S is within target size, and M is not empty.
+-            candidate_key, _ = m_queue.popitem(last=False) # FIFO head
++            # Evict from M
++            key, _ = m_queue.popitem(last=False) # FIFO head
+             
+-            if candidate_key in accessed_bits:
+-                # Hit in M -> Reinsert at tail (Second Chance)
+-                accessed_bits.discard(candidate_key)
+-                m_queue[candidate_key] = None
++            if key in accessed_bits:
++                # Second chance: reinsert to M tail
++                accessed_bits.discard(key)
++                m_queue[key] = None
+             else:
+-                # Victim found in M
+-                # Conditional Demotion: Demote to S only if S has room.
+-                # If S is full (or above target), we drop the M-victim to prevent clogging S.
++                # M victim found.
++                # Conditional Demotion:
++                # If S has capacity, give this item a chance in S (Probation)
+                 if len(s_queue) < s_target:
+-                    s_queue[candidate_key] = None # Insert at tail of S
++                    s_queue[key] = None
++                    # Loop continues; we moved item internaly, didn't evict from cache yet.
+                 else:
+-                    # Drop and add to Ghost
+-                    ghost_registry[candidate_key] = None
+-                    if len(ghost_registry) > capacity:
+-                        ghost_registry.popitem(last=False)
+-                    return candidate_key
++                    # S is full, evict from M -> Ghost M
++                    ghost_m[key] = None
++                    if len(ghost_m) > capacity:
++                        ghost_m.popitem(last=False)
++                    return key
+ 
+ def update_after_hit(cache_snapshot, obj):
+-    '''
+-    Mark object as accessed.
+-    '''
+     accessed_bits.add(obj.key)
+ 
+ def update_after_insert(cache_snapshot, obj):
+-    '''
+-    Handle insertion:
+-    - Reset globals if needed.
+-    - Check Ghost for rescue (M).
+-    - Else insert to Probation (S).
+-    '''
+     reset_globals_if_new_trace(cache_snapshot)
+     
++    global s_dist
+     key = obj.key
++    capacity = cache_snapshot.capacity
+     
+-    if key in ghost_registry:
+-        # Rescue from Ghost -> Insert directly to Main
++    # Calculate adaptation step size
++    delta = 1.0 / capacity if capacity > 0 else 0.01
++    
++    if key in ghost_s:
++        # Hit in Ghost S: S was too small.
++        # Grow S
++        s_dist = min(0.9, s_dist + delta)
++        # Rescue to M (Assume it belongs in working set)
+         m_queue[key] = None
+-        del ghost_registry[key]
++        del ghost_s[key]
++        
++    elif key in ghost_m:
++        # Hit in Ghost M: M was too small (S too big/clogged).
++        # Shrink S (Grow M)
++        s_dist = max(0.01, s_dist - delta)
++        # Rescue to M
++        m_queue[key] = None
++        del ghost_m[key]
++        
+     else:
+-        # New item -> Insert into Small (Probation)
++        # New item -> S
+         s_queue[key] = None
+     
+-    # Reset access bit: Item starts cold (freq=0) until hit again
++    # Reset access bit for new/promoted item
+     accessed_bits.discard(key)
+ 
+ def update_after_evict(cache_snapshot, obj, evicted_obj):
+-    '''
+-    Clean up internal state after eviction.
+-    '''
+-    key = evicted_obj.key
+-    accessed_bits.discard(key)
+-    if key in s_queue:
+-        del s_queue[key]
+-    if key in m_queue:
+-        del m_queue[key]
++    accessed_bits.discard(evicted_obj.key)
++    # Cleanup ensures we don't hold references to evicted items
++    if evicted_obj.key in s_queue:
++        del s_queue[evicted_obj.key]
++    if evicted_obj.key in m_queue:
++        del m_queue[evicted_obj.key]
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

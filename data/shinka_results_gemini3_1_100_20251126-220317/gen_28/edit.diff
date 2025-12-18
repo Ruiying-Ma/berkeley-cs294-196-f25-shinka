@@ -1,0 +1,271 @@
+--- a/original.py
++++ b/original.py
+@@ -1,134 +1,172 @@
+ # EVOLVE-BLOCK-START
+-"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
++"""
++AS3-FIFO: Adaptive S3-FIFO Algorithm
++Combines the tri-queue structure of S3-FIFO (Small, Main, Ghost) with 
++the adaptive sizing strategy of ARC.
++"""
++from collections import OrderedDict
+ 
+-# S3-FIFO-D Globals
+-m_small = dict()
+-m_main = dict()
+-m_ghost = dict()
+-m_hits = dict()
++# Global State
++algo_state = {
++    'q_small': OrderedDict(),
++    'q_main': OrderedDict(),
++    'q_ghost_s': OrderedDict(),
++    'q_ghost_m': OrderedDict(),
++    'access_map': {},
++    'p': 0.0
++}
+ 
+ def evict(cache_snapshot, obj):
+-    '''
+-    S3-FIFO-D Eviction Logic:
+-    - New items enter Small.
+-    - Eviction prioritizes dropping from Small (if > 10% cap) or Main.
+-    - Items in Small with hits promote to Main.
+-    - Items in Main with hits get second chance (reinserted).
+-    '''
+-    global m_small, m_main, m_hits
+-
+-    capacity = cache_snapshot.capacity
+-    # Small queue size target: 10% of capacity
+-    s_capacity = max(1, int(capacity * 0.1))
+-
+-    while True:
+-        # If Small is larger than target, or Main is empty, we evict from Small
+-        if len(m_small) > s_capacity or len(m_main) == 0:
+-            if not m_small:
+-                # Should not happen if cache is full and Main is empty
+-                # If Main has items, pick from Main
+-                if m_main:
+-                    return next(iter(m_main))
+-                return next(iter(cache_snapshot.cache))
+-
+-            candidate = next(iter(m_small))
+-            if m_hits.get(candidate, 0) > 0:
+-                # Hit in Small -> Promote to Main
+-                m_hits[candidate] = 0
+-                del m_small[candidate]
+-                m_main[candidate] = None
++    state = algo_state
++    q_s = state['q_small']
++    q_m = state['q_main']
++    acc = state['access_map']
++    
++    # Adaptive target for Small queue
++    target_s = state['p']
++    
++    # Safety counter to prevent infinite loops
++    max_loops = (len(q_s) + len(q_m)) * 2 + 10
++    
++    while max_loops > 0:
++        max_loops -= 1
++        
++        # Determine eviction candidate source
++        # Evict from Small if it exceeds target size or if Main is empty
++        evict_small = False
++        if len(q_s) > target_s:
++            evict_small = True
++        elif not q_m:
++            evict_small = True
++            
++        if evict_small:
++            if not q_s:
++                # Should unlikely happen if cache is full
++                return next(iter(q_m)) if q_m else next(iter(cache_snapshot.cache))
++            
++            cand = next(iter(q_s))
++            
++            if acc.get(cand, 0) > 0:
++                # Lazy Promotion: Small -> Main
++                acc[cand] = 0
++                q_s.popitem(last=False) # Remove from head
++                q_m[cand] = None         # Add to Main tail
++                continue
+             else:
+-                # No hit -> Evict from Small
+-                return candidate
++                # Victim found in Small
++                return cand
+         else:
+             # Evict from Main
+-            if not m_main:
+-                # Fallback to Small
+-                return next(iter(m_small))
+-
+-            candidate = next(iter(m_main))
+-            if m_hits.get(candidate, 0) > 0:
+-                # Hit in Main -> Reinsert at tail (Second Chance)
+-                m_hits[candidate] = 0
+-                del m_main[candidate]
+-                m_main[candidate] = None
++            if not q_m:
++                 return next(iter(q_s))
++                 
++            cand = next(iter(q_m))
++            
++            if acc.get(cand, 0) > 0:
++                # Second Chance: Main -> Main Tail
++                acc[cand] = 0
++                q_m.move_to_end(cand)
++                continue
+             else:
+-                # No hit -> Evict from Main
+-                return candidate
++                # Victim found in Main
++                return cand
++                
++    # Fallback
++    if q_s: return next(iter(q_s))
++    return next(iter(q_m))
+ 
+ def update_after_hit(cache_snapshot, obj):
+-    '''
+-    On Cache Hit:
+-    - Increment hit counter (saturated at 3).
+-    '''
+-    global m_hits
+-    m_hits[obj.key] = min(m_hits.get(obj.key, 0) + 1, 3)
++    acc = algo_state['access_map']
++    # Saturate hit count at 2 (0=new, 1=warm, 2=hot)
++    acc[obj.key] = min(acc.get(obj.key, 0) + 1, 2)
+ 
+ def update_after_insert(cache_snapshot, obj):
+-    '''
+-    On Cache Insert (Miss):
+-    - Reset state if new trace.
+-    - Insert into Small or Main (if in Ghost).
+-    '''
+-    global m_small, m_main, m_hits, m_ghost
++    state = algo_state
++    key = obj.key
++    capacity = cache_snapshot.capacity
++    
++    # Initialize/Reset for new trace
++    if cache_snapshot.access_count <= 1:
++        state['q_small'].clear()
++        state['q_main'].clear()
++        state['q_ghost_s'].clear()
++        state['q_ghost_m'].clear()
++        state['access_map'].clear()
++        state['p'] = max(1, int(capacity * 0.1))
+ 
+-    if cache_snapshot.access_count <= 1:
+-        m_small.clear()
+-        m_main.clear()
+-        m_hits.clear()
+-        m_ghost.clear()
+-
+-    # S3-FIFO-D: If in ghost, insert to Main (rescue). Else Small.
+-    if obj.key in m_ghost:
+-        del m_ghost[obj.key]
+-        m_main[obj.key] = None
++    # Adaptation Logic (ARC-inspired)
++    p = state['p']
++    q_gs = state['q_ghost_s']
++    q_gm = state['q_ghost_m']
++    
++    if key in q_gs:
++        # Ghost Hit in Small -> Small was too small -> Increase p
++        delta = 1
++        if len(q_gs) < len(q_gm):
++            delta = len(q_gm) / len(q_gs)
++        p = min(capacity, p + delta)
++        
++        del q_gs[key]
++        state['q_main'][key] = None # Rescue to Main
++        state['access_map'][key] = 0
++        
++    elif key in q_gm:
++        # Ghost Hit in Main -> Main was too small -> Decrease p
++        delta = 1
++        if len(q_gm) < len(q_gs):
++            delta = len(q_gs) / len(q_gm)
++        p = max(0, p - delta)
++        
++        del q_gm[key]
++        state['q_main'][key] = None # Rescue to Main
++        state['access_map'][key] = 0
++        
+     else:
+-        m_small[obj.key] = None
+-
+-    m_hits[obj.key] = 0
++        # New Insert -> Small (Nursery)
++        state['q_small'][key] = None
++        state['access_map'][key] = 0
++        
++    state['p'] = p
+ 
+ def update_after_evict(cache_snapshot, obj, evicted_obj):
+-    '''
+-    After Eviction:
+-    - Manage Ghost list for items evicted from Small.
+-    - Cleanup data structures.
+-    '''
+-    global m_small, m_main, m_hits, m_ghost
+-
++    state = algo_state
+     key = evicted_obj.key
+-
+-    if key in m_small:
+-        # Evicted from Small without promotion -> Add to Ghost
+-        del m_small[key]
+-        m_ghost[key] = None
+-    elif key in m_main:
+-        del m_main[key]
+-
+-    if key in m_hits:
+-        del m_hits[key]
+-
+-    # Limit Ghost size to Cache Capacity
+-    while len(m_ghost) > cache_snapshot.capacity:
+-        m_ghost.pop(next(iter(m_ghost)))
+-
++    capacity = cache_snapshot.capacity
++    
++    # Remove from cache queues and add to ghosts
++    if key in state['q_small']:
++        del state['q_small'][key]
++        state['q_ghost_s'][key] = None
++    elif key in state['q_main']:
++        del state['q_main'][key]
++        state['q_ghost_m'][key] = None
++        
++    if key in state['access_map']:
++        del state['access_map'][key]
++        
++    # Limit ghost size
++    while len(state['q_ghost_s']) > capacity:
++        state['q_ghost_s'].popitem(last=False)
++    while len(state['q_ghost_m']) > capacity:
++        state['q_ghost_m'].popitem(last=False)
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

@@ -1,0 +1,111 @@
+# INDIVIDUAL PROGRAM SUMMARIES
+
+The following are summaries of individual programs evaluated since the last meta update:
+
+**Program Name: Timestamp-based Least Recently Used (LRU) Strategy**
+- **Implementation**: The algorithm maintains a global dictionary mapping object keys to their last access logical timestamp, which is updated on every hit and insertion. Eviction identifies the victim by searching for the object in the cache with the minimum timestamp value (the least recently used item).
+- **Performance**: The solution achieved a combined score of 0.21, performing well on workloads with high temporal locality but suffering on scan-heavy traces.
+- **Feedback**: While the LRU logic correctly captures recency, the lack of frequency tracking or scan resistance leads to cache pollution and near-zero hit rates on specific adversarial workloads.
+**Program Identifier:** Generation 0 - Patch Name initial_program - Correct Program: True
+
+**Program Name: 2Q Segmented LRU with Ghost Registry**
+- **Implementation**: This algorithm employs a 2Q-style approach with a fixed 25% probation segment and a ghost registry, promoting items to the protected segment only upon re-insertion if they were previously evicted.
+- **Performance**: The algorithm achieved a combined score of 0.24, excelling on highly repetitive traces (up to 0.88 hit rate) but performing poorly on scan-heavy workloads.
+- **Feedback**: The strict requirement for items to pass through the ghost registry before promotion likely prevents "hot" items from being protected quickly enough, and the static segment sizing fails to adapt to varying working set sizes.
+**Program Identifier:** Generation 1 - Patch Name two_queue_eviction - Correct Program: True
+
+**Program Name: Adaptive Replacement Cache (ARC) with Global State Handling**
+- **Implementation**: Implements ARC using global sets for T1/T2 (live) and B1/B2 (ghost) entries, dynamically tuning the partition `p` and resetting state upon trace changes.
+- **Performance**: Achieved a combined score of 0.24, with strong performance on frequency-biased traces (up to 0.89) but lower hit rates on sparse or scan-heavy workloads.
+- **Feedback**: The global state management correctly handles trace continuity, and the adaptive logic balances recency and frequency effectively, though the Python set overhead may impact efficiency on larger traces.
+**Program Identifier:** Generation 2 - Patch Name arc_eviction - Correct Program: True
+
+**Program Name: Adaptive Replacement Cache (ARC) with Set-Based Lists**
+- **Implementation**: Implements the ARC algorithm using four sets (T1, T2, B1, B2) and a dynamic parameter `p` to balance recency and frequency based on ghost list hits, utilizing global timestamps to determine LRU order.
+- **Performance**: Achieves a combined score of 0.24, demonstrating high efficacy on frequency-biased workloads (up to 0.89 hit rate) but high variance across different traces.
+- **Feedback**: The adaptive logic successfully balances cache segments, but the set-based implementation introduces O(N) scanning overhead for eviction decisions compared to standard O(1) linked-list approaches.
+**Program Identifier:** Generation 3 - Patch Name implement_arc_algorithm - Correct Program: True
+
+**Program Name: Segmented LRU with Static 80% Protected Segment**
+- **Implementation**: Tracks `[segment, timestamp]` metadata to implement SLRU, promoting hits to a Protected segment (limited to 80% capacity) and handling overflow by demoting the Protected LRU to the Probationary segment before evicting the Probationary LRU.
+- **Performance**: The algorithm scored 0.23, showing high hit rates on stable traces (e.g., 88%) but failing on dynamic patterns (near 0%) due to the rigid segment sizing.
+- **Feedback**: The large static Protected segment favors established items but creates a bottleneck for new content; an adaptive mechanism to adjust segment sizes based on workload behavior would likely improve robustness.
+**Program Identifier:** Generation 4 - Patch Name slru_algorithm - Correct Program: True
+
+**Program Name: LeCaR (Learning Cache Replacement) with Adaptive Weighting**
+- **Implementation**: Maintains LRU and LFU candidates and uses a weight parameter, adjusted by hits in ghost history sets (recently evicted items), to probabilistically select the eviction policy via reinforcement learning.
+- **Performance**: Achieved a combined score of 0.21, demonstrating high efficacy on stable patterns (up to 0.87 hit rate) but failing significantly on dynamic workloads (near 0.00).
+- **Feedback**: The adaptive mechanism successfully arbitrates between recency and frequency for distinct patterns, but the probabilistic selection and fixed learning rate struggle to adapt quickly enough to rapid phase changes in complex traces.
+**Program Identifier:** Generation 5 - Patch Name lecar_eviction - Correct Program: True
+
+**Program Name: Segmented LRU with Static 80% Protected Segment**
+- **Implementation**: Implements SLRU using two ordered dictionaries to manage probation and protected segments, promoting hits to protected and demoting protected LRU items to probation when the protected segment exceeds 80% capacity.
+- **Performance**: Achieved a combined score of 0.23, with high hit rates on specific traces (e.g., 0.88) but poor performance (near 0.00) on many others.
+- **Feedback**: The static allocation helps retain high-frequency items but fails to adapt to changing workload patterns, resulting in significant performance variability compared to adaptive strategies.
+**Program Identifier:** Generation 6 - Patch Name slru_eviction - Correct Program: True
+
+**Program Name: Adaptive Replacement Cache (ARC)**
+- **Implementation**: Uses four `OrderedDict`s to manage recency (T1) and frequency (T2) segments alongside ghost lists (B1/B2), dynamically adjusting the partition target `p` based on hits in the eviction history.
+- **Performance**: Achieved a combined score of 0.24, with high hit rates on stable workloads (e.g., 0.89 on trace 28) but near-zero performance on several sparse or scanning traces.
+- **Feedback**: The adaptive mechanism successfully balances recency and frequency for many patterns, but the adaptation rate or ghost list sizing appears insufficient for workloads with rapid phase changes or very large working sets.
+**Program Identifier:** Generation 7 - Patch Name arc_cache_eviction - Correct Program: True
+
+**Program Name: LIRS Implementation with OrderedDict Stack and Queue**
+- **Implementation**: Implements the LIRS algorithm using `OrderedDict` to manage a recency stack and resident queue, dynamically classifying blocks as LIR or HIR to minimize eviction of stable data.
+- **Performance**: Combined score of 0.0, as the program failed validation tests.
+- **Feedback**: The failure indicates a logic error in handling the complex state transitions or synchronization between the algorithm's internal history structures and the actual cache content.
+**Program Identifier:** Generation 8 - Patch Name replace_arc_with_lirs - Correct Program: False
+
+**Program Name: Adaptive Replacement Cache (ARC) with Global State Reset**
+- **Implementation**: The program implements the ARC algorithm using four `OrderedDict`s to manage recent (T1), frequent (T2), and ghost (B1, B2) entries, dynamically adjusting the partition size `p` based on ghost list hits. It relies on global variables for state persistence and includes a specific check to reset this state when a new trace is detected.
+- **Performance**: The algorithm achieved a combined score of 0.24, demonstrating high effectiveness on structured workloads (e.g., 0.89 hit rate on trace 28) while underperforming on others.
+- **Feedback**: The adaptive nature of ARC successfully captures complex locality patterns without manual tuning, though the use of global state requires the implemented reset logic to ensure correctness across independent trace evaluations.
+**Program Identifier:** Generation 9 - Patch Name implement_arc_eviction - Correct Program: True
+
+# GLOBAL INSIGHTS SCRATCHPAD
+
+The following are global insights about optimization approaches and their effectiveness:
+
+Based on the analysis of the provided program summaries and the current best program (Generation 9), here are the insights:
+
+## Successful Algorithmic Patterns
+- **Adaptive Segmentation (ARC)**: The Adaptive Replacement Cache (ARC) algorithm consistently achieves the highest scores (0.24) across multiple implementations (Gen 2, 3, 7, 9). The core mechanism of dynamically adjusting the target size `p` for the recency segment (T1) based on hits in ghost lists allows the cache to automatically tune itself between recency-heavy and frequency-heavy workloads.
+- **Ghost List Utilization**: Programs that track evicted items (Ghost Lists/Registry) significantly outperform those that don't (like pure LRU). The current best program (Gen 9) utilizes two ghost lists (`m_b1` and `m_b2`) to detect whether the workload favors recently seen items or frequently accessed items, using this signal to drive the adaptive policy.
+- **Frequency-Recency Hybridization**: Approaches that combine recency and frequency (ARC, 2Q) outperform pure recency (LRU, Gen 0, score 0.21) and static frequency-biased policies (SLRU, Gen 4, score 0.23). ARC's ability to act as LRU when unique data is accessed and LFU when data repeats is the key driver of the 0.24 score.
+
+## Ineffective Approaches
+- **Static Segment Sizing**: Segmented LRU (SLRU) implementations with fixed segment sizes (e.g., Gen 4 and Gen 6 with 80% protected) achieved lower scores (0.23) compared to adaptive approaches. The rigid allocation creates bottlenecks; it wastes space on protected items when the working set is small and recent, or fails to protect enough items when the "hot" set grows.
+- **Reinforcement Learning (LeCaR)**: The LeCaR implementation (Gen 5, score 0.21) failed to outperform basic heuristics. The probabilistic weight updates and learning rate were likely too slow to adapt to the rapid phase changes present in the adversarial traces, leading to poor performance on dynamic workloads (near 0.00).
+- **Pure Recency (LRU)**: The baseline LRU strategy (Gen 0) scored the lowest among working "smart" algorithms (0.21). Its lack of frequency tracking makes it susceptible to cache pollution from scans, where one-time access items flush out useful data.
+- **Complex State Management (LIRS)**: Attempting to implement complex state transitions like LIRS (Gen 8) resulted in validation failures (Score 0.0). The intricacy of maintaining stack and queue consistency within the specific constraints of the evaluation harness proved error-prone compared to the simpler set/list logic of ARC.
+
+## Implementation Insights
+- **Global State Persistence**: The current best program (Gen 9) explicitly relies on global variables (`m_t1`, `m_t2`, `m_p`, etc.) to persist the ARC state between function calls. This pattern is crucial for correctness in this evaluation environment, ensuring that the cache history is not lost between `evict` and `update` operations, while also implementing reset logic for new traces.
+- **OrderedDict for Efficiency**: While Gen 3 implemented ARC using sets and timestamps (incurring O(N) scanning overhead), the current best program (Gen 9) uses Python's `OrderedDict`. This allows for O(1) eviction and promotion operations (`popitem`, `move_to_end`), which is semantically cleaner and likely more performant for LRU ordering.
+- **Lazy Ghost List Cleanup**: The current best program implements a lazy cleanup for ghost lists (e.g., allowing `m_b2` to grow to `capacity * 2`). This larger history window increases the probability of detecting patterns in larger working sets compared to strictly enforcing `capacity` size on ghost lists immediately.
+
+## Performance Analysis
+- **The 0.24 Ceiling**: Multiple distinct implementations of ARC (Gen 2, 3, 7, 9) and 2Q (Gen 1) have all converged to a combined score of 0.24. This suggests that while these algorithms optimize effectively for structured traces (hitting ~0.89 on Trace 28), they all fundamentally struggle with the same subset of adversarial traces (e.g., Traces 11-19, scoring near 0.00), likely due to scan patterns or working sets significantly exceeding cache capacity.
+- **Adaptability vs. Stability**: The best performing programs (ARC) show high variance. Gen 9 achieves 0.89 on Trace 28 but 0.00 on Trace 14. In contrast, static policies like SLRU (Gen 6) are slightly more consistent but cap out lower (0.23). The adaptive nature maximizes hits on "learnable" traces but offers little protection on chaotic ones.
+- **Impact of Implementation Detail**: Despite implementing the same ARC logic, Gen 2, 3, 7, and 9 achieved the same score. This indicates that minor implementation variations (Sets vs. OrderedDicts) are less impactful on the *hit rate* than the underlying algorithmic logic, provided the logic is correct. However, Gen 8's failure highlights that implementation complexity is a significant risk.
+
+# META RECOMMENDATIONS
+
+The following are actionable recommendations for the next program generations:
+
+Based on the analysis of the Global Insights and the current best Adaptive Replacement Cache (ARC) program, here are 5 actionable recommendations for future program mutations:
+
+1.  **Implement Scan-Resistant Admission (ARC + Filter)**
+    Modify the ARC implementation to include a "probationary" filter (such as a small FIFO queue or a frequency counter) before allowing items into the main `m_t1` list. Currently, the zero scores on Traces 11-19 suggest scan patterns are flushing the cache; a filter would ensure that only items accessed more than once (or passing a probabilistic guard) enter the main memory, preventing one-time scans from polluting the adaptive segments.
+
+2.  **Simplified LIRS Using OrderedDicts**
+    Re-attempt the LIRS (Low Inter-reference Recency Set) logic but simplify the implementation to avoid the validation errors seen in Generation 8. Instead of managing a complex stack with pointer pruning, use two explicit `OrderedDicts` to represent the LIR (hot) and HIR (cold/probationary) sets, using the ghost list logic to track "non-resident LIR" blocks. This approach theoretically offers better scan resistance than ARC while leveraging the successful "Ghost List" pattern.
+
+3.  **Hybridize ARC with FIFO Eviction for T1**
+    Change the eviction policy of the T1 (recent) segment from LRU to FIFO, effectively creating an adaptive version of the 2Q algorithm. While ARC treats T1 as a recency list, using FIFO for the first stage makes it a better filter for cyclic scans and one-time accesses, allowing the adaptive `m_p` parameter to dynamically size the buffer between a FIFO queue (scan resistant) and an LRU list (frequency aware).
+
+4.  **Dynamic Adaptation Step Sizing**
+    Refine the `m_p` update logic (`delta`) to be dynamic rather than fixed at 1.0 or based solely on list ratios. Implement a "momentum" or variable step size where the magnitude of the change to `m_p` increases if consecutive hits occur in the same ghost list (B1 or B2). This allows the cache to reconfigure itself more rapidly during drastic workload phase changes, potentially recovering faster on the highly dynamic adversarial traces.
+
+5.  **Randomized Victim Selection in Segments**
+    Introduce a slight randomization to the eviction candidate selection within the T1 and T2 segments to counter adversarial patterns designed to defeat deterministic LRU. Instead of strictly evicting the absolute LRU item (`m_t1[0]`), select the victim from the bottom 2 or 3 items in the list at random. This can break synchronization in worst-case loop patterns without significantly impacting the hit rate on standard workloads.

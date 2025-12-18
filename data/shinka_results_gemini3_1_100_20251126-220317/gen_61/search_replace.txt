@@ -1,0 +1,91 @@
+<NAME>
+tune_aging_and_doorkeeper
+</NAME>
+
+<DESCRIPTION>
+Increase the aging interval from 5x to 10x capacity to reduce frequency decay rate, improving retention of working sets. Increase Doorkeeper reset threshold from 2x to 5x capacity to improve scan resistance by retaining filter history longer.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def _update_freq(key, capacity):
+    state = algo_state
+
+    # Aging Mechanism
+    state['aging_counter'] += 1
+    # Age frequencies every 5x capacity to adapt to phase changes
+    if state['aging_counter'] >= capacity * 5:
+        state['aging_counter'] = 0
+        # Halve frequencies
+        rem = []
+        for k, v in state['freq'].items():
+            nv = v // 2
+            if nv == 0: rem.append(k)
+            else: state['freq'][k] = nv
+        for k in rem: del state['freq'][k]
+
+    # Doorkeeper Management
+    # Reset Doorkeeper when it grows too large to maintain filter effectiveness
+    if len(state['doorkeeper']) > capacity * 2:
+        state['doorkeeper'].clear()
+
+    # Frequency Update
+=======
+def _update_freq(key, capacity):
+    state = algo_state
+
+    # Aging Mechanism
+    state['aging_counter'] += 1
+    # Age frequencies every 10x capacity to adapt to phase changes (slower decay)
+    if state['aging_counter'] >= capacity * 10:
+        state['aging_counter'] = 0
+        # Halve frequencies
+        rem = []
+        for k, v in state['freq'].items():
+            nv = v // 2
+            if nv == 0: rem.append(k)
+            else: state['freq'][k] = nv
+        for k in rem: del state['freq'][k]
+
+    # Doorkeeper Management
+    # Reset Doorkeeper when it grows too large to maintain filter effectiveness
+    if len(state['doorkeeper']) > capacity * 5:
+        state['doorkeeper'].clear()
+
+    # Frequency Update
+>>>>>>> REPLACE
+</DIFF>
+
+<NAME>
+update_docstring
+</NAME>
+
+<DESCRIPTION>
+Update the module docstring to reflect the changes to the aging parameter.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+"""
+W-TinyLFU with Refined Doorkeeper, Adaptive Aging, and Biased Eviction
+Maintains a small Window and an SLRU Main Cache.
+Uses a Doorkeeper to filter one-hit wonders and frequency counters for admission to Main.
+Improvements:
+- Size-based Doorkeeper reset to handle scans better.
+- Adaptive Window eviction (checks Main victim value).
+- Biased duel favoring Main cache to reduce churn.
+- 5x capacity aging for faster adaptability.
+"""
+=======
+"""
+W-TinyLFU with Refined Doorkeeper, Adaptive Aging, and Biased Eviction
+Maintains a small Window and an SLRU Main Cache.
+Uses a Doorkeeper to filter one-hit wonders and frequency counters for admission to Main.
+Improvements:
+- Size-based Doorkeeper reset to handle scans better.
+- Adaptive Window eviction (checks Main victim value).
+- Biased duel favoring Main cache to reduce churn.
+- 10x capacity aging for better working set retention.
+"""
+>>>>>>> REPLACE
+</DIFF>

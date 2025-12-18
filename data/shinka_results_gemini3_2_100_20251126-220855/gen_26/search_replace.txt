@@ -1,0 +1,120 @@
+<NAME>
+randomized_arc_eviction
+</NAME>
+
+<DESCRIPTION>
+Introduce randomization in the eviction policy for the T1 (recency) list. Instead of strictly evicting the LRU item, we select a victim randomly from the 5 least recently used items. This helps break synchronization in looping patterns (like Trace 14) where the loop size is slightly larger than the cache, preventing thrashing while maintaining ARC's adaptivity.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+from collections import OrderedDict
+
+# ARC Global State
+=======
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+from collections import OrderedDict
+import random
+
+# ARC Global State
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    ARC Eviction Policy:
+    Selects a victim from T1 or T2 based on the target size 'p'.
+    Adjusts 'p' if the incoming object was observed in ghost lists B1/B2.
+    '''
+    _check_reset(cache_snapshot)
+    global m_p
+
+    key = obj.key
+    capacity = cache_snapshot.capacity
+
+    # 1. Adapt p (target size of T1) based on hits in ghost lists
+    if key in m_b1:
+        delta = 1
+        if len(m_b1) > 0 and len(m_b2) > 0:
+            delta = max(1, len(m_b2) / len(m_b1))
+        m_p = min(capacity, m_p + delta)
+    elif key in m_b2:
+        delta = 1
+        if len(m_b1) > 0 and len(m_b2) > 0:
+            delta = max(1, len(m_b1) / len(m_b2))
+        m_p = max(0, m_p - delta)
+
+    # 2. Select victim
+    evict_t1 = False
+    if len(m_t1) > 0:
+        if len(m_t1) > m_p:
+            evict_t1 = True
+        elif key in m_b2 and len(m_t1) == int(m_p):
+            evict_t1 = True
+
+    # If T2 is empty, we must evict from T1 (if possible)
+    if len(m_t2) == 0:
+        evict_t1 = True
+
+    if evict_t1 and m_t1:
+        # Evict LRU from T1
+        return next(iter(m_t1))
+    else:
+        # Evict LRU from T2
+        # Fallback to T1 if T2 is empty (shouldn't happen here if logic holds)
+        return next(iter(m_t2)) if m_t2 else next(iter(m_t1))
+=======
+def evict(cache_snapshot, obj):
+    '''
+    ARC Eviction Policy:
+    Selects a victim from T1 or T2 based on the target size 'p'.
+    Adjusts 'p' if the incoming object was observed in ghost lists B1/B2.
+    '''
+    _check_reset(cache_snapshot)
+    global m_p
+
+    key = obj.key
+    capacity = cache_snapshot.capacity
+
+    # 1. Adapt p (target size of T1) based on hits in ghost lists
+    if key in m_b1:
+        delta = 1
+        if len(m_b1) > 0 and len(m_b2) > 0:
+            delta = max(1, len(m_b2) / len(m_b1))
+        m_p = min(capacity, m_p + delta)
+    elif key in m_b2:
+        delta = 1
+        if len(m_b1) > 0 and len(m_b2) > 0:
+            delta = max(1, len(m_b1) / len(m_b2))
+        m_p = max(0, m_p - delta)
+
+    # 2. Select victim
+    evict_t1 = False
+    if len(m_t1) > 0:
+        if len(m_t1) > m_p:
+            evict_t1 = True
+        elif key in m_b2 and len(m_t1) == int(m_p):
+            evict_t1 = True
+
+    # If T2 is empty, we must evict from T1 (if possible)
+    if len(m_t2) == 0:
+        evict_t1 = True
+
+    if evict_t1 and m_t1:
+        # Randomized eviction from T1 to break loops/scans
+        # Sample first few items (LRU end) and pick one
+        k = 5
+        candidates = []
+        it = iter(m_t1)
+        try:
+            for _ in range(k):
+                candidates.append(next(it))
+        except StopIteration:
+            pass
+        return random.choice(candidates)
+    else:
+        # Evict LRU from T2
+        # Fallback to T1 if T2 is empty (shouldn't happen here if logic holds)
+        return next(iter(m_t2)) if m_t2 else next(iter(m_t1))
+>>>>>>> REPLACE
+</DIFF>

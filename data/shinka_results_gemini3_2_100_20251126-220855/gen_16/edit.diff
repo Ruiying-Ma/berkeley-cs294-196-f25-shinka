@@ -1,0 +1,216 @@
+--- a/original.py
++++ b/original.py
+@@ -1,138 +1,137 @@
+ # EVOLVE-BLOCK-START
+ """Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+ from collections import OrderedDict
+ 
+-# S3-FIFO Global State
+-s3_small = OrderedDict() # S: Small FIFO queue for new insertions
+-s3_main = OrderedDict()  # M: Main FIFO queue for frequent items
+-s3_ghost = OrderedDict() # G: Ghost FIFO queue for history
+-s3_freq = {}             # Frequency counter (small bits)
++# ARC Global State
++arc_t1 = OrderedDict() # T1: Recent items
++arc_t2 = OrderedDict() # T2: Frequent items
++arc_b1 = OrderedDict() # B1: Ghost Recent
++arc_b2 = OrderedDict() # B2: Ghost Frequent
++arc_p = 0.0            # Adaptation parameter
++arc_c = 0              # Cache capacity
+ m_last_access_count = -1
+ 
+ def _check_reset(cache_snapshot):
+     """Resets global state if a new trace is detected."""
+-    global s3_small, s3_main, s3_ghost, s3_freq, m_last_access_count
++    global arc_t1, arc_t2, arc_b1, arc_b2, arc_p, arc_c, m_last_access_count
+     if cache_snapshot.access_count < m_last_access_count:
+-        s3_small.clear()
+-        s3_main.clear()
+-        s3_ghost.clear()
+-        s3_freq.clear()
++        arc_t1.clear()
++        arc_t2.clear()
++        arc_b1.clear()
++        arc_b2.clear()
++        arc_p = 0.0
++        arc_c = cache_snapshot.capacity
+     m_last_access_count = cache_snapshot.access_count
++    if arc_c == 0: arc_c = cache_snapshot.capacity
+ 
+ def evict(cache_snapshot, obj):
+     '''
+-    S3-FIFO Eviction Policy.
+-    - S (Small) buffers new items. M (Main) holds frequent items.
+-    - Scans S then M. Items with hits are promoted/reinserted.
+-    - Victim is chosen from tail of S or M that has no hits.
++    ARC Eviction Policy.
++    Uses T1/T2 lists and B1/B2 ghost lists to adaptively manage cache content.
+     '''
+     _check_reset(cache_snapshot)
+-    capacity = cache_snapshot.capacity
+-    target_s_size = max(1, int(capacity * 0.1))
++    global arc_p
+ 
+-    # Loop until a victim is found.
+-    # Logic: "Lazy promotion" happens during eviction scan.
+-    while True:
+-        # 1. Check Small Queue
+-        # Evict from S if it's larger than target size, or if M is empty (must evict from S)
+-        if len(s3_small) > target_s_size or len(s3_main) == 0:
+-            if s3_small:
+-                candidate_key = next(iter(s3_small))
+-                freq = s3_freq.get(candidate_key, 0)
++    key = obj.key
++    # Adaptation logic (ARC)
++    if key in arc_b1:
++        delta = 1
++        if len(arc_b1) >= len(arc_b2):
++            delta = 1
++        else:
++            delta = len(arc_b2) / len(arc_b1)
++        arc_p = min(float(arc_c), arc_p + delta)
++    elif key in arc_b2:
++        delta = 1
++        if len(arc_b2) >= len(arc_b1):
++            delta = 1
++        else:
++            delta = len(arc_b1) / len(arc_b2)
++        arc_p = max(0.0, arc_p - delta)
+ 
+-                if freq > 0:
+-                    # Hit in S: Move to M (Tail)
+-                    s3_small.popitem(last=False)
+-                    s3_main[candidate_key] = 1
+-                    s3_freq[candidate_key] = 0 # Reset frequency
+-                else:
+-                    # No Hit in S: Evict
+-                    return candidate_key
+-            else:
+-                # Should not be reached if len(s3_main) == 0 checks passed
+-                if not s3_main: return None
++    # Determine victim based on ARC logic
++    replace_t1 = False
++    if len(arc_t1) > 0:
++        if len(arc_t1) > arc_p:
++            replace_t1 = True
++        elif (key in arc_b1) and (len(arc_t1) == int(arc_p)):
++             replace_t1 = True
+ 
+-        # 2. Check Main Queue
+-        # If we didn't evict from S (because S is small), check M
+-        if s3_main:
+-            candidate_key = next(iter(s3_main))
+-            freq = s3_freq.get(candidate_key, 0)
+-
+-            if freq > 0:
+-                # Hit in M: Reinsert to M (Tail)
+-                s3_main.popitem(last=False)
+-                s3_main[candidate_key] = 1
+-                s3_freq[candidate_key] = 0 # Reset frequency
+-            else:
+-                # No Hit in M: Evict
+-                return candidate_key
++    if replace_t1 and arc_t1:
++        return next(iter(arc_t1)) # LRU of T1
++    else:
++        if arc_t2:
++            return next(iter(arc_t2)) # LRU of T2
++        return next(iter(arc_t1)) # Fallback
+ 
+ def update_after_hit(cache_snapshot, obj):
+     '''
+-    On Hit: Increment frequency counter (capped).
++    On Hit: Move to MRU of T2.
+     '''
+     _check_reset(cache_snapshot)
+     key = obj.key
+-    s3_freq[key] = min(3, s3_freq.get(key, 0) + 1)
++    if key in arc_t1:
++        del arc_t1[key]
++        arc_t2[key] = 1 # Insert MRU T2
++    elif key in arc_t2:
++        arc_t2.move_to_end(key) # Update MRU T2
+ 
+ def update_after_insert(cache_snapshot, obj):
+     '''
+-    On Insert:
+-    - If in Ghost (G), insert to Main (M).
+-    - Else, insert to Small (S).
++    On Insert: Move ghosts to T2, or new items to T1.
+     '''
+     _check_reset(cache_snapshot)
+     key = obj.key
+ 
+-    if key in s3_ghost:
+-        # Recall from Ghost
+-        del s3_ghost[key]
+-        s3_main[key] = 1
+-        s3_freq[key] = 0
++    if key in arc_b1:
++        del arc_b1[key]
++        arc_t2[key] = 1 # From Ghost T1 -> T2
++    elif key in arc_b2:
++        del arc_b2[key]
++        arc_t2[key] = 1 # From Ghost T2 -> T2
+     else:
+-        # New Insert
+-        s3_small[key] = 1
+-        s3_freq[key] = 0
++        arc_t1[key] = 1 # New item -> T1
+ 
+ def update_after_evict(cache_snapshot, obj, evicted_obj):
+     '''
+-    On Evict: Remove from queues and manage Ghost.
++    On Evict: Move to Ghost lists and manage Ghost capacity.
+     '''
+     key = evicted_obj.key
+ 
+-    if key in s3_small:
+-        del s3_small[key]
+-        # Evicted from S -> Add to G
+-        s3_ghost[key] = 1
+-    elif key in s3_main:
+-        del s3_main[key]
+-        # Evicted from M -> Discard (Standard S3-FIFO)
++    if key in arc_t1:
++        del arc_t1[key]
++        arc_b1[key] = 1
++    elif key in arc_t2:
++        del arc_t2[key]
++        arc_b2[key] = 1
+ 
+-    if key in s3_freq:
+-        del s3_freq[key]
++    # Manage Ghost Capacity
++    # Limit B1 and B2 size to ensure bounded memory usage
++    target_ghost = arc_c
+ 
+-    # Limit Ghost size
+-    if len(s3_ghost) > cache_snapshot.capacity:
+-        s3_ghost.popitem(last=False)
++    while len(arc_b1) > target_ghost:
++        arc_b1.popitem(last=False)
++    while len(arc_b2) > target_ghost * 2:
++        arc_b2.popitem(last=False)
+ 
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

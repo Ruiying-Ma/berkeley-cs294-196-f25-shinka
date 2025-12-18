@@ -1,0 +1,278 @@
+<NAME>
+wtinylfu_lite
+</NAME>
+
+<DESCRIPTION>
+Implement a W-TinyLFU inspired algorithm "W-TinyLFU Lite".
+It features:
+1. Two-level cache structure: Window (1% capacity) and Main (SLRU with Probation/Protected segments).
+2. Doorkeeper Mechanism: A set that tracks recently seen keys to filter one-hit wonders (scans). Frequency is only incremented for items passing the doorkeeper.
+3. Frequency Aging: Periodic halving of frequency counters and clearing of the doorkeeper every 5*Capacity accesses to adapt to workload changes.
+4. Admission Control: A duel between the Window victim and the Probation victim based on frequency. Only items with higher frequency than the eviction candidate in Main are admitted to Main.
+This directly addresses the recommendations to improve scan resistance and handle varying working sets.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+# ARC Globals
+m_t1 = dict() # Recency (L1)
+m_t2 = dict() # Frequency (L2)
+m_b1 = dict() # Ghost Recency
+m_b2 = dict() # Ghost Frequency
+p = 0         # Adaptive parameter
+
+def evict(cache_snapshot, obj):
+    '''
+    ARC Eviction Logic with Randomization:
+    - Adapt p based on hits in ghost lists (B1, B2).
+    - Decide whether to evict from T1 or T2 based on p and T1 size.
+    - Use Random Eviction to robustly handle loops and large working sets.
+    '''
+    global p
+    import random
+
+    capacity = cache_snapshot.capacity
+
+    # Adaptation: If the incoming object (miss) is in a ghost list
+    if obj.key in m_b1:
+        delta = 1
+        if len(m_b1) < len(m_b2):
+             delta = len(m_b2) / len(m_b1)
+        p = min(capacity, p + delta)
+    elif obj.key in m_b2:
+        delta = 1
+        if len(m_b2) < len(m_b1):
+             delta = len(m_b1) / len(m_b2)
+        p = max(0, p - delta)
+
+    # Decision: Select victim
+    evict_t1 = False
+    if len(m_t1) > 0:
+        if len(m_t1) > p:
+            evict_t1 = True
+        elif obj.key in m_b2 and len(m_t1) == int(p):
+            evict_t1 = True
+        elif len(m_t2) == 0:
+            evict_t1 = True
+
+    if evict_t1:
+        return random.choice(list(m_t1.keys()))
+    else:
+        return random.choice(list(m_t2.keys()))
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    On Cache Hit:
+    - If obj in T1, move to T2 (MRU).
+    - If obj in T2, move to MRU of T2.
+    '''
+    global m_t1, m_t2
+
+    if obj.key in m_t1:
+        del m_t1[obj.key]
+        m_t2[obj.key] = None
+    elif obj.key in m_t2:
+        del m_t2[obj.key]
+        m_t2[obj.key] = None
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On Cache Insert (Miss):
+    - Place obj in T1 or T2.
+    '''
+    global m_t1, m_t2, m_b1, m_b2, p
+
+    # Reset state at start of new trace (access_count starts at 1 usually for first miss)
+    if cache_snapshot.access_count <= 1:
+        m_t1.clear()
+        m_t2.clear()
+        m_b1.clear()
+        m_b2.clear()
+        p = 0
+
+    # Check if it was a ghost
+    is_ghost = False
+    if obj.key in m_b1:
+        del m_b1[obj.key]
+        is_ghost = True
+    if obj.key in m_b2:
+        del m_b2[obj.key]
+        is_ghost = True
+
+    if is_ghost:
+        # History hit -> promote to frequency list
+        m_t2[obj.key] = None
+    else:
+        # New item -> probation list
+        m_t1[obj.key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    After Eviction:
+    - Update ghost lists.
+    '''
+    global m_t1, m_t2, m_b1, m_b2
+
+    if evicted_obj.key in m_t1:
+        del m_t1[evicted_obj.key]
+        m_b1[evicted_obj.key] = None
+    elif evicted_obj.key in m_t2:
+        del m_t2[evicted_obj.key]
+        m_b2[evicted_obj.key] = None
+
+    # Constrain ghost list sizes to capacity
+    capacity = cache_snapshot.capacity
+    while len(m_b1) > capacity:
+        m_b1.pop(next(iter(m_b1)))
+    while len(m_b2) > capacity:
+        m_b2.pop(next(iter(m_b2)))
+=======
+# W-TinyLFU Lite Globals
+from collections import OrderedDict
+
+q_window = OrderedDict()
+q_probation = OrderedDict()
+q_protected = OrderedDict()
+freq = dict()
+door = set()
+
+# Config
+c_window_pct = 0.01
+c_protected_pct = 0.80
+
+def evict(cache_snapshot, obj):
+    '''
+    W-TinyLFU Lite Eviction Logic:
+    - Window (1%) vs Main (99%) structure.
+    - If Window full, duel Window LRU vs Main Probation LRU using frequency.
+    - Winner stays (promoted to/kept in Main), Loser is evicted.
+    '''
+    global q_window, q_probation, q_protected, freq, door
+
+    capacity = cache_snapshot.capacity
+    w_cap = max(1, int(capacity * c_window_pct))
+
+    # Candidates
+    cand_w = next(iter(q_window)) if q_window else None
+    cand_p = next(iter(q_probation)) if q_probation else None
+
+    evict_window = True
+
+    # If Window is overflowing, we check if we can displace someone in Main
+    if q_window and len(q_window) > w_cap:
+        if cand_p:
+            # Duel: Compare Frequencies
+            fw = freq.get(cand_w, 0)
+            fp = freq.get(cand_p, 0)
+
+            if fw > fp:
+                # Window wins -> Promote to Probation, Evict Probation victim
+                evict_window = False
+
+                # Internal Move: Window -> Probation
+                q_window.move_to_end(cand_w) # Ensure right key is picked
+                del q_window[cand_w]
+                q_probation[cand_w] = None # Insert at tail
+            else:
+                # Window loses -> Evict Window victim
+                evict_window = True
+        else:
+            # No probation victim -> Check protected?
+            # Usually SLRU keeps protected safe. We evict Window.
+            evict_window = True
+    else:
+        # Window not full. Evict from Main to maintain separation if needed.
+        # If Main has items, evict from Main.
+        if cand_p or q_protected:
+            evict_window = False
+        else:
+            evict_window = True
+
+    # Return the victim key
+    if evict_window:
+        return cand_w if cand_w else (cand_p if cand_p else next(iter(cache_snapshot.cache)))
+    else:
+        if cand_p: return cand_p
+        if q_protected: return next(iter(q_protected))
+        return cand_w
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    On Hit:
+    - Update Doorkeeper/Frequency.
+    - SLRU Promotion (Probation -> Protected).
+    '''
+    global freq, door, q_window, q_probation, q_protected
+    key = obj.key
+
+    # Doorkeeper
+    if key not in door:
+        door.add(key)
+    else:
+        freq[key] = min(freq.get(key, 0) + 1, 60)
+
+    # Cache segments
+    if key in q_window:
+        q_window.move_to_end(key)
+    elif key in q_probation:
+        # Promote
+        del q_probation[key]
+        q_protected[key] = None
+
+        # Enforce Protected Limit
+        w_cap = max(1, int(cache_snapshot.capacity * c_window_pct))
+        main_cap = max(1, cache_snapshot.capacity - w_cap)
+        prot_cap = int(main_cap * c_protected_pct)
+
+        while len(q_protected) > prot_cap:
+            demoted, _ = q_protected.popitem(last=False)
+            q_probation[demoted] = None # Demote to Probation Tail
+    elif key in q_protected:
+        q_protected.move_to_end(key)
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On Insert:
+    - Init/Reset/Aging.
+    - Insert into Window.
+    '''
+    global freq, door, q_window, q_probation, q_protected
+
+    # Init
+    if cache_snapshot.access_count <= 1:
+        q_window.clear()
+        q_probation.clear()
+        q_protected.clear()
+        freq.clear()
+        door.clear()
+
+    # Aging: Every 5*Capacity accesses
+    if cache_snapshot.access_count > 0 and cache_snapshot.access_count % (5 * cache_snapshot.capacity) == 0:
+        for k in list(freq.keys()):
+            freq[k] //= 2
+            if freq[k] == 0:
+                del freq[k]
+        door.clear()
+
+    key = obj.key
+    q_window[key] = None
+
+    if key not in door:
+        door.add(key)
+    else:
+        freq[key] = min(freq.get(key, 0) + 1, 60)
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    After Evict:
+    - Cleanup from queues.
+    '''
+    global q_window, q_probation, q_protected
+    key = evicted_obj.key
+
+    if key in q_window: del q_window[key]
+    if key in q_probation: del q_probation[key]
+    if key in q_protected: del q_protected[key]
+>>>>>>> REPLACE
+
+</DIFF>

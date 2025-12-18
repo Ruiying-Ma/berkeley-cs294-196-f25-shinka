@@ -1,0 +1,170 @@
+# EVOLVE-BLOCK-START
+"""Advanced S3-FIFO with Persistent Frequency History and Randomized Probation"""
+
+from collections import OrderedDict
+import random
+import itertools
+
+# Global State
+m_small = OrderedDict()  # Probation queue
+m_main = OrderedDict()   # Protected queue
+m_freq = {}              # Frequency map (Ghost history)
+m_ops = 0                # Operation counter for aging
+m_last_access_count = 0
+m_params = {
+    'small_ratio': 0.1,  # Target size for Small
+    'freq_cap': 3        # Max frequency
+}
+
+def check_reset(cache_snapshot):
+    global m_small, m_main, m_freq, m_ops, m_last_access_count
+    if cache_snapshot.access_count < m_last_access_count:
+        m_small.clear()
+        m_main.clear()
+        m_freq.clear()
+        m_ops = 0
+    m_last_access_count = cache_snapshot.access_count
+
+def _age_frequencies():
+    """Periodically degrade frequencies to adapt to new patterns."""
+    global m_freq
+    # Snapshot keys to allow modification during iteration if needed
+    for k in list(m_freq):
+        m_freq[k] //= 2
+        if m_freq[k] == 0:
+            del m_freq[k]
+
+def evict(cache_snapshot, obj):
+    check_reset(cache_snapshot)
+    global m_small, m_main, m_freq, m_params
+
+    capacity = cache_snapshot.capacity
+    target_small = max(1, int(capacity * m_params['small_ratio']))
+    
+    # 1. Clean up frequency map (Ghost) if too large
+    # Keeping history 2x-4x capacity is usually good
+    if len(m_freq) > capacity * 4:
+        # Remove oldest inserted keys (Python 3.7+ dicts preserve insertion order)
+        # We assume m_freq is roughly ordered by insertion/update
+        over = len(m_freq) - (capacity * 4)
+        for _ in range(over):
+            m_freq.pop(next(iter(m_freq)))
+
+    while True:
+        # Decide which queue to evict from
+        evict_from_small = False
+        if len(m_small) > target_small:
+            evict_from_small = True
+        elif not m_main:
+            evict_from_small = True
+
+        if evict_from_small:
+            if not m_small:
+                # Should not happen unless Main is also empty
+                if m_main:
+                    evict_from_small = False
+                else:
+                    return None 
+
+            if evict_from_small:
+                # Randomized Window Eviction for Small
+                # Check first K items to find a victim with freq=0
+                # This breaks strict FIFO loops
+                window_size = 5
+                window = list(itertools.islice(m_small, window_size))
+                
+                victim = None
+                for candidate in window:
+                    if m_freq.get(candidate, 0) == 0:
+                        victim = candidate
+                        break
+                
+                if victim:
+                    return victim
+                
+                # If all in window have freq > 0, process the Head (FIFO)
+                # It has freq > 0, so it gets promoted.
+                candidate = next(iter(m_small))
+                # Promote to Main
+                m_small.pop(candidate)
+                m_main[candidate] = None # Insert MRU
+                
+                # Reset freq? S3-FIFO says reset. SLRU says keep.
+                # We reset to 0 to require it to prove itself in Main,
+                # BUT since we use freq for Second Chance in Main, 
+                # a promoted item with 0 freq is weak.
+                # Compromise: Set to 0. If it's hit in Main, it becomes 1.
+                # If it reaches Main tail with 0, it's evicted.
+                # This acts as a filter.
+                m_freq[candidate] = 0
+                continue
+
+        # Evict from Main
+        if not m_main:
+            continue
+            
+        # Main Eviction (LRU + Second Chance)
+        candidate = next(iter(m_main)) # Tail (LRU)
+        freq = m_freq.get(candidate, 0)
+        
+        if freq > 0:
+            # Second Chance
+            m_main.move_to_end(candidate) # MRU
+            m_freq[candidate] = freq - 1
+        else:
+            return candidate
+
+def update_after_hit(cache_snapshot, obj):
+    check_reset(cache_snapshot)
+    global m_main, m_freq, m_ops, m_params
+    
+    key = obj.key
+    m_ops += 1
+    
+    # Aging
+    if m_ops % cache_snapshot.capacity == 0:
+        _age_frequencies()
+
+    # Increment Frequency
+    m_freq[key] = min(m_params['freq_cap'], m_freq.get(key, 0) + 1)
+    
+    # Maintain LRU in Main
+    if key in m_main:
+        m_main.move_to_end(key)
+
+def update_after_insert(cache_snapshot, obj):
+    check_reset(cache_snapshot)
+    global m_small, m_main, m_freq
+    
+    key = obj.key
+    
+    # Check Ghost/History
+    # If key exists in m_freq, it's a "Ghost Hit" (re-access)
+    if key in m_freq:
+        # Restore/Boost frequency
+        # We treat re-insertion as a hit on the ghost.
+        m_freq[key] = min(m_params['freq_cap'], m_freq[key] + 1)
+        
+        # Immediate promotion if highly frequent?
+        # If freq > 1, skip Small.
+        if m_freq[key] > 1:
+            m_main[key] = None
+            return
+    else:
+        m_freq[key] = 0
+        
+    # Standard Insert to Small
+    m_small[key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    check_reset(cache_snapshot)
+    global m_small, m_main
+    
+    key = evicted_obj.key
+    if key in m_small:
+        del m_small[key]
+    elif key in m_main:
+        del m_main[key]
+    
+    # Do NOT remove from m_freq. It serves as Ghost.
+# EVOLVE-BLOCK-END

@@ -1,0 +1,165 @@
+# INDIVIDUAL PROGRAM SUMMARIES
+
+The following are summaries of individual programs evaluated since the last meta update:
+
+**Program Name: Access-Count LRU Eviction**
+- **Implementation**: Maintains a global key→timestamp map updated on every hit/insert using cache_snapshot.access_count; on eviction, selects the cached key with the smallest timestamp (ties implicitly broken by cache iteration order). Metadata for evicted keys is purged to keep the map in sync.
+- **Performance**: Achieved a combined score of 0.21 across 48 traces, with hit rates ranging from 0.0000 to 0.8680.
+- **Feedback**: Behavior matches pure LRU—strong on workloads with temporal locality (several mid-to-high hit-rate traces) but weak on scans, large working sets, or frequency-skewed patterns (many near-zero traces). Incorporating frequency/adaptive components (e.g., 2Q/ARC/LRFU) or scan resistance could improve robustness across diverse workloads.
+**Program Identifier:** Generation 0 - Patch Name initial_program - Correct Program: True
+
+**Program Name: Adaptive Replacement Cache (ARC)**
+- **Implementation**: Uses OrderedDicts for ARC’s T1/T2 (in-cache) and B1/B2 (ghost) lists, with p (target T1 size) initialized to half capacity and bounded to the live cache size. Eviction follows ARC’s replace heuristic (B2 ghost hits bias evicting from T1), hits promote to T2 MRU, inserts go to T1 unless in ghosts (which adjust p), and desync fallbacks promote hits to T2 and place unknown evictions into B1; ghost lists are trimmed to capacity.
+- **Performance**: Combined score 0.24 across 48 traces, with hit rates ranging from 0.00 to 0.89 (strong on traces 27/28/34/38, weak on several low-locality/scan traces).
+- **Feedback**: Ghost-driven adaptation and p tuning help on mixed recency/frequency workloads but struggle on scan-like or highly unique streams. Integer rounding and default promotion to T2 on desync may over-bias frequency and reduce T1 headroom; gentler p updates or stricter T1 defaults could stabilize performance.
+**Program Identifier:** Generation 1 - Patch Name arc_adaptive_recency_frequency - Correct Program: True
+
+**Program Name: 80/20 SLRU-style two-segment cache**
+- **Implementation**: Uses per-key last-access timestamps (from access_count) and a two-segment design: new items enter probation, first hit promotes to protected, and an LRU demotion enforces a protected cap at 80% of capacity. Eviction selects the LRU from probation first, otherwise the global LRU; metadata is fully cleaned on evict.
+- **Performance**: Combined score 0.23 across 48 traces, with strong hit rates on locality-heavy traces (up to 0.8872) but many traces near zero.
+- **Feedback**: The static 80% protected quota and immediate promotion after one hit help reuse-heavy workloads but reduce adaptability, over-protecting items and underperforming on scans/random patterns. Absence of admission control or ghost history limits discrimination between transient and recurring items, leading to many low-hit results.
+**Program Identifier:** Generation 2 - Patch Name slru_promotion_with_quota - Correct Program: True
+
+**Program Name: 2Q Segmented LRU with freq tiebreak**
+- **Implementation**: Implements a 2Q-style cache with probation (A1) and protected (Am) segments, promoting items to Am on first hit and tracking recency via access_count-based timestamps. Eviction picks a segment targeting ~25% A1, then evicts the segment LRU with frequency as a tiebreaker; metadata is stored in global dicts and cleaned on eviction.
+- **Performance**: Combined score 0.23; strong on reusable/looping traces (peaks up to 0.8874) but many traces are low, including some near-zero.
+- **Feedback**: The segment choice effectively evicts from A1 even when A1 is below the target, over-protecting Am and harming adaptability to scans/phase shifts; the frequency tiebreak likely rarely activates due to unique timestamps. Correcting the segment-selection branch to truly enforce the A1 target or dynamically sizing segments (e.g., with ghost history) could improve robustness across workloads.
+**Program Identifier:** Generation 3 - Patch Name segmented_lru_2q_promotion - Correct Program: True
+
+**Program Name: Simplified ARC with Ghost Sets**
+- **Implementation**: ARC-like T1/T2 resident lists and B1/B2 ghost lists with access_count-based LRU; evicts from T1 when T1 exceeds adaptive target p (or on B2 hints), else from T2; hits promote to T2, and p adapts on ghost hits using |B2|/|B1| ratios while pruning ghosts to capacity.
+- **Performance**: Combined score 0.24 across 48 traces, with hit rates ranging from 0.00 to 0.89 (strong on several traces, moderate to low on many others).
+- **Feedback**: Performs well on workloads mixing recency and frequency, but struggles on scan/low-reuse patterns, exhibiting high variance. Simplifications (always promoting to T2, shared ghost cap, coarse replace rule) likely induce T2 pollution and limit responsiveness to scans.
+**Program Identifier:** Generation 4 - Patch Name arc_simplified_segmented_lru - Correct Program: True
+
+**Program Name: ARC-inspired adaptive cache eviction**
+- **Implementation**: Implements a simplified ARC using OrderedDicts for T1/T2 (resident) and B1/B2 (ghost) with an adaptive target arc_p; metadata is resynced with the actual cache on eviction and timestamps serve as a fallback tie-breaker. Hits promote keys to T2 MRU, inserts adjust arc_p based on ghost hits, and new keys enter T1; ghost lists are trimmed to capacity.
+- **Performance**: Combined score 0.25 over 48 traces; per-trace hit rates ranged from 0.0000 to 0.8915.
+- **Feedback**: Strong on workloads with stable recency/frequency (e.g., traces 27, 28, 34, 38) but weak on scan-like or adversarial patterns (many traces below 0.1). Always promoting hits to T2 and capping ghost sizes at capacity may over-bias frequency and dampen adaptability despite consistent metadata via resync.
+**Program Identifier:** Generation 5 - Patch Name arc_with_ghost_lists - Correct Program: True
+
+**Program Name: ARC-TinyLFU Hybrid Cache**
+- **Implementation**: Combines ARC (OrderedDict-based T1/T2 with ghost lists B1/B2) with a decaying TinyLFU-style frequency sketch and LRU timestamps for tie-breaking. arc_p adapts on ghost hits; eviction compares the LRU of T1 vs T2 using arc_p and per-key frequencies; hits promote to T2, inserts respect ghost membership, and evictions update ghost lists with ghost sizes trimmed to capacity.
+- **Performance**: Combined score 0.23 across 48 traces, with hit rates ranging from 0.0 to 0.8864 (strong on traces 27/28/34/38 and moderate ~0.45–0.53 on several, but very low on many others).
+- **Feedback**: The ARC plus ghost-based adaptation benefits workloads with recurring locality, but the simplistic frequency sketch and considering only each segment’s LRU as eviction candidates leads to high variance and weak results on low-locality/streaming traces. Tuning admission (e.g., stronger TinyLFU gate), decay cadence, and reducing reliance on periodic resync could improve robustness.
+**Program Identifier:** Generation 6 - Patch Name arc_tiny_lfu_hybrid - Correct Program: True
+
+**Program Name: Hybrid ARC-inspired Segmented LRU with Ghosts**
+- **Implementation**: Two-tier (A1 probation, Am protected) LRU with per-key timestamps, light frequency counts, and ghost histories (A1/Am) that adapt an A1 target size; eviction selects a segment via the adaptive target and picks the LRU key with frequency as a tiebreaker. Hits promote to protected; inserts adjust the target if ghosts indicate prior residency, and ghost lists are trimmed with a size-bound.
+- **Performance**: Combined score 0.23 across 48 traces; hit rates ranged from 0.0000 to 0.8910 (notably ~0.49–0.54 on traces 1–10 and 0.891 on trace_28).
+- **Feedback**: Ghost-driven adaptation and first-hit promotion work well on reuse-heavy workloads (e.g., traces 27, 28, 34, 38), but performance collapses on streaming/low-reuse traces (many near-zero results). Strengthening scan resistance/demotion or aging and enriching the frequency signal could reduce protected-set stickiness and improve robustness.
+**Program Identifier:** Generation 7 - Patch Name arc_srlu_hybrid - Correct Program: True
+
+**Program Name: Segmented LRU (SLRU) Cache Eviction**
+- **Implementation**: Implements SLRU using two sets (probationary/protected) and a global timestamp map updated on each access. Eviction chooses the LRU from probationary, else protected, else global; hits promote to protected and a fixed 0.8 protected cap triggers demotions, with periodic cleanup against current cache keys.
+- **Performance**: Combined score 0.23 across 48 traces; hit rates spanned near-zero on scan/low-locality traces to 0.88 on high-locality traces (notably traces 27–28, 34, 38).
+- **Feedback**: Shielding benefited stable-reuse workloads, but the static protected ratio and absence of adaptive/ghost admission limited performance under scans and shifting working sets. Linear LRU searches are simple but may be inefficient and less responsive; tuning the protected size or adding adaptive admission could improve robustness.
+**Program Identifier:** Generation 8 - Patch Name slru_promotion_with_lru_demote - Correct Program: True
+
+**Program Name: ARC+TinyLFU Hybrid Eviction**
+- **Implementation**: Combines ARC (T1/T2 with ghost lists B1/B2 and adaptive target p) with a TinyLFU-style frequency sketch, decayed every 10k accesses, using timestamps as a tie-breaker. Eviction samples up to 3 LRU candidates from T1/T2, prefers ARC’s chosen segment but can override based on frequency gaps; metadata is resynced to the cache and p is adjusted at most once per access.
+- **Performance**: Combined score 0.23; hit rates ranged from 0.0000 to 0.8910 across 48 traces.
+- **Feedback**: Strong on workloads with recurring locality and frequency skew, but weak on scans or large, sparse working sets. The small sample size (S=3) and relatively slow decay window can misjudge recency/frequency, leading to suboptimal victim selection in volatile patterns.
+**Program Identifier:** Generation 9 - Patch Name arc_tinylfu_sampling - Correct Program: True
+
+**Program Name: Hybrid ARC + LFU Aging Cache**
+- **Implementation**: Maintains ARC-style resident sets (T1 probationary LRU, T2 protected) and ghost sets (B1/B2) with adaptive target p; replace() evicts from T1 by LRU when T1>p/B2-hit/empty-T2, otherwise from T2 by lowest aged frequency with LRU tiebreaker. T2 uses capped per-key frequencies aged by staleness over a capacity-scaled window; ghost lists are timestamped and pruned to 2×capacity.
+- **Performance**: Combined score 0.24 across 48 traces, peaking near 0.89 on locality-heavy traces but dropping near zero on many low-locality/scan-like traces.
+- **Feedback**: Adaptive p via ghost hits and LFU-with-aging improves robustness and yields strong gains on reuse-heavy workloads. However, unconditional T1→T2 promotion and conservative aging (window≈capacity/2, no demotion) can overprotect stale items, hurting scans and rapidly shifting patterns.
+**Program Identifier:** Generation 10 - Patch Name arc_lfu_hybrid_v2 - Correct Program: True
+
+**Program Name: Adaptive ARC with Delayed Promotion**
+- **Implementation**: Simplified ARC maintaining T1/T2 residents and B1/B2 ghosts, with per-key timestamp LRU and replace() evicting from T1 when |T1|>p, when the incoming key is in B2 and |T1|≥p, or when T2 is empty. Adaptive target p starts at capacity/2, adjusts on ghost hits with damped steps, slowly decays without ghost hits and under scan clamp, and uses delayed T2 promotion requiring two hits within a short window.
+- **Performance**: Combined score 0.24 across 48 traces; hit rates span 0.0000 to 0.8889 with several mid-0.4–0.5 cases and a few strong (≥0.7) traces.
+- **Feedback**: The design adapts well to recurring/frequent reuse, but struggles on scans and sparse or long-gap two-touch patterns. Conservative delayed promotion and ratio-damped p updates likely slow adaptation and underprotect short bursts, yielding very low hits on multiple traces.
+**Program Identifier:** Generation 11 - Patch Name arc_adaptive_p_decay_delayed_promotion - Correct Program: True
+
+**Program Name: Hybrid ARC Segmented LRU with Damped Adaptation**
+- **Implementation**: ARC-inspired two-tier cache (A1 probation, Am protected) using per-key LRU timestamps with a light frequency tie-breaker and bounded ghost histories (A1/Am) to steer an adaptive A1 target (p). It applies step-limited target updates on ghost hits, delayed promotion via short-window double-hit, scan clamping via a cold-streak heuristic, periodic decay of p, and LRU-within-segment eviction.
+- **Performance**: Combined score 0.22 across 48 traces; hit rates span 0.0000–0.8780 with strong results on reuse-heavy traces (e.g., 0.8780, 0.7696, 0.7228, 0.6136) but many low results on scan/one-hit or highly diverse workloads (often ≤0.06).
+- **Feedback**: Ghost-guided adaptation and delayed promotion successfully protect reused items, but adaptation can be slow or too conservative under heavy scans/low-locality traces, yielding many near-zero hit rates. Consider more aggressive/dynamic decay, tighter promotion windows, or stronger scan bias when ghost signals are quiet to improve robustness on streaming and long-tail patterns.
+**Program Identifier:** Generation 12 - Patch Name arc_srlu_delayed_promo_decay_scanclamp - Correct Program: True
+
+**Program Name: Adaptive Replacement Cache with Ghost Lists**
+- **Implementation**: ARC-like eviction choosing LRU from T1 or T2 based on adaptive p and ghost membership, implemented with OrderedDicts (T1/T2 resident, B1/B2 ghost) and timestamp tie-breaks. Hits promote to T2; inserts adjust p on B1/B2 hits; evicted items move to ghosts; metadata resyncs to cache and ghosts are trimmed to capacity.
+- **Performance**: Combined score 0.25 over 48 traces; hit rates ranged from 0.0 to 0.8915 with a few strong workloads and many modest/low results.
+- **Feedback**: Limited ghost history (ghosts capped at capacity vs. standard 2C) and deferred p-adjustment may weaken adaptation, especially on sequential/adversarial traces. Implementing full ARC REPLACE behavior and 2C ghost sizing could improve stability and hit rates.
+**Program Identifier:** Generation 13 - Patch Name arc_pure_plus_resync - Correct Program: True
+
+**Program Name: Adaptive ARC with delayed promotion**
+- **Implementation**: Implements an ARC-style cache with T1/T2 residents and B1/B2 ghosts controlled by adaptive parameter p using OrderedDict LRU. Adds delayed promotion via a window W and pending hits, prefers evicting non-pending T1 items, decays p when idle/cold-streaks, trims ghosts, resynchronizes metadata, and falls back to timestamps.
+- **Performance**: Combined score 0.24 across 48 traces; strong on locality-rich traces (0.85–0.89) but very low on scans/anti-locality sequences (many <0.1, one 0.0).
+- **Feedback**: Delayed promotion reduces pollution but can miss spaced repetitions; p adapts mainly on ghost hits and decays slowly, underreacting to long scans despite the cold-streak clamp. Consider more aggressive scan detection or faster p decay and tuning W to better handle streams without harming frequent reuse.
+**Program Identifier:** Generation 14 - Patch Name darc_delayed_promo_scanclamp - Correct Program: True
+
+**Program Name: Hybrid ARC/SLRU/LRFU Cache**
+- **Implementation**: Maintains A1 (probationary) and Am (protected) segments with an ARC-like adaptive A1 target driven by ghost histories (B1/B2), cold-streak damping, and time-based decay. Evictions are chosen via an LRFU-like score within the selected segment; promotions require two hits within a capacity-scaled window, and ghost lists are trimmed to max(2×cap, 256).
+- **Performance**: Combined score 0.22 across 48 traces; hit rates ranged 0.0000–0.8860, excelling on locality-rich traces and struggling on scan/low-reuse workloads.
+- **Feedback**: The LRFU scoring plus delayed promotion effectively protects true hot items, yielding strong results on repeated-access patterns. However, the large ghost minimum and scan clamping can mis-tune the A1 target on streaming traces, producing very low hit rates; consider reducing ghost bounds toward O(cap) and retuning decay/promotion thresholds.
+**Program Identifier:** Generation 15 - Patch Name arc_slru_lrfu_hybrid_v2 - Correct Program: True
+
+**Program Name: ARC-based adaptive cache with delayed promotion**
+- **Implementation**: Implements an ARC-like policy with T1/T2 resident lists and B1/B2 ghosts, adaptive target p, and LRU-based eviction chosen between T1/T2 based on p and B2 presence, with timestamp fallback. Adds delayed T1→T2 promotion via a pending window, ghost-hit-driven p adjustment, idle decay, cold-streak clamp, metadata resync, and ghosts trimmed to 2x capacity.
+- **Performance**: Combined score 0.24 across 48 traces; strong on several looping/reuse traces (peaks ~0.89) but near-zero on many scan/one-timer workloads.
+- **Feedback**: Cold-streak and idle-decay both reduce p (despite comments saying “recency”), biasing toward frequency and likely hurting scan resistance; delayed promotion can miss short bursts, reducing mid-frequency hits. Ghost history supports quick adaptation when patterns repeat, explaining the strong results on repetitive traces.
+**Program Identifier:** Generation 16 - Patch Name arc_delayed_promotion_damped_p_and_ghost_buffer - Correct Program: True
+
+**Program Name: ARC with delayed promotion and idle decay**
+- **Implementation**: Uses ARC with OrderedDict T1/T2 and ghost lists B1/B2, with adaptive target p tuned by ghost hits, idle-time decay, and a scan clamp. Employs delayed T1 promotion via a pending window, metadata resync, and timestamp-based LRU fallback for tie-breaking.
+- **Performance**: Combined score 0.24; peaks on strong locality traces (up to 0.8888) but many workloads exhibit low hit rates, including several near-zero.
+- **Feedback**: Adaptation benefits frequent/recent reuse, but delayed promotion and conservative p decay likely underreact to short bursts and scans, hurting highly non-repetitive workloads. Consider faster T1→T2 promotion and more aggressive p decay during prolonged cold streaks or sequential access patterns.
+**Program Identifier:** Generation 17 - Patch Name arc_delayed_promotion_decay_ghost2x - Correct Program: True
+
+**Program Name: Adaptive SLRU with ARC-style ghosts**
+- **Implementation**: Two-segment SLRU (probationary/protected) using per-key access timestamps; promotes on hits and demotes to enforce an adaptive protected target. ARC-style ghost histories (B1/B2) adjust the protected size (±cap//8) and admit ghost hits directly to protected; eviction prefers probationary LRU with protected/global LRU fallbacks, and ghosts are trimmed to ≤2× capacity.
+- **Performance**: Combined score 0.21 over 48 traces; hit rates ranged 0.0000–0.8680, strong on locality-heavy traces and weak on scan/random-heavy ones.
+- **Feedback**: The SLRU+ghost adaptation shields reused items and rebalances segment sizes effectively, yielding high hits on recurring patterns. Low-reuse traces limit gains; consider tuning the initial protected ratio/step size or enhancing scan-resistance in admission.
+**Program Identifier:** Generation 18 - Patch Name arc_slru_ghost_adapt - Correct Program: True
+
+**Program Name: ARCPlus: Adaptive ARC with scan guard**
+- **Implementation**: Implements ARC with T1/T2 resident lists and B1/B2 ghost lists via OrderedDict LRU; adapts T1 target p using ghost hits with capped steps, idle-time decay, and a cold-streak scan clamp. Includes resync to cache contents, timestamp tie-breakers, and ghost trimming capped at 2× capacity.
+- **Performance**: Combined score 0.24 over 48 traces; hit rates ranged from 0.0 to 0.8934, strong on locality-heavy traces (e.g., 27/28) but weak on many sparse/scan patterns.
+- **Feedback**: Aggressive promotion to T2 on any hit and a fallback victim path that can bypass ARC’s T1/T2 preference may bias toward frequency and trigger frequent resyncs, reducing robustness under scans/churn. Tightening eviction to strictly follow T1/T2 LRU and tuning p-decay/scan clamp thresholds could curb near-zero cases while preserving the high-hit scenarios.
+**Program Identifier:** Generation 19 - Patch Name arc_plus_simplified - Correct Program: True
+
+# GLOBAL INSIGHTS SCRATCHPAD
+
+The following are global insights about optimization approaches and their effectiveness:
+
+## Successful Algorithmic Patterns
+- Strict ARC REPLACE selection yielded the top score. The current best, “Adaptive Replacement Cache with Ghost Lists” (0.25), uses the canonical rule to evict from T1 when |T1| > p or (incoming key ∈ B2 and |T1| == p), else from T2. This precise T1/T2 decisioning aligns with standard ARC and correlates with its stability and consistent mid-tier hits (traces 1–10 ≈0.44–0.54) versus 0.24 peers. In contrast, “ARCPlus: Adaptive ARC with scan guard” (0.24) includes a fallback victim path that can bypass ARC’s preference and reports weaker robustness on scans.
+- Ghost-driven, asymmetric p updates with an initial recency bias improved adaptation across mixed workloads. The best program starts p at 0 and adjusts on B1/B2 hits with ratio-based steps (|B2|/|B1| and |B1|/|B2|, floored to ≥1) bounded in [0, C]. This mirrors the previous insight that such p-control enhanced robustness, lifting ARC variants above LRU/SLRU/2Q baselines and helping the best program edge others (0.25 vs. 0.24).
+- Metadata resynchronization before eviction improved reliability. The best program’s _resync aligns T1/T2 with the live cache and trims ghosts before REPLACE. This reduced desync-driven fallbacks and was a noted differentiator versus other ARCs that reported desync issues and scored 0.24.
+- Immediate promotion on any hit captured short bursts better than delayed schemes. The best program moves T1 hits directly into T2 and maintains strong results on reuse-heavy traces (e.g., 27/28 at 0.8500/0.8915, 34 at 0.7529, 38 at 0.6404) and consistent mid results elsewhere, whereas delayed-promotion variants commonly missed spaced repetitions and underprotected short bursts.
+
+## Ineffective Approaches
+- Delayed promotion (requiring two hits in a window) repeatedly suppressed performance on short bursts and spaced two-touch patterns. Programs “Adaptive ARC with Delayed Promotion” (0.24), “Hybrid ARC Segmented LRU with Damped Adaptation” (0.22), “Adaptive ARC with delayed promotion” (0.24), “ARC-based adaptive cache with delayed promotion” (0.24), and “ARC with delayed promotion and idle decay” (0.24) all report very low hit rates on scans/one-timers and spaced repeats; feedback cites slow adaptation and missed bursts.
+- Frequency-heavy hybrids overprotected stale items and worsened scans. “Hybrid ARC + LFU Aging Cache” (0.24) drops near zero on scan-like traces due to unconditional T1→T2 promotion and conservative aging that overprotects stale entries. “Hybrid ARC/SLRU/LRFU Cache” (0.22) shows similar issues, with LRFU scoring and large ghosts mis-tuning the A1 target and producing many near-zero scan results.
+- Non-strict eviction paths reduced ARC’s robustness. “ARCPlus: Adaptive ARC with scan guard” (0.24) mentions a fallback victim path that can bypass ARC’s T1/T2 preference and triggers frequent resyncs, biasing toward frequency and weakening scan resistance, leading to more near-zero cases compared to the best program’s strict REPLACE.
+- Over-tuned decay/clamp mechanisms mis-biased adaptation. Several variants damped p updates, added slow decay, or scan clamps (“Adaptive ARC with Delayed Promotion,” “ARC-based adaptive cache with delayed promotion,” “ARC with delayed promotion and idle decay,” all 0.24). Feedback indicates underreaction to scans and long cold streaks, yielding very low hits on diverse/streaming workloads.
+
+## Implementation Insights
+- OrderedDict-based LRU across resident and ghost sets provides O(1) MRU/LRU maintenance and clean ARC mechanics. All top variants use this; the best program combines it with a minimal, deterministic timestamp fallback only when residents are empty.
+- The best program’s _resync is pivotal: it reconciles T1/T2 with the actual cache, placing unknown residents into T1 and trimming ghosts. This keeps REPLACE decisions valid and reduces dependency on timestamp fallback, aligning with its superior average (0.25) over otherwise similar ARCs at 0.24 that reported desync-related fallbacks.
+- Asymmetric, ratio-based p adjustments bounded in [0, C] with p initialized to 0 (recency-first) were effective. The best program updates p on B1/B2 hits immediately during insert handling, contrasting with damped/decayed or deferred schemes that slowed adaptation and correlated with lower averages (0.24 or 0.22).
+- Ghost sizing alone did not determine the winner. The best program trims total ghosts to ≤C (vs. the standard 2C seen in multiple 0.24 implementations), yet still tops at 0.25, indicating that correct REPLACE logic and reliable metadata overshadow marginal gains from larger ghost histories.
+
+## Performance Analysis
+- ARC-family algorithms dominate: best at 0.25 (“Adaptive Replacement Cache with Ghost Lists”), a cluster at 0.24 (multiple ARC variants and hybrids), then hybrids at 0.22, and SLRU-like at 0.21. The consistent uplift from ghost-driven adaptation and strict REPLACE confirms previous observations.
+- Peaks on locality-heavy traces are similar across ARC variants (often ≥0.85 on traces 27/28 and strong on 34/38). The best program matches these peaks (27/28/34/38 = 0.8500/0.8915/0.7529/0.6404) and outperforms on average by sustaining moderate hits on mixed workloads (traces 1–10 ≈0.44–0.54, 20–26 ≈0.27–0.36, 47 = 0.4663).
+- The floor on scans/low-reuse remains low across all policies (e.g., best shows 0.0000 on trace 14; 0.02–0.09 on many 15–19, 22, 29–33). Attempts to fix scans with delayed promotion or heavy decay/clamps often backfire, reducing mid-frequency protection and leaving the scan floor largely unchanged, resulting in 0.22–0.24 averages.
+- Adding LFU/LRFU elements did not raise the average, and sometimes hurt it. “Hybrid ARC/SLRU/LRFU Cache” (0.22) and “Hybrid ARC Segmented LRU with Damped Adaptation” (0.22) show strong peaks but many near-zero cases on diverse/streaming traces, reinforcing that frequency layers without careful admission/demotion control do not improve robustness relative to strict ARC mechanics.
+
+# META RECOMMENDATIONS
+
+The following are actionable recommendations for the next program generations:
+
+1. Expand ghost history to 2×C with p-proportional trimming. Change _trim_ghosts to enforce |B1| + |B2| ≤ 2*arc_capacity and bias trimming so |B1| tracks ≈ arc_p and |B2| tracks ≈ (arc_capacity - arc_p) (trim the list exceeding its proportional target first). This preserves more history for ghost-driven p steering while keeping strict ARC mechanics that already work well.
+
+2. Enforce ARC invariants proactively on fast paths. In update_after_hit and update_after_insert, if len(arc_T1)+len(arc_T2) != len(cache_snapshot.cache), call _resync() and also ensure disjointness by removing any key from B1/B2 if it appears in T1/T2. This keeps REPLACE decisions valid between evictions and reduces reliance on fallbacks that were linked to weaker robustness in peers.
+
+3. Make REPLACE strictly ARC and eliminate non-ARC fallback. Before returning a victim in evict, if the chosen list (T1 or T2) is empty, select from the other if non-empty; only if both are empty, rebuild T1 from current residents (resync) and retry, instead of using timestamps. This preserves the canonical “evict(LRU(T1)) if |T1| > p or (x ∈ B2 and |T1| == p), else evict(LRU(T2))” and avoids non-deterministic, drift-prone paths.
+
+4. Lightly cap p step sizes to prevent overshoot while keeping asymmetric, immediate updates. Replace inc/dec with min(current_step, max(1, arc_capacity // 8)) and keep the existing ratio-based direction and [0, C] bounds (no decay, no damping over time). This keeps the winning adaptation behavior but avoids runaway p swings when |B1| or |B2| is very small, improving stability on mixed workloads.
+
+5. Strengthen ghost-consistent eviction bookkeeping and fallback victim preference. In update_after_evict, if resident membership is unknown, send the key to B2 if it already exists in B2 (else B1), and always remove it from the opposite ghost to keep sets disjoint. Additionally, if a rare fallback selection is still needed, prefer evicting a resident whose key is in B1 over one in B2, otherwise choose the oldest by timestamp—preserving likely-frequent items and aligning with ghost signals.

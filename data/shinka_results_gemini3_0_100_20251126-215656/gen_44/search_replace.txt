@@ -1,0 +1,166 @@
+<NAME>
+conditional_demotion_evict
+</NAME>
+
+<DESCRIPTION>
+Implement Conditional Demotion and Frequency Decay in the eviction logic.
+- Conditional Demotion: When an item in Main is chosen for eviction (freq=0), it is demoted to Small only if Small is below its target capacity. If Small is full (e.g., during scans), the item is evicted directly to protect Small from pollution. This prevents scan patterns from flushing out the working set in the Main queue while still allowing history retention during stable periods.
+- Frequency Decay: When a Main item with freq > 0 is processed, decrement its frequency by 1 instead of resetting to 0. This provides a "leveled" protection where highly popular items (freq=3) survive multiple eviction passes, improving robustness for heavy hitters.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO eviction with Ghost Queue support.
+    Evicts from Small (Probation) or Main (Protected) based on S3-FIFO logic.
+    '''
+    global _s3_small, _s3_main, _s3_freq
+    _check_reset(cache_snapshot)
+
+    # Target size for small queue (10% of capacity)
+    curr_size = len(cache_snapshot.cache)
+    s_target = max(1, int(curr_size * 0.1))
+
+    while True:
+        # 1. Check Small FIFO (Probation)
+        # If Small is larger than target, we prefer to evict from it
+        if len(_s3_small) > s_target:
+            if not _s3_small:
+                break # Should be caught by outer checks, but safety
+
+            candidate = next(iter(_s3_small))
+
+            # Consistency check: if key not in actual cache, clean up and skip
+            if candidate not in cache_snapshot.cache:
+                _s3_small.pop(candidate, None)
+                _s3_freq.pop(candidate, None)
+                continue
+
+            # S3-FIFO Logic:
+            freq = _s3_freq.get(candidate, 0)
+            if freq > 0:
+                # Accessed while in Small -> Promote to Main
+                _s3_small.pop(candidate)
+                _s3_main[candidate] = None # Insert at tail (MRU)
+                _s3_freq[candidate] = 0    # Reset frequency
+                continue
+            else:
+                # Not visited: Evict from Small
+                return candidate
+
+        # 2. Check Main FIFO (Protected)
+        if _s3_main:
+            candidate = next(iter(_s3_main))
+
+            if candidate not in cache_snapshot.cache:
+                _s3_main.pop(candidate, None)
+                _s3_freq.pop(candidate, None)
+                continue
+
+            freq = _s3_freq.get(candidate, 0)
+            if freq > 0:
+                # Accessed while in Main -> Second Chance (Reinsert)
+                _s3_main.pop(candidate)
+                _s3_main[candidate] = None # Reinsert at tail
+                _s3_freq[candidate] = 0
+                continue
+            else:
+                # Not visited in Main: Evict
+                return candidate
+
+        # 3. Fallback: Main is empty or only contains active items that got reinserted?
+        # Force check Small if Main is empty and Small is not empty (even if <= target)
+        if not _s3_main and _s3_small:
+            candidate = next(iter(_s3_small))
+            if candidate not in cache_snapshot.cache:
+                _s3_small.pop(candidate, None)
+                _s3_freq.pop(candidate, None)
+                continue
+
+            freq = _s3_freq.get(candidate, 0)
+            if freq > 0:
+                 _s3_small.pop(candidate)
+                 _s3_main[candidate] = None
+                 _s3_freq[candidate] = 0
+                 continue
+            else:
+                 return candidate
+
+        # If both empty (should not happen on full cache)
+        if not _s3_small and not _s3_main:
+            if cache_snapshot.cache:
+                return next(iter(cache_snapshot.cache))
+            return None
+=======
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO with Conditional Demotion and Frequency Decay.
+    '''
+    global _s3_small, _s3_main, _s3_freq
+    _check_reset(cache_snapshot)
+
+    # Target size for small queue (10% of capacity)
+    curr_size = len(cache_snapshot.cache)
+    s_target = max(1, int(curr_size * 0.1))
+
+    while True:
+        # 1. Check Small FIFO (Probation)
+        # Priority eviction if Small > target OR Main is empty
+        if len(_s3_small) > s_target or not _s3_main:
+            if not _s3_small:
+                # Fallback if both empty
+                if cache_snapshot.cache:
+                    return next(iter(cache_snapshot.cache))
+                return None
+
+            candidate = next(iter(_s3_small))
+
+            if candidate not in cache_snapshot.cache:
+                _s3_small.pop(candidate, None)
+                _s3_freq.pop(candidate, None)
+                continue
+
+            freq = _s3_freq.get(candidate, 0)
+            if freq > 0:
+                # Promote Small -> Main
+                _s3_small.pop(candidate)
+                _s3_main[candidate] = None
+                _s3_freq[candidate] = 0
+                continue
+            else:
+                # Evict from Small
+                return candidate
+
+        # 2. Check Main FIFO (Protected)
+        else:
+            if not _s3_main:
+                continue # Should be handled by top branch but safety
+
+            candidate = next(iter(_s3_main))
+
+            if candidate not in cache_snapshot.cache:
+                _s3_main.pop(candidate, None)
+                _s3_freq.pop(candidate, None)
+                continue
+
+            freq = _s3_freq.get(candidate, 0)
+            if freq > 0:
+                # Reinsert Main -> Main with Decay
+                _s3_main.pop(candidate)
+                _s3_main[candidate] = None
+                _s3_freq[candidate] = freq - 1 # Decay
+                continue
+            else:
+                # Conditional Demotion: Main -> Small
+                # Only demote if Small is not full.
+                # If Small is full (under scan), evict Main item directly.
+                if len(_s3_small) < s_target:
+                    _s3_main.pop(candidate)
+                    _s3_small[candidate] = None
+                    _s3_freq[candidate] = 0
+                    continue
+                else:
+                    return candidate
+>>>>>>> REPLACE
+</DIFF>

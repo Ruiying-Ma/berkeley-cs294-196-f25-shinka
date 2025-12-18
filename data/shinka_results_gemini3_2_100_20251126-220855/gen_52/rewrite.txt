@@ -1,0 +1,193 @@
+# EVOLVE-BLOCK-START
+"""S3-FIFO with TinyLFU Admission and Randomized Eviction"""
+
+from collections import OrderedDict
+import random
+
+# Global State
+m_small = OrderedDict()
+m_main = OrderedDict()
+m_ghost = OrderedDict()
+m_freq = {}
+m_small_hits = set()
+m_main_hits = set()
+m_last_access_count = 0
+m_global_tick = 0
+
+def check_reset(cache_snapshot):
+    global m_small, m_main, m_ghost, m_freq, m_small_hits, m_main_hits, m_last_access_count, m_global_tick
+    if cache_snapshot.access_count < m_last_access_count:
+        m_small.clear()
+        m_main.clear()
+        m_ghost.clear()
+        m_freq.clear()
+        m_small_hits.clear()
+        m_main_hits.clear()
+        m_global_tick = 0
+    m_last_access_count = cache_snapshot.access_count
+
+def evict(cache_snapshot, obj):
+    check_reset(cache_snapshot)
+    global m_small, m_main, m_ghost, m_freq, m_small_hits, m_main_hits
+
+    capacity = cache_snapshot.capacity
+    target_s = max(1, int(capacity * 0.1))
+
+    while True:
+        # 1. Decide which queue to evict from
+        # Evict from Small if it exceeds target size OR if Main is empty (must populate Main)
+        if len(m_small) > target_s or not m_main:
+            if not m_small:
+                # Fallback if Small is empty but Main is not (logic safety)
+                if m_main:
+                    pass # Go to Main eviction
+                else:
+                    return None # Error: Cache empty
+
+            # Candidate from Small Head (FIFO)
+            candidate = next(iter(m_small))
+            
+            # Policy 1: S3-FIFO Promotion
+            # If accessed while in Small, promote to Main
+            if candidate in m_small_hits:
+                m_small_hits.remove(candidate)
+                del m_small[candidate]
+                m_main[candidate] = None # Insert at MRU
+                continue
+            
+            # Policy 2: TinyLFU Admission
+            # If candidate frequency > Main victim frequency, evict Main instead.
+            if m_main:
+                # Select a comparison victim from Main (LRU/Random sample)
+                # We use the LRU item as the baseline for comparison
+                main_victim_key = next(iter(m_main))
+                
+                freq_s = m_freq.get(candidate, 0)
+                freq_m = m_freq.get(main_victim_key, 0)
+                
+                if freq_s > freq_m:
+                    # Admit candidate to Main, Evict main_victim_key
+                    del m_small[candidate]
+                    m_main[candidate] = None # Promote
+                    return main_victim_key
+
+            # Default: Evict candidate from Small
+            return candidate
+
+        else:
+            # 2. Evict from Main
+            # Use Randomized LRU to break looping patterns (Trace 14)
+            
+            # Look at bottom K candidates (LRU end)
+            candidates = []
+            it = iter(m_main)
+            for _ in range(5):
+                try:
+                    candidates.append(next(it))
+                except StopIteration:
+                    break
+            
+            # Filter candidates: Check for Second Chance
+            final_candidates = []
+            for k in candidates:
+                if k in m_main_hits:
+                    # Give second chance immediately and move to MRU
+                    m_main_hits.remove(k)
+                    m_main.move_to_end(k)
+                    # We modified the OrderedDict, so iterator is invalid. 
+                    # Restart the outer loop to pick a new victim.
+                    # This implements "Lazy Promotion"
+                else:
+                    final_candidates.append(k)
+            
+            if len(final_candidates) != len(candidates):
+                continue # Some items were promoted, restart scan
+            
+            if not final_candidates:
+                # All candidates were promoted, or main empty?
+                # If main not empty, loop will continue.
+                continue
+
+            # Select victim with lowest frequency among the LRU window
+            min_freq = float('inf')
+            best_victims = []
+            
+            for k in final_candidates:
+                f = m_freq.get(k, 0)
+                if f < min_freq:
+                    min_freq = f
+                    best_victims = [k]
+                elif f == min_freq:
+                    best_victims.append(k)
+            
+            # Random tie-breaking is crucial for Trace 14
+            victim = random.choice(best_victims)
+            return victim
+
+def update_after_hit(cache_snapshot, obj):
+    check_reset(cache_snapshot)
+    global m_freq, m_small_hits, m_main_hits, m_small, m_main
+    
+    key = obj.key
+    # Increment global frequency (capped)
+    m_freq[key] = min(15, m_freq.get(key, 0) + 1)
+    
+    if key in m_small:
+        m_small_hits.add(key)
+    elif key in m_main:
+        m_main_hits.add(key)
+        # Move to MRU in Main (Standard LRU behavior)
+        m_main.move_to_end(key)
+
+def update_after_insert(cache_snapshot, obj):
+    check_reset(cache_snapshot)
+    global m_small, m_main, m_ghost, m_freq, m_global_tick
+    
+    key = obj.key
+    # Initial freq update
+    m_freq[key] = min(15, m_freq.get(key, 0) + 1)
+    
+    # Periodic Aging (Amortized O(1))
+    m_global_tick += 1
+    if m_global_tick >= cache_snapshot.capacity:
+        m_global_tick = 0
+        # Divide frequencies by 2
+        keys_to_del = []
+        for k, v in m_freq.items():
+            new_v = v >> 1
+            if new_v == 0:
+                keys_to_del.append(k)
+            else:
+                m_freq[k] = new_v
+        for k in keys_to_del:
+            del m_freq[k]
+
+    if key in m_ghost:
+        # Ghost Hit: Rescue to Main
+        m_main[key] = None
+        del m_ghost[key]
+    else:
+        # New Item: Insert to Small
+        m_small[key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    check_reset(cache_snapshot)
+    global m_small, m_main, m_ghost, m_small_hits, m_main_hits
+    
+    key = evicted_obj.key
+    
+    # Remove from internal structures
+    if key in m_small:
+        del m_small[key]
+        if key in m_small_hits: m_small_hits.remove(key)
+        m_ghost[key] = None
+    elif key in m_main:
+        del m_main[key]
+        if key in m_main_hits: m_main_hits.remove(key)
+        m_ghost[key] = None
+        
+    # Manage Ghost size (2x Capacity to catch larger loops)
+    ghost_cap = int(cache_snapshot.capacity * 2)
+    while len(m_ghost) > ghost_cap:
+        m_ghost.popitem(last=False)
+# EVOLVE-BLOCK-END

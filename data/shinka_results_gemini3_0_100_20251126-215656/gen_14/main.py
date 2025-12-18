@@ -1,0 +1,189 @@
+# EVOLVE-BLOCK-START
+"""S3-FIFO Cache Eviction Algorithm with Byte-Size Awareness"""
+from collections import deque
+
+# Global State
+s_queue = deque()
+m_queue = deque()
+ghost_registry = set()
+ghost_queue = deque()
+ghost_m_registry = set()
+ghost_m_queue = deque()
+access_bits = {}
+s_bytes = 0
+m_bytes = 0
+s_ratio = 0.1
+last_access_count = -1
+
+def check_reset(cache_snapshot):
+    '''Reset globals if a new trace is detected'''
+    global last_access_count, s_queue, m_queue, ghost_registry, ghost_queue, ghost_m_registry, ghost_m_queue, access_bits, s_bytes, m_bytes, s_ratio
+    if cache_snapshot.access_count < last_access_count:
+        s_queue.clear()
+        m_queue.clear()
+        ghost_registry.clear()
+        ghost_queue.clear()
+        ghost_m_registry.clear()
+        ghost_m_queue.clear()
+        access_bits.clear()
+        s_bytes = 0
+        m_bytes = 0
+        s_ratio = 0.1
+    last_access_count = cache_snapshot.access_count
+
+def evict(cache_snapshot, obj):
+    '''
+    Adaptive S3-FIFO Eviction Logic:
+    - S (probation) and M (protected) queues.
+    - Dynamic S-queue sizing based on ghost hits (ARC-like adaptation).
+    - Eviction candidates chosen based on queue occupancy relative to s_ratio.
+    '''
+    check_reset(cache_snapshot)
+
+    global s_queue, m_queue, access_bits, s_bytes, m_bytes, s_ratio
+
+    cache_capacity = cache_snapshot.capacity
+    target_s_bytes = cache_capacity * s_ratio
+
+    while True:
+        # Rule 1: Evict from S if it's too big OR if M is empty
+        if s_bytes >= target_s_bytes or not m_queue:
+            if s_queue:
+                candidate = s_queue[0]
+                cand_obj = cache_snapshot.cache[candidate]
+                cand_size = cand_obj.size
+
+                # Check access bit (Lazy promotion)
+                if access_bits.get(candidate, 0) > 0:
+                    s_queue.popleft()
+                    access_bits[candidate] = 0
+                    m_queue.append(candidate)
+
+                    s_bytes -= cand_size
+                    m_bytes += cand_size
+                else:
+                    return candidate
+            else:
+                # S empty, M empty -> nothing to evict (should not happen if cache full)
+                if not m_queue: return None
+                # If S empty but s_bytes target reached (e.g. huge items), we must try M
+                pass
+
+        # Rule 2: Evict from M
+        if m_queue:
+            candidate = m_queue[0]
+            if access_bits.get(candidate, 0) > 0:
+                m_queue.rotate(-1)
+                access_bits[candidate] = 0
+            else:
+                return candidate
+
+        if not s_queue and not m_queue:
+            return None
+
+def update_after_hit(cache_snapshot, obj):
+    '''Mark object as accessed'''
+    check_reset(cache_snapshot)
+    global access_bits
+    access_bits[obj.key] = 1
+
+def update_after_insert(cache_snapshot, obj):
+    '''Insert into S or M based on Ghost history, adjust s_ratio'''
+    check_reset(cache_snapshot)
+    global s_queue, m_queue, ghost_registry, ghost_m_registry, access_bits, s_bytes, m_bytes, s_ratio
+
+    key = obj.key
+    size = obj.size
+    access_bits[key] = 0
+
+    if key in ghost_registry:
+        # Rescue from S-ghost: S was too small
+        s_ratio = min(0.9, s_ratio + 0.02)
+        m_queue.append(key)
+        m_bytes += size
+        ghost_registry.remove(key)
+    elif key in ghost_m_registry:
+        # Rescue from M-ghost: M was too small (S too big)
+        s_ratio = max(0.01, s_ratio - 0.02)
+        m_queue.append(key)
+        m_bytes += size
+        ghost_m_registry.remove(key)
+    else:
+        # New -> S
+        s_queue.append(key)
+        s_bytes += size
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''Cleanup queues and update ghost registries'''
+    global s_queue, m_queue, ghost_registry, ghost_queue, ghost_m_registry, ghost_m_queue, access_bits, s_bytes, m_bytes
+
+    key = evicted_obj.key
+    size = evicted_obj.size
+
+    # Identify source queue (head of S or M)
+    if s_queue and s_queue[0] == key:
+        s_queue.popleft()
+        s_bytes -= size
+
+        # S-eviction -> S-Ghost
+        ghost_registry.add(key)
+        ghost_queue.append(key)
+
+    elif m_queue and m_queue[0] == key:
+        m_queue.popleft()
+        m_bytes -= size
+
+        # M-eviction -> M-Ghost (for adaptation signal)
+        ghost_m_registry.add(key)
+        ghost_m_queue.append(key)
+
+    else:
+        # Fallback
+        if key in s_queue:
+            s_queue.remove(key)
+            s_bytes -= size
+            ghost_registry.add(key)
+            ghost_queue.append(key)
+        elif key in m_queue:
+            m_queue.remove(key)
+            m_bytes -= size
+            ghost_m_registry.add(key)
+            ghost_m_queue.append(key)
+
+    if key in access_bits:
+        del access_bits[key]
+
+    # Manage Ghost Capacities (Extended to 2x approx)
+    current_item_count = len(s_queue) + len(m_queue)
+    ghost_cap = max(current_item_count * 2, 200)
+
+    while len(ghost_registry) > ghost_cap:
+         g = ghost_queue.popleft()
+         if g in ghost_registry:
+             ghost_registry.remove(g)
+
+    while len(ghost_m_registry) > ghost_cap:
+         g = ghost_m_queue.popleft()
+         if g in ghost_m_registry:
+             ghost_m_registry.remove(g)
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

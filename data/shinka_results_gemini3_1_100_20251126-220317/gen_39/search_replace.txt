@@ -1,0 +1,269 @@
+<NAME>
+intro_doorkeeper_aging
+</NAME>
+
+<DESCRIPTION>
+Introduces a Doorkeeper mechanism to filter one-hit wonders, caps frequency counts at 15 to prevent count saturation, and accelerates aging to adapt faster to changing workloads. This improves the cache's ability to distinguish between high-frequency items and scan traffic, and to discard old heavy hitters more quickly.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+# W-TinyLFU style state
+algo_state = {
+    'window': deque(),        # Queue of (key, size)
+    'window_size': 0,         # Current size of window
+    'probation': OrderedDict(), # key -> size
+    'protected': OrderedDict(), # key -> size
+    'protected_size': 0,
+    'freq': {},               # key -> count
+    'access_count': 0
+}
+=======
+# W-TinyLFU style state
+algo_state = {
+    'window': deque(),        # Queue of (key, size)
+    'window_size': 0,         # Current size of window
+    'probation': OrderedDict(), # key -> size
+    'protected': OrderedDict(), # key -> size
+    'protected_size': 0,
+    'freq': {},               # key -> count
+    'doorkeeper': set(),      # key
+    'access_count': 0
+}
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    W-TinyLFU Eviction:
+    - Maintains a small Window (1%) and a Main SLRU (Probation + Protected).
+    - If Window is not full, evict from Main (to allow Window to grow).
+    - If Window is full, duel the Window victim vs Main victim using frequency.
+    '''
+    window = algo_state['window']
+    probation = algo_state['probation']
+    protected = algo_state['protected']
+    freq = algo_state['freq']
+
+    capacity = cache_snapshot.capacity
+    w_cap = max(1, int(capacity * 0.01))
+
+    # 1. If Window has space, prefer evicting from Main (Probation -> Protected)
+    if algo_state['window_size'] < w_cap:
+        if probation:
+            return next(iter(probation))
+        if protected:
+            return next(iter(protected))
+        if window:
+            return window[0][0]
+
+    # 2. Window is full. Find candidates.
+    if not window:
+        # Fallback if window empty (rare)
+        if probation: return next(iter(probation))
+        if protected: return next(iter(protected))
+        return None
+
+    cand_w_key = window[0][0]
+
+    if probation:
+        cand_m_key = next(iter(probation))
+    elif protected:
+        cand_m_key = next(iter(protected))
+    else:
+        return cand_w_key
+
+    # Duel: Keep the one with higher frequency
+    freq_w = freq.get(cand_w_key, 0)
+    freq_m = freq.get(cand_m_key, 0)
+
+    if freq_w > freq_m:
+        return cand_m_key
+    else:
+        return cand_w_key
+=======
+def evict(cache_snapshot, obj):
+    '''
+    W-TinyLFU Eviction:
+    - Maintains a small Window (1%) and a Main SLRU (Probation + Protected).
+    - If Window is not full, evict from Main (to allow Window to grow).
+    - If Window is full, duel the Window victim vs Main victim using frequency.
+    '''
+    window = algo_state['window']
+    probation = algo_state['probation']
+    protected = algo_state['protected']
+    freq = algo_state['freq']
+    dk = algo_state['doorkeeper']
+
+    capacity = cache_snapshot.capacity
+    w_cap = max(1, int(capacity * 0.01))
+
+    def get_freq(k):
+        return freq.get(k, 1 if k in dk else 0)
+
+    # 1. If Window has space, prefer evicting from Main (Probation -> Protected)
+    if algo_state['window_size'] < w_cap:
+        if probation:
+            return next(iter(probation))
+        if protected:
+            return next(iter(protected))
+        if window:
+            return window[0][0]
+
+    # 2. Window is full. Find candidates.
+    if not window:
+        # Fallback if window empty (rare)
+        if probation: return next(iter(probation))
+        if protected: return next(iter(protected))
+        return None
+
+    cand_w_key = window[0][0]
+
+    if probation:
+        cand_m_key = next(iter(probation))
+    elif protected:
+        cand_m_key = next(iter(protected))
+    else:
+        return cand_w_key
+
+    # Duel: Keep the one with higher frequency
+    freq_w = get_freq(cand_w_key)
+    freq_m = get_freq(cand_m_key)
+
+    if freq_w > freq_m:
+        return cand_m_key
+    else:
+        return cand_w_key
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def update_after_hit(cache_snapshot, obj):
+    '''
+    Update frequency and manage SLRU promotion.
+    '''
+    key = obj.key
+    algo_state['access_count'] += 1
+
+    # Frequency Update & Aging
+    f = algo_state['freq']
+    f[key] = f.get(key, 0) + 1
+    if algo_state['access_count'] > cache_snapshot.capacity * 10:
+        algo_state['freq'] = {k: v // 2 for k, v in f.items() if v > 1}
+        algo_state['access_count'] = 0
+
+    # SLRU Management
+    if key in algo_state['protected']:
+        algo_state['protected'].move_to_end(key)
+    elif key in algo_state['probation']:
+        # Promote from Probation to Protected
+        val = algo_state['probation'].pop(key)
+        algo_state['protected'][key] = val
+        algo_state['protected_size'] += val
+
+        # Enforce Protected Limit (80% of capacity)
+        limit = int(cache_snapshot.capacity * 0.8)
+        while algo_state['protected_size'] > limit and algo_state['protected']:
+            k, v = algo_state['protected'].popitem(last=False)
+            algo_state['protected_size'] -= v
+            algo_state['probation'][k] = v
+=======
+def update_after_hit(cache_snapshot, obj):
+    '''
+    Update frequency and manage SLRU promotion.
+    '''
+    key = obj.key
+    algo_state['access_count'] += 1
+
+    # Frequency Update & Aging
+    f = algo_state['freq']
+    dk = algo_state['doorkeeper']
+
+    if key in f:
+        f[key] = min(f[key] + 1, 15)
+    elif key in dk:
+        dk.remove(key)
+        f[key] = 2
+    else:
+        dk.add(key)
+
+    if algo_state['access_count'] > cache_snapshot.capacity * 5:
+        algo_state['doorkeeper'].clear()
+        algo_state['freq'] = {k: v // 2 for k, v in f.items() if v > 1}
+        algo_state['access_count'] = 0
+
+    # SLRU Management
+    if key in algo_state['protected']:
+        algo_state['protected'].move_to_end(key)
+    elif key in algo_state['probation']:
+        # Promote from Probation to Protected
+        val = algo_state['probation'].pop(key)
+        algo_state['protected'][key] = val
+        algo_state['protected_size'] += val
+
+        # Enforce Protected Limit (80% of capacity)
+        limit = int(cache_snapshot.capacity * 0.8)
+        while algo_state['protected_size'] > limit and algo_state['protected']:
+            k, v = algo_state['protected'].popitem(last=False)
+            algo_state['protected_size'] -= v
+            algo_state['probation'][k] = v
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Insert new object into Window and handle overflow to Probation.
+    '''
+    key = obj.key
+    size = obj.size
+    algo_state['access_count'] += 1
+
+    # Frequency Update
+    f = algo_state['freq']
+    f[key] = f.get(key, 0) + 1
+
+    # Insert into Window
+    algo_state['window'].append((key, size))
+    algo_state['window_size'] += size
+
+    # Check Window Overflow -> Move to Probation
+    w_cap = max(1, int(cache_snapshot.capacity * 0.01))
+    while algo_state['window_size'] > w_cap and algo_state['window']:
+        k, s = algo_state['window'].popleft()
+        algo_state['window_size'] -= s
+        algo_state['probation'][k] = s
+=======
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Insert new object into Window and handle overflow to Probation.
+    '''
+    key = obj.key
+    size = obj.size
+    algo_state['access_count'] += 1
+
+    # Frequency Update
+    f = algo_state['freq']
+    dk = algo_state['doorkeeper']
+
+    if key in f:
+        f[key] = min(f[key] + 1, 15)
+    elif key in dk:
+        dk.remove(key)
+        f[key] = 2
+    else:
+        dk.add(key)
+
+    # Aging (also on insert)
+    if algo_state['access_count'] > cache_snapshot.capacity * 5:
+        algo_state['doorkeeper'].clear()
+        algo_state['freq'] = {k: v // 2 for k, v in f.items() if v > 1}
+        algo_state['access_count'] = 0
+
+    # Insert into Window
+    algo_state['window'].append((key, size))
+    algo_state['window_size'] += size
+
+    # Check Window Overflow -> Move to Probation
+    w_cap = max(1, int(cache_snapshot.capacity * 0.01))
+    while algo_state['window_size'] > w_cap and algo_state['window']:
+        k, s = algo_state['window'].popleft()
+        algo_state['window_size'] -= s
+        algo_state['probation'][k] = s
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,217 @@
+<NAME>
+heat_based_victim_and_dynamic_insertion
+</NAME>
+
+<DESCRIPTION>
+I introduce a heat-based victim selection that blends lightweight frequency with recency, replacing the previous pure (freq, LRU) ordering. This keeps truly hot items while evicting cold/recently unused ones, and adapts differently for probation (recency-biased) and protected (frequency-biased) segments.
+
+I also add a small, stable p (probation share) adaptation based on where hits occur: probation hits slightly increase probation (improve recency discovery), and protected hits slightly decrease probation (favor frequency), complementing ARC’s ghost-driven adjustments.
+
+Finally, I refine the insertion policy: employ a dynamic LIP/MRU bias. By default, if ghost-protected dominates, new items get inserted slightly colder to protect the working set; otherwise they are inserted at MRU. The guard window after evicting a strong protected item is shortened and made less punitive to avoid over-suppressing newcomers. Ghost entries now store timestamps for better MRU maintenance.
+
+These changes aim to reduce misses across mixed workloads by improving victim choice, stabilizing adaptation, and avoiding scan pollution without over-penalizing new items.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def _min_by_freq_ts(seg_dict, cache_snapshot):
+    """Pick a victim by (frequency asc, timestamp asc) among keys present in cache."""
+    best_k = None
+    best_score = None
+    cache_keys = cache_snapshot.cache.keys()
+    for k, ts in seg_dict.items():
+        if k in cache_keys:
+            f = _freq.get(k, 0)
+            score = (f, ts)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_k = k
+    return best_k
+=======
+def _min_by_freq_ts(seg_dict, cache_snapshot):
+    """Pick a victim by heat = freq - lambda*age (min heat), tie-breaking by older timestamp."""
+    best_k = None
+    best_heat = None
+    best_ts = None
+    cache_keys = cache_snapshot.cache.keys()
+    now = cache_snapshot.access_count
+    # Determine segment to bias lambda
+    seg_name = 'prob' if seg_dict is _probation else ('prot' if seg_dict is _protected else 'prob')
+    lam_base = 1.0 / max(1, _cap_est)
+    lam = 1.5 * lam_base if seg_name == 'prob' else 0.5 * lam_base
+    for k, ts in seg_dict.items():
+        if k in cache_keys:
+            last_ts = ts if ts is not None else m_key_timestamp.get(k, now)
+            age = max(0, now - last_ts)
+            f = _freq.get(k, 0)
+            heat = float(f) - lam * float(age)
+            if best_heat is None or heat < best_heat or (heat == best_heat and last_ts < best_ts):
+                best_heat = heat
+                best_ts = last_ts
+                best_k = k
+    return best_k
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_key_timestamp, _probation, _protected, _freq
+    _ensure_capacity(cache_snapshot)
+    _maybe_age(cache_snapshot)
+    current_ts = cache_snapshot.access_count
+    k = obj.key
+
+    # Maintain a general timestamp ledger for robustness.
+    m_key_timestamp[k] = current_ts
+
+    # Increment lightweight frequency counter
+    _freq[k] = _freq.get(k, 0) + 1
+
+    if k in _probation:
+        # Promote to protected on second touch.
+        _probation.pop(k, None)
+        _protected[k] = current_ts
+    elif k in _protected:
+        # Refresh recency within protected.
+        _protected[k] = current_ts
+    else:
+        # Metadata miss: treat as a re-reference and place in protected.
+        _protected[k] = current_ts
+
+    # Respect ARC target for protected by demoting its LRU if needed.
+    _, t2_target = _get_targets(cache_snapshot)
+    if len(_protected) > t2_target:
+        demote_key = _lru_key_in(_protected, cache_snapshot)
+        if demote_key is not None and demote_key != k:
+            demote_ts = _protected.pop(demote_key)
+            _probation[demote_key] = demote_ts
+
+    # If present in ghosts, clear and bound ghost history
+    if k in _B1_ghost:
+        _B1_ghost.pop(k, None)
+    if k in _B2_ghost:
+        _B2_ghost.pop(k, None)
+    _ghost_trim()
+=======
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_key_timestamp, _probation, _protected, _freq, _p_target
+    _ensure_capacity(cache_snapshot)
+    _maybe_age(cache_snapshot)
+    current_ts = cache_snapshot.access_count
+    k = obj.key
+
+    # Maintain a general timestamp ledger for robustness.
+    m_key_timestamp[k] = current_ts
+
+    # Increment lightweight frequency counter
+    _freq[k] = _freq.get(k, 0) + 1
+
+    # Record pre-hit residency to guide gentle p adaptation
+    was_prob = (k in _probation)
+    was_prot = (k in _protected)
+
+    if was_prob:
+        # Promote to protected on reuse.
+        _probation.pop(k, None)
+        _protected[k] = current_ts
+    elif was_prot:
+        # Refresh recency within protected.
+        _protected[k] = current_ts
+    else:
+        # Metadata miss: treat as a re-reference and place in protected.
+        _protected[k] = current_ts
+
+    # Slight, stable p adaptation: probation hits -> increase T1; protected hits -> decrease T1.
+    step_up = 0.2
+    step_down = 0.1
+    if was_prob:
+        _p_target = min(float(_cap_est), _p_target + step_up)
+    elif was_prot:
+        _p_target = max(0.0, _p_target - step_down)
+
+    # Respect ARC target for protected by demoting its LRU if needed.
+    _, t2_target = _get_targets(cache_snapshot)
+    if len(_protected) > t2_target:
+        demote_key = _lru_key_in(_protected, cache_snapshot)
+        if demote_key is not None and demote_key != k:
+            demote_ts = _protected.pop(demote_key)
+            _probation[demote_key] = demote_ts
+
+    # If present in ghosts, clear and bound ghost history
+    if k in _B1_ghost:
+        _B1_ghost.pop(k, None)
+    if k in _B2_ghost:
+        _B2_ghost.pop(k, None)
+    _ghost_trim()
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    else:
+        # New to cache and ghosts: insert into probation
+        # If we recently had to evict a strong protected item, bias this newcomer as cold.
+        if current_ts <= _guard_until:
+            _probation[k] = current_ts - max(1, _cap_est)  # artificially older to prefer early eviction
+        else:
+            _probation[k] = current_ts
+        # Seed minimal frequency for new items
+        _freq[k] = _freq.get(k, 0)
+=======
+    else:
+        # New to cache and ghosts: insert into probation with dynamic insertion bias (LIP vs MRU).
+        lip_bias = 0
+        if current_ts <= _guard_until:
+            # Guard window after evicting strong protected entries: mild bias only.
+            lip_bias = max(1, _cap_est // 4)
+        else:
+            # If frequency ghosts dominate, bias colder to protect the working set; else insert MRU.
+            if len(_B1_ghost) <= len(_B2_ghost):
+                lip_bias = max(1, _cap_est // 6)
+        _probation[k] = current_ts - lip_bias if lip_bias > 0 else current_ts
+        # Seed minimal frequency for new items
+        _freq[k] = _freq.get(k, 0)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        if was_t1:
+            _B1_ghost[k] = True  # insert as MRU in ghost
+        elif was_t2:
+            _B2_ghost[k] = True
+            # If we had to evict a strong protected item, enable a short guard window.
+            if fval >= 2:
+                _guard_until = cache_snapshot.access_count + max(1, _cap_est // 2)
+        else:
+            # Unknown residency; default to B1
+            _B1_ghost[k] = True
+=======
+        now = cache_snapshot.access_count
+        if was_t1:
+            _B1_ghost[k] = now  # insert as MRU in ghost with timestamp
+        elif was_t2:
+            _B2_ghost[k] = now
+            # If we had to evict a strong protected item, enable a short guard window (shorter to avoid over-suppression).
+            if fval >= 2:
+                _guard_until = now + max(1, _cap_est // 4)
+        else:
+            # Unknown residency; default to B1
+            _B1_ghost[k] = now
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,267 @@
+--- a/original.py
++++ b/original.py
+@@ -1,150 +1,238 @@
+ # EVOLVE-BLOCK-START
+ """Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+ 
+ # Legacy timestamp dictionary kept for compatibility; used as a general access ledger.
+ m_key_timestamp = dict()
+ 
+ # Segmented LRU metadata: probation and protected segments (key -> last access time)
+ _probation = dict()
+ _protected = dict()
+ 
++# Ghost histories to adapt segment sizes (key -> last seen time when evicted)
++_ghost_probation = dict()
++_ghost_protected = dict()
++
++# Adaptive target for protected share (0..1). Start with a frequency bias.
++_prot_ratio = 0.66
++
++def _clamp(x, lo, hi):
++    return lo if x < lo else hi if x > hi else x
++
+ def _get_caps(cache_snapshot):
+-    """Compute target sizes for probation and protected segments."""
++    """Compute target sizes for probation and protected segments using adaptive ratio."""
++    global _prot_ratio
+     total_cap = max(int(getattr(cache_snapshot, "capacity", 1)), 1)
+-    # Favor protected segment to keep repeatedly used items
+-    prot_cap = max(int(total_cap * 0.66), 1 if total_cap > 1 else 0)
++    prot_cap = int(round(total_cap * _clamp(_prot_ratio, 0.1 if total_cap > 1 else 0.0, 0.9 if total_cap > 1 else 1.0)))
++    prot_cap = min(max(prot_cap, 1 if total_cap > 1 else 0), total_cap - 1 if total_cap > 1 else 1)
+     prob_cap = max(total_cap - prot_cap, 1)
+     return prob_cap, prot_cap
+ 
+ def _lru_key_in(seg_dict, cache_snapshot):
+     """Return the LRU key from seg_dict that is currently in the cache."""
+     min_key = None
+     min_ts = None
+-    # Iterate only over keys that are in the current cache snapshot
+     cache_keys = cache_snapshot.cache.keys()
+     for k, ts in seg_dict.items():
+         if k in cache_keys:
+             if (min_ts is None) or (ts < min_ts):
+                 min_ts = ts
+                 min_key = k
+     return min_key
+ 
++def _lru_key(seg_dict):
++    """Return the LRU key from seg_dict irrespective of cache presence."""
++    min_key = None
++    min_ts = None
++    for k, ts in seg_dict.items():
++        if (min_ts is None) or (ts < min_ts):
++            min_ts = ts
++            min_key = k
++    return min_key
++
++def _trim_ghosts(cache_snapshot):
++    """Keep ghost histories bounded to avoid memory growth."""
++    total_cap = max(int(getattr(cache_snapshot, "capacity", 1)), 1)
++    limit = max(2 * total_cap, 1)
++    # Remove oldest from the larger ghost first
++    while (len(_ghost_probation) + len(_ghost_protected)) > limit:
++        if len(_ghost_probation) >= len(_ghost_protected):
++            k = _lru_key(_ghost_probation)
++            if k is None:
++                break
++            _ghost_probation.pop(k, None)
++        else:
++            k = _lru_key(_ghost_protected)
++            if k is None:
++                break
++            _ghost_protected.pop(k, None)
++
+ def evict(cache_snapshot, obj):
+     '''
+     This function defines how the algorithm chooses the eviction victim.
+     - Args:
+         - `cache_snapshot`: A snapshot of the current cache state.
+         - `obj`: The new object that needs to be inserted into the cache.
+     - Return:
+         - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+     '''
+-    # Prefer evicting from the probation segment to protect re-referenced items.
+-    candid_obj_key = _lru_key_in(_probation, cache_snapshot)
+-    if candid_obj_key is None:
+-        # Fall back to protected segment if probation has no candidates in cache.
+-        candid_obj_key = _lru_key_in(_protected, cache_snapshot)
+-    if candid_obj_key is None:
++    global _prot_ratio
++    prob_cap, prot_cap = _get_caps(cache_snapshot)
++
++    # Adapt segment ratio using ghost hits of the incoming object
++    # If it was recently evicted from protected, we lacked protected capacity -> increase protected share.
++    # If it was evicted from probation, we favored frequency too much -> increase recency (decrease protected share).
++    step = 1.0 / max(10, max(int(getattr(cache_snapshot, "capacity", 1)), 1))
++    if obj.key in _ghost_protected and obj.key not in _ghost_probation:
++        _prot_ratio = _clamp(_prot_ratio + step, 0.1, 0.9)
++    elif obj.key in _ghost_probation and obj.key not in _ghost_protected:
++        _prot_ratio = _clamp(_prot_ratio - step, 0.1, 0.9)
++    # Recompute after potential adjustment
++    prob_cap, prot_cap = _get_caps(cache_snapshot)
++
++    # Choose eviction segment:
++    # - Prefer evicting from probation if it meets/exceeds its target or protected is small.
++    # - Otherwise evict from protected.
++    victim_key = None
++    if len(_probation) > 0 and (len(_probation) >= prob_cap or len(_protected) == 0):
++        victim_key = _lru_key_in(_probation, cache_snapshot)
++    if victim_key is None and len(_protected) > 0:
++        victim_key = _lru_key_in(_protected, cache_snapshot)
++
++    if victim_key is None:
+         # Last-resort fallback: pick any key from the cache (should rarely happen).
+         for k in cache_snapshot.cache:
+-            candid_obj_key = k
++            victim_key = k
+             break
+-    return candid_obj_key
++    return victim_key
+ 
+ def update_after_hit(cache_snapshot, obj):
+     '''
+     This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+     - Args:
+         - `cache_snapshot`: A snapshot of the current cache state.
+         - `obj`: The object accessed during the cache hit.
+     - Return: `None`
+     '''
+     global m_key_timestamp, _probation, _protected
+     current_ts = cache_snapshot.access_count
+     k = obj.key
+ 
+     # Maintain a general timestamp ledger for robustness.
+     m_key_timestamp[k] = current_ts
+ 
+     if k in _probation:
+         # Promote to protected on second touch.
+         _probation.pop(k, None)
+         _protected[k] = current_ts
+ 
+         # If protected exceeds capacity, demote its LRU back to probation.
+         prob_cap, prot_cap = _get_caps(cache_snapshot)
+         if len(_protected) > prot_cap:
+             demote_key = _lru_key_in(_protected, cache_snapshot)
+             if demote_key is not None and demote_key != k:
+                 demote_ts = _protected.pop(demote_key, current_ts)
+-                # Keep original timestamp to maintain proper LRU ordering in probation.
+                 _probation[demote_key] = demote_ts
+     elif k in _protected:
+         # Refresh recency within protected.
+         _protected[k] = current_ts
+     else:
+         # Metadata miss: treat as a re-reference and place in protected.
+         _protected[k] = current_ts
+         prob_cap, prot_cap = _get_caps(cache_snapshot)
+         if len(_protected) > prot_cap:
+             demote_key = _lru_key_in(_protected, cache_snapshot)
+             if demote_key is not None and demote_key != k:
+                 demote_ts = _protected.pop(demote_key, current_ts)
+                 _probation[demote_key] = demote_ts
+ 
+ def update_after_insert(cache_snapshot, obj):
+     '''
+     This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+     - Args:
+         - `cache_snapshot`: A snapshot of the current cache state.
+         - `obj`: The object that was just inserted into the cache.
+     - Return: `None`
+     '''
+-    global m_key_timestamp, _probation, _protected
++    global m_key_timestamp, _probation, _protected, _ghost_probation, _ghost_protected, _prot_ratio
+     current_ts = cache_snapshot.access_count
+     k = obj.key
+ 
+-    # Record in general ledger and place new entries in the probation segment.
++    # Record in general ledger.
+     m_key_timestamp[k] = current_ts
+-    _probation[k] = current_ts
+-
+-    # Optional hygiene: if probation grows too large relative to capacity, no immediate action is required.
+-    # Eviction will naturally prefer probation, which is desired.
++
++    # Admission using ghost hints: if recently evicted from protected, admit to protected directly.
++    if k in _ghost_protected and k not in _ghost_probation:
++        _ghost_protected.pop(k, None)
++        _protected[k] = current_ts
++        # Slightly favor protected due to reuse signal.
++        _prot_ratio = _clamp(_prot_ratio + (1.0 / max(20, max(int(getattr(cache_snapshot, "capacity", 1)), 1))), 0.1, 0.9)
++    else:
++        # Default: place into probation (also if present in probation ghost).
++        _ghost_probation.pop(k, None)
++        _probation[k] = current_ts
++
++    # Keep protected within its target by demoting LRU if necessary.
++    prob_cap, prot_cap = _get_caps(cache_snapshot)
++    if len(_protected) > prot_cap:
++        demote_key = _lru_key_in(_protected, cache_snapshot)
++        if demote_key is not None:
++            demote_ts = _protected.pop(demote_key, current_ts)
++            _probation[demote_key] = demote_ts
++
++    # Bound ghost histories
++    _trim_ghosts(cache_snapshot)
+ 
+ def update_after_evict(cache_snapshot, obj, evicted_obj):
+     '''
+     This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+     - Args:
+         - `cache_snapshot`: A snapshot of the current cache state.
+         - `obj`: The object to be inserted into the cache.
+         - `evicted_obj`: The object that was just evicted from the cache.
+     - Return: `None`
+     '''
+-    global m_key_timestamp, _probation, _protected
+-    # Remove evicted key from all metadata stores.
+-    if evicted_obj is not None:
+-        _probation.pop(evicted_obj.key, None)
+-        _protected.pop(evicted_obj.key, None)
+-        m_key_timestamp.pop(evicted_obj.key, None)
+-    # Do not add obj here; it will be handled in update_after_insert.
++    global m_key_timestamp, _probation, _protected, _ghost_probation, _ghost_protected
++    if evicted_obj is None:
++        return
++
++    k = evicted_obj.key
++    ts = cache_snapshot.access_count
++
++    # Move evicted key into the corresponding ghost history.
++    if k in _probation:
++        _probation.pop(k, None)
++        _ghost_probation[k] = ts
++    elif k in _protected:
++        _protected.pop(k, None)
++        _ghost_protected[k] = ts
++    else:
++        # Unknown to our metadata; assume it was probation.
++        _ghost_probation[k] = ts
++
++    # Clean general ledger
++    m_key_timestamp.pop(k, None)
++
++    # Bound ghost histories
++    _trim_ghosts(cache_snapshot)
+ 
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

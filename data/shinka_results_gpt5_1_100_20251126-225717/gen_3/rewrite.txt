@@ -1,0 +1,228 @@
+# EVOLVE-BLOCK-START
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads
+
+This implementation uses ARC (Adaptive Replacement Cache) to balance recency and frequency.
+It maintains:
+- T1: LRU list of recent items (in cache, seen once recently)
+- T2: LRU list of frequent items (in cache, seen multiple times)
+- B1: LRU ghost list for keys evicted from T1
+- B2: LRU ghost list for keys evicted from T2
+- p: target size for T1, adaptively tuned based on ghost hits
+
+We only change internal metadata and victim selection; inputs/outputs remain unchanged.
+"""
+
+from collections import OrderedDict
+
+# Legacy timestamp map kept for compatibility; not used by the ARC policy.
+m_key_timestamp = dict()
+
+# ARC state
+T1 = OrderedDict()  # resident recent keys
+T2 = OrderedDict()  # resident frequent keys
+B1 = OrderedDict()  # ghost for T1 evictions
+B2 = OrderedDict()  # ghost for T2 evictions
+arc_p = 0  # adaptive target size for T1
+
+
+def _move_to_mru(od: OrderedDict, key: str):
+    """Move key to MRU position in an OrderedDict (LRU at front)."""
+    if key in od:
+        od.move_to_end(key, last=True)
+    else:
+        od[key] = True  # value is dummy
+
+
+def _pop_lru_present(od: OrderedDict, present_keys: set):
+    """Pop the LRU key from od that is still present in 'present_keys'."""
+    # Iterate from LRU to MRU
+    for k in list(od.keys()):
+        if k in present_keys:
+            od.pop(k, None)
+            return k
+        else:
+            # Clean up stale keys
+            od.pop(k, None)
+    return None
+
+
+def _trim_ghosts_to_bound(capacity: int):
+    """Keep ghost lists total size bounded (<= 2 * capacity)."""
+    # Prefer to keep ghosts informative but bounded
+    limit = max(2 * capacity, 1)
+    # Remove from oldest ghosts first (alternating B1 then B2 if needed)
+    # to avoid unbounded growth in long traces.
+    while len(B1) + len(B2) > limit:
+        if len(B1) > len(B2):
+            if B1:
+                B1.popitem(last=False)
+        else:
+            if B2:
+                B2.popitem(last=False)
+
+
+def evict(cache_snapshot, obj):
+    '''
+    Choose eviction victim using ARC's replace() policy.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object to evict.
+    '''
+    global arc_p
+
+    capacity = max(cache_snapshot.capacity, 1)
+    in_cache_keys = set(cache_snapshot.cache.keys())
+
+    # Adjust arc_p if this is a ghost hit (ARC's adaptation step)
+    b1_hit = obj.key in B1
+    b2_hit = obj.key in B2
+    if b1_hit and not b2_hit:
+        # Move target toward recency if B1 ghosts are hit
+        inc = max(1, len(B2) // max(1, len(B1)))
+        arc_p = min(capacity, arc_p + inc)
+    elif b2_hit and not b1_hit:
+        # Move target toward frequency if B2 ghosts are hit
+        dec = max(1, len(B1) // max(1, len(B2)))
+        arc_p = max(0, arc_p - dec)
+
+    # Ensure our resident sets contain only actual cache keys
+    for od in (T1, T2):
+        for k in list(od.keys()):
+            if k not in in_cache_keys:
+                od.pop(k, None)
+
+    # ARC replace() decision: evict from T1 or T2
+    # Prefer evicting from T1 if T1 is larger than p,
+    # or when incoming key is in B2 and T1 size equals p.
+    evict_from_T1 = False
+    if len(T1) > 0 and ((b2_hit and len(T1) == arc_p) or (len(T1) > arc_p)):
+        evict_from_T1 = True
+    elif len(T2) == 0 and len(T1) > 0:
+        evict_from_T1 = True
+
+    if evict_from_T1:
+        victim = _pop_lru_present(T1, in_cache_keys)
+        if victim is not None:
+            return victim
+
+    # Else evict from T2
+    victim = _pop_lru_present(T2, in_cache_keys)
+    if victim is not None:
+        return victim
+
+    # Fallback: if metadata out of sync, evict LRU among all tracked or any cached key
+    # Try B1/B2 cleanups and then fallback to arbitrary cache key to ensure progress.
+    if cache_snapshot.cache:
+        # Best-effort LRU fallback using access order of T1+T2 if available
+        for k in list(T1.keys()) + list(T2.keys()):
+            if k in in_cache_keys:
+                return k
+        # Arbitrary fallback
+        return next(iter(cache_snapshot.cache.keys()))
+    return None
+
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    Update metadata after a cache hit.
+    - Promote from T1 to T2 on first reuse.
+    - Refresh position within T2 on subsequent hits.
+    '''
+    key = obj.key
+    # If key was in T1 (first reuse), move to T2
+    if key in T1:
+        T1.pop(key, None)
+        _move_to_mru(T2, key)
+    else:
+        # Keep it hot in T2
+        _move_to_mru(T2, key)
+        # Defensive: if somehow not tracked (e.g., metadata drift), add to T2
+        if key not in T2:
+            _move_to_mru(T2, key)
+
+    # Cleanup: key should not be in ghosts if it's a hit
+    B1.pop(key, None)
+    B2.pop(key, None)
+
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Update metadata after inserting a new object.
+    - Cold miss: insert into T1 (recent).
+    - Ghost hit (key in B1 or B2): insert into T2 (frequent) and adapt p.
+    '''
+    global arc_p
+
+    key = obj.key
+    capacity = max(cache_snapshot.capacity, 1)
+
+    # If key already tracked (shouldn't happen on insert), normalize by removing
+    T1.pop(key, None)
+    T2.pop(key, None)
+
+    if key in B1:
+        # Ghost hit from T1: adapt toward recency, insert into T2
+        inc = max(1, len(B2) // max(1, len(B1)))
+        arc_p = min(capacity, arc_p + inc)
+        B1.pop(key, None)
+        _move_to_mru(T2, key)
+    elif key in B2:
+        # Ghost hit from T2: adapt toward frequency, insert into T2
+        dec = max(1, len(B1) // max(1, len(B2)))
+        arc_p = max(0, arc_p - dec)
+        B2.pop(key, None)
+        _move_to_mru(T2, key)
+    else:
+        # Cold miss: insert into T1
+        _move_to_mru(T1, key)
+
+    # Keep ghosts bounded
+    _trim_ghosts_to_bound(capacity)
+
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Update metadata after evicting the victim.
+    - Move victim from resident list (T1/T2) into corresponding ghost list (B1/B2).
+    - Trim ghost lists to keep memory bounded.
+    '''
+    capacity = max(cache_snapshot.capacity, 1)
+    vkey = evicted_obj.key
+
+    # If victim was tracked in T1/T2, move to respective ghost
+    if vkey in T1:
+        T1.pop(vkey, None)
+        _move_to_mru(B1, vkey)
+    elif vkey in T2:
+        T2.pop(vkey, None)
+        _move_to_mru(B2, vkey)
+    else:
+        # Unknown to our resident sets: treat as T1 victim by default for learning
+        _move_to_mru(B1, vkey)
+
+    # Ensure ghosts don't grow unbounded
+    _trim_ghosts_to_bound(capacity)
+
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

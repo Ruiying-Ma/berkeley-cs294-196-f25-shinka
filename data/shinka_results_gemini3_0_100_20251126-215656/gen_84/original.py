@@ -1,0 +1,156 @@
+# EVOLVE-BLOCK-START
+"""
+S3-FIFO with Extended Ghost and Conservative Rescue.
+Combines the extended history tracking of S3-FIFO-D-G with the clean,
+no-bonus rescue logic of the Inspiration program to balance scan-resistance and loop-capture.
+"""
+
+from collections import OrderedDict
+
+# Global structures
+# s_queue: Small FIFO queue (probationary)
+# m_queue: Main FIFO queue (protected)
+# ghost_registry: Keeps track of recently evicted keys to detect loops/recurrence
+# accessed_bits: Simulates reference bits for CLOCK-like policies within queues
+
+s_queue = OrderedDict()
+m_queue = OrderedDict()
+ghost_registry = OrderedDict()
+accessed_bits = set()
+
+def reset_globals_if_new_trace(cache_snapshot):
+    """
+    Heuristic to reset global state if a new trace starts.
+    We detect this if the cache size is very small (start of trace)
+    but our internal queues have leftover data.
+    """
+    global s_queue, m_queue, ghost_registry, accessed_bits
+    if len(cache_snapshot.cache) <= 1 and (len(s_queue) > 1 or len(m_queue) > 1):
+        s_queue.clear()
+        m_queue.clear()
+        ghost_registry.clear()
+        accessed_bits.clear()
+
+def evict(cache_snapshot, obj):
+    '''
+    Executes the S3-FIFO eviction policy with conditional demotion.
+    '''
+    capacity = cache_snapshot.capacity
+    # Target size for the small queue (10% of capacity, min 1)
+    s_target = max(int(capacity * 0.1), 1)
+
+    # Safety check for state consistency: if cache is full but queues are empty
+    if not s_queue and not m_queue:
+        return next(iter(cache_snapshot.cache))
+
+    while True:
+        # 1. Evict from Small Queue if it's too big OR Main is empty
+        # If Main is empty, we must evict from Small (if it has items)
+        if len(s_queue) > s_target or len(m_queue) == 0:
+            if not s_queue:
+                # Fallback if S is empty but M is not (logic implies M is 0 here, so both 0)
+                # But we checked both 0 above. So this handles rare edge cases.
+                if m_queue:
+                    candidate_key, _ = m_queue.popitem(last=False)
+                    return candidate_key
+                return next(iter(cache_snapshot.cache))
+
+            candidate_key, _ = s_queue.popitem(last=False) # FIFO head
+
+            if candidate_key in accessed_bits:
+                # Hit in S -> Promote to M (Probation passed)
+                accessed_bits.discard(candidate_key)
+                m_queue[candidate_key] = None
+            else:
+                # Victim found in S
+                # Record in Ghost to catch loops later
+                ghost_registry[candidate_key] = None
+                # Extended Ghost Size: 2x Capacity to catch longer loops (Trace 29 optimization)
+                if len(ghost_registry) > capacity * 2:
+                    ghost_registry.popitem(last=False)
+                return candidate_key
+
+        # 2. Evict from Main Queue
+        else:
+            # S is within target size, and M is not empty.
+            candidate_key, _ = m_queue.popitem(last=False) # FIFO head
+
+            if candidate_key in accessed_bits:
+                # Hit in M -> Reinsert at tail (Second Chance)
+                accessed_bits.discard(candidate_key)
+                m_queue[candidate_key] = None
+            else:
+                # Victim found in M
+                # Conditional Demotion: Demote to S only if S has room.
+                # If S is full (or above target), we drop the M-victim to prevent clogging S.
+                if len(s_queue) < s_target:
+                    s_queue[candidate_key] = None # Insert at tail of S
+                else:
+                    # Drop and add to Ghost
+                    ghost_registry[candidate_key] = None
+                    if len(ghost_registry) > capacity * 2:
+                        ghost_registry.popitem(last=False)
+                    return candidate_key
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    Mark object as accessed.
+    '''
+    accessed_bits.add(obj.key)
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Handle insertion:
+    - Reset globals if needed.
+    - Check Ghost for rescue (M).
+    - Else insert to Probation (S).
+    '''
+    reset_globals_if_new_trace(cache_snapshot)
+
+    key = obj.key
+
+    if key in ghost_registry:
+        # Rescue from Ghost -> Insert directly to Main
+        m_queue[key] = None
+        del ghost_registry[key]
+        # NO BONUS: Do not set accessed_bits.
+        # Item starts cold in M. Must be hit again to stick.
+        # This prevents one-hit wonders from ghost polluting M (Trace 12 optimization).
+        accessed_bits.discard(key)
+    else:
+        # New item -> Insert into Small (Probation)
+        s_queue[key] = None
+        # Reset access bit: Item starts cold
+        accessed_bits.discard(key)
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Clean up internal state after eviction.
+    '''
+    key = evicted_obj.key
+    accessed_bits.discard(key)
+    if key in s_queue:
+        del s_queue[key]
+    if key in m_queue:
+        del m_queue[key]
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

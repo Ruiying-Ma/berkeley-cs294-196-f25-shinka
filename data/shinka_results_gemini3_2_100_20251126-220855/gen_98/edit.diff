@@ -1,0 +1,214 @@
+--- a/original.py
++++ b/original.py
+@@ -1,165 +1,170 @@
+ # EVOLVE-BLOCK-START
+-"""S3-LRU with Windowed Promotion and Probabilistic Anchor"""
++"""S3-LRU with Static Anchoring, Global Ghost, and Jitter"""
+ import random
+ import itertools
+ 
+ # Global State
+ # s3_small: FIFO queue for the small segment (probation)
+ # s3_main: LRU queue for the main segment (protected)
+-# s3_ghost: Ghost cache for tracking eviction from small
++# s3_ghost: Ghost cache (Victim history)
+ # s3_freq: Frequency counter for objects (max 3)
+ s3_small = {}
+ s3_main = {}
+ s3_ghost = {}
+ s3_freq = {}
+ 
+ def evict(cache_snapshot, obj):
+     '''
+-    S3-LRU with Windowed Promotion and Probabilistic Anchor.
++    S3-LRU with Static Anchoring, Global Ghost, and Jitter.
+     
+-    Hybrid Strategy:
+-    - Main Segment: LRU with Second Chance. Best for strong temporal locality.
+-    - Small Segment: FIFO with Windowed Promotion.
+-      - Scans first K=5 items for any 'hot' item (freq > 0) to promote.
+-      - If none found, tries Probabilistic Promotion (1%) to anchor loop items.
+-      - If no promotion, evicts the HEAD (Strict FIFO). This preserves recency info 
+-        better than random eviction.
+-    - Ghost: 3x capacity to catch long-range recurrences.
++    Key Innovations:
++    1.  **Static Anchoring**: Uses `hash(key) % 100 == 0` to promote a fixed 1% subset 
++        of items from Small to Main regardless of frequency. This ensures that for 
++        loops larger than the cache (Trace 14), we anchor a portion of the data 
++        instead of thrashing everything.
++    2.  **Global Ghost**: Evictions from BOTH Small and Main go to the Ghost registry. 
++        This allows "warm" items evicted from Main (due to capacity pressure) to be 
++        quickly rescued if accessed again.
++    3.  **4x Ghost Capacity**: Larger history window to detect loops that significantly 
++        exceed cache size.
++    4.  **Windowed Random Eviction**: In Small, we scan a window. If no promotion, 
++        we pick a random victim. This adds robustness against synchronized arrival patterns.
+     '''
+     global s3_small, s3_main, s3_ghost, s3_freq
+ 
+     capacity = cache_snapshot.capacity
+     
+-    # Jittered Small Capacity (10% +/- 1%)
+-    # Noise breaks synchronized thrashing
++    # 1. Jittered Small Capacity (10% +/- 1%)
+     noise = max(1, int(capacity * 0.01))
+     s_capacity = max(1, int(capacity * 0.1) + random.randint(-noise, noise))
+ 
+-    # Extended Ghost Cleanup (3x)
+-    while len(s3_ghost) > 3 * capacity:
++    # 2. Ghost Cleanup (4x Capacity)
++    # Larger ghost for better scan/loop detection
++    while len(s3_ghost) > 4 * capacity:
+         s3_ghost.pop(next(iter(s3_ghost)))
+         
+     k_window = 5
+ 
+     while True:
+         # Decision: Small or Main?
+-        # Evict from Small if it's too big, or if Main is empty
++        # Evict from Small if larger than target, or if Main is empty
+         if len(s3_small) >= s_capacity or not s3_main:
+             if not s3_small:
+                 return None
+             
+-            # Windowed Scan for Promotion
+-            # Check first K items. If any is hot, promote it.
++            # Windowed Scan
+             candidates = list(itertools.islice(s3_small, k_window))
+             promoted_key = None
+             
+             for cand in candidates:
+                 freq = s3_freq.get(cand, 0)
+                 
+-                # 1. Merit Promotion (Hit in Small)
++                # A. Merit Promotion (Hit)
+                 if freq > 0:
+                     promoted_key = cand
+                     break
+                 
+-                # 2. Probabilistic Promotion (1%)
+-                # Anchors items from scan/loop patterns into Main
+-                if (cache_snapshot.access_count ^ hash(cand)) % 100 == 0:
++                # B. Static Anchoring (1%)
++                # Consistently anchors a random 1% subset of items.
++                # Critical for Trace 14 (Loop > Cache) to allow some hits.
++                if hash(cand) % 100 == 0:
+                     promoted_key = cand
+                     break
+             
+             if promoted_key:
+-                # Promote to Main
+                 s3_small.pop(promoted_key)
+                 s3_main[promoted_key] = None
+-                s3_freq[promoted_key] = 0 # Reset freq on promotion
+-                continue
+-                
+-            # No promotion candidate found in window.
+-            # Evict the Head (Strict FIFO).
+-            # We explicitly choose the Head (candidates[0]) to preserve the FIFO 
+-            # property for the eviction victim, which is optimal for Recency workloads.
+-            return candidates[0]
++                s3_freq[promoted_key] = 0 # Reset freq
++                continue # Retry eviction after state change
++
++            # No promotion? Evict from Small.
++            # Use Random from Window to reduce thrashing/synchronization
++            return random.choice(candidates)
+ 
+         else:
+             # Evict from Main (LRU + Second Chance)
+             candidate = next(iter(s3_main))
+             freq = s3_freq.get(candidate, 0)
+ 
+             if freq > 0:
+-                # Second Chance: Reinsert at MRU (tail) and decrement freq
++                # Second Chance
+                 s3_main.pop(candidate)
+-                s3_main[candidate] = None
++                s3_main[candidate] = None # Move to MRU
+                 s3_freq[candidate] = freq - 1
+                 continue
+             
++            # Evict from Main
+             return candidate
+ 
+ def update_after_hit(cache_snapshot, obj):
+     '''
+     On Hit:
+-    - Increment frequency (capped at 3).
+-    - If in Main, move to MRU (True LRU).
++    - Increment frequency (max 3).
++    - If in Main, move to MRU (LRU policy).
+     '''
+     global s3_freq, s3_main
+     key = obj.key
+     s3_freq[key] = min(s3_freq.get(key, 0) + 1, 3)
+ 
+     if key in s3_main:
+-        # LRU Update: Move to MRU
+         val = s3_main.pop(key)
+         s3_main[key] = val
+ 
+ def update_after_insert(cache_snapshot, obj):
+     '''
+     On Insert:
+-    - Check Ghost -> Main (Rescue).
+-    - Else -> Small (Probation).
++    - If in Ghost -> Rescue to Main.
++    - Else -> Insert to Small.
++    - Reset Frequency.
+     '''
+     global s3_small, s3_main, s3_ghost, s3_freq
+     key = obj.key
+     s3_freq[key] = 0
+ 
+     if key in s3_ghost:
+         s3_main[key] = None
+         s3_ghost.pop(key)
+     else:
+         s3_small[key] = None
+ 
+ def update_after_evict(cache_snapshot, obj, evicted_obj):
+     '''
+     On Evict:
+-    - Cleanup queues.
+-    - Small evictions go to Ghost.
++    - Add to Ghost (Global Victim Cache).
++    - Remove from queues and frequency map.
+     '''
+     global s3_small, s3_main, s3_ghost, s3_freq
+     key = evicted_obj.key
+ 
++    # Track eviction in Ghost, regardless of source
++    # This captures Small (probation fail) and Main (capacity eviction)
+     if key in s3_small:
+         s3_small.pop(key)
+-        s3_ghost[key] = None
+     elif key in s3_main:
+         s3_main.pop(key)
++        
++    s3_ghost[key] = None
+ 
+     if key in s3_freq:
+         s3_freq.pop(key)
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

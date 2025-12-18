@@ -1,0 +1,395 @@
+# EVOLVE-BLOCK-START
+"""S3Q Scan-Guarded SLRU with TinyLFU and Ghost-driven window adaptation
+
+Resident segments:
+- 'w': small window FIFO (recency burst absorption)
+- 'p': probation (testing area)
+- 'q': protected (frequent)
+
+Ghost sets:
+- Gp (m_ghost_b1_ts): keys evicted from recency side (w or p)
+- Gq (m_ghost_b2_ts): keys evicted from protected side (q)
+
+Adaptation:
+- m_target_p is repurposed as the target window size (|W|), adaptively tuned via ghost hits.
+- Asymmetric caps and ceiling ratios keep control responsive but stable.
+- Scan guarding inserts brand-new keys into probation during cold streaks, protecting Q.
+"""
+
+# Per-key resident metadata
+m_key_timestamp = dict()  # key -> last access time
+m_key_segment = dict()    # key -> 'w' | 'p' | 'q'
+
+# Ghost metadata (key -> last ghost timestamp)
+m_ghost_b1_ts = dict()  # Gp: evicted from recency side (w or p)
+m_ghost_b2_ts = dict()  # Gq: evicted from protected (q)
+
+# Adaptive window target (repurposed from previous name p)
+m_target_p = None  # desired size of |W|
+
+# Scan and ghost tracking
+m_last_ghost_hit_access = None
+m_last_ghost_hit_side = None  # 'Gp' or 'Gq'
+m_cold_streak = 0  # consecutive cold misses (not in ghosts)
+
+# TinyLFU-like frequency sketch with periodic decay
+m_freq = dict()              # key -> decaying frequency
+m_next_decay_access = None   # access threshold for next decay
+
+
+def _cap(cache_snapshot):
+    try:
+        return int(cache_snapshot.capacity)
+    except Exception:
+        # Fallback if capacity unknown; match number of cache entries
+        return max(1, len(cache_snapshot.cache))
+
+
+def _ensure_init(cache_snapshot):
+    global m_target_p, m_last_ghost_hit_access, m_cold_streak, m_next_decay_access
+    if m_target_p is None:
+        # Start with a modest window (20% of capacity)
+        m_target_p = max(1, _cap(cache_snapshot) // 5)
+    if m_last_ghost_hit_access is None:
+        m_last_ghost_hit_access = cache_snapshot.access_count
+    if m_cold_streak is None:
+        m_cold_streak = 0
+    if m_next_decay_access is None:
+        m_next_decay_access = cache_snapshot.access_count + max(8, _cap(cache_snapshot))
+
+
+def _maybe_decay_freq(cache_snapshot):
+    global m_freq, m_next_decay_access
+    _ensure_init(cache_snapshot)
+    if cache_snapshot.access_count >= (m_next_decay_access or 0):
+        if m_freq:
+            for k in list(m_freq.keys()):
+                newc = m_freq.get(k, 0) >> 1
+                if newc:
+                    m_freq[k] = newc
+                else:
+                    m_freq.pop(k, None)
+        m_next_decay_access = cache_snapshot.access_count + max(8, _cap(cache_snapshot))
+
+
+def _bump_freq(key, w=1):
+    try:
+        inc = max(1, int(w))
+    except Exception:
+        inc = 1
+    m_freq[key] = m_freq.get(key, 0) + inc
+
+
+def _segment_keys(cache_snapshot):
+    """Partition current residents by segment label."""
+    w_keys, p_keys, q_keys = [], [], []
+    for k in cache_snapshot.cache.keys():
+        seg = m_key_segment.get(k)
+        if seg == 'w':
+            w_keys.append(k)
+        elif seg == 'q':
+            q_keys.append(k)
+        else:
+            # default unknown to probation for safety
+            m_key_segment[k] = 'p'
+            p_keys.append(k)
+    return w_keys, p_keys, q_keys
+
+
+def _lru_key(keys):
+    if not keys:
+        return None
+    return min(keys, key=lambda k: m_key_timestamp.get(k, float('inf')))
+
+
+def _choose_victim(keys):
+    """Hybrid: prefer lowest freq, then oldest."""
+    if not keys:
+        return None
+    return min(keys, key=lambda k: (m_freq.get(k, 0), m_key_timestamp.get(k, float('inf'))))
+
+
+def _clamp_window_target(cap):
+    """Clamp window size to a reasonable band."""
+    global m_target_p
+    min_w = max(1, cap // 64)
+    max_w = max(1, cap // 2)
+    if m_target_p < min_w:
+        m_target_p = min_w
+    elif m_target_p > max_w:
+        m_target_p = max_w
+
+
+def _prune_ghosts(cache_snapshot):
+    """Keep total ghost size <= 2*cap; bias trimming opposite to last hit side."""
+    global m_ghost_b1_ts, m_ghost_b2_ts
+    cap = _cap(cache_snapshot)
+    limit = max(1, 2 * cap)
+    total = len(m_ghost_b1_ts) + len(m_ghost_b2_ts)
+    while total > limit:
+        # Prefer trimming the side opposite the last-hit side to retain the signal longer.
+        if m_last_ghost_hit_side == 'Gp' and m_ghost_b2_ts:
+            # trim oldest from Gq
+            v = min(m_ghost_b2_ts, key=m_ghost_b2_ts.get)
+            m_ghost_b2_ts.pop(v, None)
+        elif m_last_ghost_hit_side == 'Gq' and m_ghost_b1_ts:
+            # trim oldest from Gp
+            v = min(m_ghost_b1_ts, key=m_ghost_b1_ts.get)
+            m_ghost_b1_ts.pop(v, None)
+        else:
+            # Otherwise trim from the larger
+            if len(m_ghost_b1_ts) >= len(m_ghost_b2_ts):
+                if m_ghost_b1_ts:
+                    v = min(m_ghost_b1_ts, key=m_ghost_b1_ts.get)
+                    m_ghost_b1_ts.pop(v, None)
+                elif m_ghost_b2_ts:
+                    v = min(m_ghost_b2_ts, key=m_ghost_b2_ts.get)
+                    m_ghost_b2_ts.pop(v, None)
+            else:
+                if m_ghost_b2_ts:
+                    v = min(m_ghost_b2_ts, key=m_ghost_b2_ts.get)
+                    m_ghost_b2_ts.pop(v, None)
+                elif m_ghost_b1_ts:
+                    v = min(m_ghost_b1_ts, key=m_ghost_b1_ts.get)
+                    m_ghost_b1_ts.pop(v, None)
+        total = len(m_ghost_b1_ts) + len(m_ghost_b2_ts)
+
+
+def evict(cache_snapshot, obj):
+    """
+    Choose the eviction victim.
+    Policy:
+    - Maintain balance: prefer evicting from W if non-empty (fast recency filter).
+      If |W| exceeds target or obj ∈ Gq, shed W first.
+      If Q is bloated beyond a soft target, take one from Q (LRU) to refresh it.
+    - Otherwise default SLRU: evict from P if non-empty; else W; else Q.
+    - Ghost bias: if obj in Gq, favor evicting from recency side (W then P).
+                 if obj in Gp, favor evicting from Q.
+    Within any segment, use LRU for W/P and freq+LRU for Q.
+    """
+    _ensure_init(cache_snapshot)
+    cap = _cap(cache_snapshot)
+    _clamp_window_target(cap)
+    w_keys, p_keys, q_keys = _segment_keys(cache_snapshot)
+
+    # Keep ghosts disjoint from current residents
+    for k in cache_snapshot.cache.keys():
+        m_ghost_b1_ts.pop(k, None)
+        m_ghost_b2_ts.pop(k, None)
+
+    in_gp = obj.key in m_ghost_b1_ts
+    in_gq = obj.key in m_ghost_b2_ts
+
+    # Soft cap for protected segment to avoid hoarding stale items
+    p_min = max(1, cap // 8)
+    q_soft_max = max(1, cap - max(1, m_target_p) - p_min)
+
+    # If window is oversized or ghost suggests recency pressure, evict from W
+    if w_keys and (len(w_keys) > max(1, m_target_p) or in_gq):
+        victim = _lru_key(w_keys)
+        if victim is not None:
+            return victim
+
+    # Trim Q if it exceeds its soft target
+    if q_keys and (len(q_keys) > q_soft_max):
+        # Prefer LRU in Q to flush stale protected
+        victim = _lru_key(q_keys)
+        if victim is not None:
+            return victim
+
+    # Ghost-biased choice
+    if in_gp and q_keys:
+        victim = _choose_victim(q_keys)
+        if victim is not None:
+            return victim
+    if in_gq:
+        # Favor recency side
+        victim = _lru_key(w_keys) or _lru_key(p_keys)
+        if victim is not None:
+            return victim
+
+    # Default order: W -> P -> Q
+    victim = _lru_key(w_keys)
+    if victim is not None:
+        return victim
+    victim = _lru_key(p_keys)
+    if victim is not None:
+        return victim
+    victim = _choose_victim(q_keys)
+    return victim
+
+
+def update_after_hit(cache_snapshot, obj):
+    """
+    On hit:
+    - Refresh timestamp and bump frequency.
+    - SLRU promotions:
+        * W -> P (first hit graduates to probation)
+        * P -> Q (second hit graduates to protected)
+        * Q -> Q (refresh)
+    - Light idle drift: if no ghost hits for ~cap accesses, nudge window toward baseline.
+    - Keep ghosts disjoint.
+    """
+    global m_cold_streak, m_target_p, m_last_ghost_hit_access
+    _ensure_init(cache_snapshot)
+    _maybe_decay_freq(cache_snapshot)
+
+    now = cache_snapshot.access_count
+    cap = _cap(cache_snapshot)
+    base_w = max(1, cap // 5)
+
+    # Reset cold streak and update stats
+    m_cold_streak = 0
+    m_key_timestamp[obj.key] = now
+
+    seg = m_key_segment.get(obj.key, 'p')
+    # Promotion discipline
+    if seg == 'w':
+        m_key_segment[obj.key] = 'p'
+        _bump_freq(obj.key, 2)
+    elif seg == 'p':
+        m_key_segment[obj.key] = 'q'
+        _bump_freq(obj.key, 2)
+    else:
+        # seg == 'q' or unknown default
+        m_key_segment[obj.key] = 'q'
+        _bump_freq(obj.key, 1)
+
+    # Idle drift for window target (slowly home toward baseline without ghost signals)
+    if now - m_last_ghost_hit_access > cap:
+        if m_target_p > base_w:
+            m_target_p -= 1
+        elif m_target_p < base_w:
+            m_target_p += 1
+        _clamp_window_target(cap)
+
+    # Keep ghosts disjoint
+    m_ghost_b1_ts.pop(obj.key, None)
+    m_ghost_b2_ts.pop(obj.key, None)
+
+
+def update_after_insert(cache_snapshot, obj):
+    """
+    On insert (miss path):
+    - Adapt window size via ghost hits:
+        * If key ∈ Gp: increase window target (recency needs more room).
+        * If key ∈ Gq: decrease window target (protect frequency).
+      Use ceiling ratios and asymmetric caps; stronger decrease during cold streaks.
+    - Scan-guard insertion: default to probation P; during sustained cold streaks,
+      route to window W for quick shedding.
+    - On ghost hits, promote to Q immediately.
+    """
+    global m_target_p, m_last_ghost_hit_access, m_last_ghost_hit_side, m_cold_streak
+    _ensure_init(cache_snapshot)
+    _maybe_decay_freq(cache_snapshot)
+
+    cap = _cap(cache_snapshot)
+    _clamp_window_target(cap)
+
+    in_gp = obj.key in m_ghost_b1_ts
+    in_gq = obj.key in m_ghost_b2_ts
+
+    inc_cap = max(1, cap // 8)
+    dec_cap = max(1, (cap // 4) if m_cold_streak >= max(1, cap // 2) else (cap // 8))
+
+    # Default insertion is into probation; W is used as a scan guard only
+    seg = 'p'
+
+    if in_gp:
+        # Enlarge window (recency pressure)
+        denom = max(1, len(m_ghost_b1_ts))
+        numer = len(m_ghost_b2_ts)
+        raw_inc = max(1, (numer + denom - 1) // denom)  # ceil(|Gq|/|Gp|)
+        m_target_p = min(cap, m_target_p + min(inc_cap, raw_inc))
+        _clamp_window_target(cap)
+        seg = 'q'  # strong signal ⇒ direct protect
+        # Ghost bookkeeping
+        m_ghost_b1_ts.pop(obj.key, None)
+        m_ghost_b2_ts.pop(obj.key, None)
+        m_last_ghost_hit_access = cache_snapshot.access_count
+        m_last_ghost_hit_side = 'Gp'
+        m_cold_streak = 0
+        _bump_freq(obj.key, 3)
+    elif in_gq:
+        # Shrink window (favor frequency)
+        denom = max(1, len(m_ghost_b2_ts))
+        numer = len(m_ghost_b1_ts)
+        raw_dec = max(1, (numer + denom - 1) // denom)  # ceil(|Gp|/|Gq|)
+        m_target_p = max(0, m_target_p - min(dec_cap, raw_dec))
+        _clamp_window_target(cap)
+        seg = 'q'  # strong signal ⇒ direct protect
+        # Ghost bookkeeping
+        m_ghost_b2_ts.pop(obj.key, None)
+        m_ghost_b1_ts.pop(obj.key, None)
+        m_last_ghost_hit_access = cache_snapshot.access_count
+        m_last_ghost_hit_side = 'Gq'
+        m_cold_streak = 0
+        _bump_freq(obj.key, 4)
+    else:
+        # Cold miss: scan guard and gentle clamp
+        m_cold_streak += 1
+        # During sustained cold streaks, divert brand-new keys to window for quick eviction
+        if m_cold_streak >= max(1, cap // 3):
+            seg = 'w'
+        # Gentle clamp to reduce window if streak persists
+        if m_cold_streak % max(1, cap // 2) == 0:
+            m_target_p = max(0, m_target_p - max(1, cap // 16))
+            _clamp_window_target(cap)
+        _bump_freq(obj.key, 1)
+
+    # Install resident metadata
+    m_key_segment[obj.key] = seg
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+
+    # Ensure ghosts remain disjoint
+    m_ghost_b1_ts.pop(obj.key, None)
+    m_ghost_b2_ts.pop(obj.key, None)
+
+    # Control ghost history size
+    _prune_ghosts(cache_snapshot)
+
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    """
+    After eviction, move evicted resident to appropriate ghost:
+    - If evicted from Q → Gq
+    - Else (from W or P) → Gp
+    """
+    _ensure_init(cache_snapshot)
+
+    seg = m_key_segment.pop(evicted_obj.key, 'p')
+    m_key_timestamp.pop(evicted_obj.key, None)
+
+    ts = cache_snapshot.access_count
+    if seg == 'q':
+        m_ghost_b2_ts[evicted_obj.key] = ts  # Gq
+        m_ghost_b1_ts.pop(evicted_obj.key, None)
+    else:
+        m_ghost_b1_ts[evicted_obj.key] = ts  # Gp
+        m_ghost_b2_ts.pop(evicted_obj.key, None)
+
+    # Drop frequency accounting for evicted keys to avoid stale bias and memory growth
+    m_freq.pop(evicted_obj.key, None)
+
+    _prune_ghosts(cache_snapshot)
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

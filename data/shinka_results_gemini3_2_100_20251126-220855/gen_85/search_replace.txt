@@ -1,0 +1,216 @@
+<NAME>
+extended_ghost_and_rescue_boost
+</NAME>
+
+<DESCRIPTION>
+Improves the S3-FIFO algorithm by:
+1. Extending the Ghost registry capacity to 3x the cache size to better capture larger working sets and loops (e.g., Trace 14).
+2. Preserving frequency counters for items moved to the Ghost registry, instead of resetting them.
+3. Boosting the frequency of items rescued from Ghost to Main (setting to 1), granting them immediate protection from the next eviction cycle (Clock algorithm) in Main.
+4. Correctly managing frequency cleanup: removing it only when items are evicted from Main or fall out of the extended Ghost registry.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO Eviction Policy with Multi-bit Clock.
+    - S (Small): FIFO. Hits promote to Main.
+    - M (Main): Clock with 2-bit frequency (0-3).
+      - Items in M are evicted only if freq is 0.
+      - If freq > 0, decrement and reinsert (move to tail).
+    - G (Ghost): Tracks history for rescue.
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+    _check_reset(cache_snapshot)
+
+    capacity = cache_snapshot.capacity
+    # Target size for Small queue (10% of capacity)
+    s_capacity = max(1, int(capacity * 0.1))
+
+    # Lazy cleanup of ghost
+    while len(s3_ghost) > capacity:
+        # Remove oldest item (head of dict)
+        s3_ghost.pop(next(iter(s3_ghost)))
+
+    while True:
+        # Decision: Evict from Small or Main?
+        # Rule: Evict from Small if it exceeds its target size, OR if Main is empty.
+        if len(s3_small) >= s_capacity or not s3_main:
+            if not s3_small:
+                return None
+
+            candidate = next(iter(s3_small))
+            freq = s3_freq.get(candidate, 0)
+
+            if freq > 0:
+                # Hit in Small: Promote to Main
+                # Reset frequency to 0 upon entering Main (new probation)
+                s3_small.pop(candidate)
+                s3_main[candidate] = None
+                s3_freq[candidate] = 0
+                continue
+            else:
+                # Victim found in Small
+                return candidate
+
+        else:
+            # Evict from Main
+            candidate = next(iter(s3_main))
+            freq = s3_freq.get(candidate, 0)
+
+            if freq > 0:
+                # Hit in Main: Decrement frequency and reinsert at tail (Clock logic)
+                s3_main.pop(candidate)
+                s3_main[candidate] = None
+                s3_freq[candidate] = freq - 1
+                continue
+            else:
+                # Victim found in Main
+                return candidate
+=======
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO Eviction Policy with Multi-bit Clock.
+    - S (Small): FIFO. Hits promote to Main.
+    - M (Main): Clock with 2-bit frequency (0-3).
+      - Items in M are evicted only if freq is 0.
+      - If freq > 0, decrement and reinsert (move to tail).
+    - G (Ghost): Tracks history for rescue.
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+    _check_reset(cache_snapshot)
+
+    capacity = cache_snapshot.capacity
+    # Target size for Small queue (10% of capacity)
+    s_capacity = max(1, int(capacity * 0.1))
+
+    # Extended Ghost Registry: 3x Capacity
+    # Helps capturing larger loops and improves history retention.
+    g_capacity = int(capacity * 3)
+
+    # Lazy cleanup of ghost
+    while len(s3_ghost) > g_capacity:
+        # Remove oldest item (head of dict)
+        k = next(iter(s3_ghost))
+        s3_ghost.pop(k)
+        # Also clean up frequency to keep memory usage proportional
+        if k in s3_freq:
+            del s3_freq[k]
+
+    while True:
+        # Decision: Evict from Small or Main?
+        # Rule: Evict from Small if it exceeds its target size, OR if Main is empty.
+        if len(s3_small) >= s_capacity or not s3_main:
+            if not s3_small:
+                return None
+
+            candidate = next(iter(s3_small))
+            freq = s3_freq.get(candidate, 0)
+
+            if freq > 0:
+                # Hit in Small: Promote to Main
+                # Reset frequency to 0 upon entering Main (probation)
+                s3_small.pop(candidate)
+                s3_main[candidate] = None
+                s3_freq[candidate] = 0
+                continue
+            else:
+                # Victim found in Small
+                return candidate
+
+        else:
+            # Evict from Main
+            candidate = next(iter(s3_main))
+            freq = s3_freq.get(candidate, 0)
+
+            if freq > 0:
+                # Hit in Main: Decrement frequency and reinsert at tail (Clock logic)
+                s3_main.pop(candidate)
+                s3_main[candidate] = None
+                s3_freq[candidate] = freq - 1
+                continue
+            else:
+                # Victim found in Main
+                return candidate
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On Insert:
+    - If in Ghost, insert to Main (rescue).
+    - Else, insert to Small.
+    '''
+    _check_reset(cache_snapshot)
+    global s3_small, s3_main, s3_ghost, s3_freq
+    key = obj.key
+    s3_freq[key] = 0
+
+    if key in s3_ghost:
+        s3_main[key] = None
+        s3_ghost.pop(key)
+    else:
+        s3_small[key] = None
+=======
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On Insert:
+    - If in Ghost, insert to Main (rescue) and boost frequency.
+    - Else, insert to Small with freq 0.
+    '''
+    _check_reset(cache_snapshot)
+    global s3_small, s3_main, s3_ghost, s3_freq
+    key = obj.key
+
+    if key in s3_ghost:
+        # Rescue: Ghost -> Main
+        s3_main[key] = None
+        s3_ghost.pop(key)
+        # Boost frequency for rescued items to give them a second chance in Main
+        s3_freq[key] = 1
+    else:
+        # Insert New: Small
+        s3_small[key] = None
+        s3_freq[key] = 0
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    On Evict:
+    - Cleanup from queues.
+    - If evicted from Small, add to Ghost.
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+    key = evicted_obj.key
+
+    if key in s3_small:
+        s3_small.pop(key)
+        s3_ghost[key] = None
+    elif key in s3_main:
+        s3_main.pop(key)
+
+    if key in s3_freq:
+        s3_freq.pop(key)
+=======
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    On Evict:
+    - Cleanup from queues.
+    - If evicted from Small, add to Ghost (keep freq).
+    - If evicted from Main, drop (remove freq).
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+    key = evicted_obj.key
+
+    if key in s3_small:
+        # Evicted from Small -> Move to Ghost
+        s3_small.pop(key)
+        s3_ghost[key] = None
+        # Do NOT remove from s3_freq, keep history for Ghost
+    elif key in s3_main:
+        # Evicted from Main -> Drop
+        s3_main.pop(key)
+        if key in s3_freq:
+            del s3_freq[key]
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,136 @@
+# EVOLVE-BLOCK-START
+"""
+Two-Tier Ghost S3-FIFO (2TG-S3)
+Refines S3-FIFO with:
+1. Two-Tier Ghost Registry: Distinguishes ghosts from Small vs Main queues to enable origin-aware rescue.
+2. Two-Hit Probation: Requires two hits in the Small queue for promotion, filtering weak signals.
+3. Frequency Inheritance: Demoted Main items receive a 'credit', allowing quicker promotion if reused.
+4. Conditional Demotion: Main items are only demoted to Small if space permits, preventing scan pollution.
+"""
+
+from collections import OrderedDict
+
+# Global structures
+s_queue = OrderedDict()        # Small/Probationary Queue
+m_queue = OrderedDict()        # Main/Protected Queue
+ghost_s = OrderedDict()        # Ghost registry for items evicted from S
+ghost_m = OrderedDict()        # Ghost registry for items evicted from M
+accessed_bits = set()          # Tracks 'recently used' status (simulates reference bits)
+s_probation = set()            # Tracks S-items that have survived one eviction cycle (credit)
+
+def reset_globals_if_new_trace(cache_snapshot):
+    """Resets internal state if a new trace is detected based on cache size."""
+    global s_queue, m_queue, ghost_s, ghost_m, accessed_bits, s_probation
+    if len(cache_snapshot.cache) <= 1 and (len(s_queue) > 1 or len(m_queue) > 1):
+        s_queue.clear()
+        m_queue.clear()
+        ghost_s.clear()
+        ghost_m.clear()
+        accessed_bits.clear()
+        s_probation.clear()
+
+def evict(cache_snapshot, obj):
+    '''
+    Eviction logic with 2-tier ghosts and probation hysteresis.
+    '''
+    capacity = cache_snapshot.capacity
+    # Target size for S: 10% of capacity
+    s_target = max(int(capacity * 0.1), 1)
+
+    # Fallback for empty queues
+    if not s_queue and not m_queue:
+        return next(iter(cache_snapshot.cache))
+
+    while True:
+        # Policy: Evict from S if it exceeds target size OR if M is empty
+        if len(s_queue) > s_target or len(m_queue) == 0:
+            if not s_queue:
+                # Should not happen if m_queue is not empty, handled by loop logic
+                # If both empty, handled above. 
+                # This branch implies M has items.
+                candidate_key, _ = m_queue.popitem(last=False)
+                return candidate_key
+
+            candidate_key, _ = s_queue.popitem(last=False) # FIFO Head
+
+            if candidate_key in accessed_bits:
+                # Hit in S. Check probation status.
+                accessed_bits.discard(candidate_key)
+                
+                if candidate_key in s_probation:
+                    # Second hit (or inherited credit): Promote to M
+                    m_queue[candidate_key] = None
+                    s_probation.discard(candidate_key)
+                else:
+                    # First hit: Reinsert to S tail, grant probation credit
+                    s_queue[candidate_key] = None
+                    s_probation.add(candidate_key)
+            else:
+                # No hit in S: Evict
+                s_probation.discard(candidate_key)
+                # Add to Ghost S
+                ghost_s[candidate_key] = None
+                if len(ghost_s) > capacity:
+                    ghost_s.popitem(last=False)
+                return candidate_key
+
+        else:
+            # Evict from M
+            candidate_key, _ = m_queue.popitem(last=False) # FIFO Head
+
+            if candidate_key in accessed_bits:
+                # Hit in M: Second Chance -> Reinsert to M tail
+                accessed_bits.discard(candidate_key)
+                m_queue[candidate_key] = None
+            else:
+                # No hit in M: Candidate for eviction
+                # Conditional Demotion: Only demote to S if S is not full
+                if len(s_queue) < s_target:
+                    # Demote to S tail
+                    s_queue[candidate_key] = None
+                    # Frequency Inheritance: Give credit so it promotes on next hit
+                    s_probation.add(candidate_key)
+                else:
+                    # S is full: Evict directly (prevent pollution)
+                    # Add to Ghost M
+                    ghost_m[candidate_key] = None
+                    if len(ghost_m) > capacity:
+                        ghost_m.popitem(last=False)
+                    return candidate_key
+
+def update_after_hit(cache_snapshot, obj):
+    accessed_bits.add(obj.key)
+
+def update_after_insert(cache_snapshot, obj):
+    reset_globals_if_new_trace(cache_snapshot)
+    key = obj.key
+    
+    # Check Ghost Registries
+    if key in ghost_m:
+        # Rescue from Main Ghost -> Restore to Main
+        m_queue[key] = None
+        del ghost_m[key]
+    elif key in ghost_s:
+        # Rescue from Small Ghost -> Restore to Small
+        # We don't grant credit here; it must prove itself again in S
+        s_queue[key] = None
+        del ghost_s[key]
+        s_probation.discard(key)
+    else:
+        # New Item -> Insert to Small
+        s_queue[key] = None
+        s_probation.discard(key)
+    
+    # Reset access bit for the new insertion (starts cold)
+    accessed_bits.discard(key)
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    # Cleanup
+    key = evicted_obj.key
+    accessed_bits.discard(key)
+    s_probation.discard(key)
+    if key in s_queue:
+        del s_queue[key]
+    if key in m_queue:
+        del m_queue[key]
+# EVOLVE-BLOCK-END

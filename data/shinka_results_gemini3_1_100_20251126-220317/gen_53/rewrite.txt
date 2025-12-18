@@ -1,0 +1,172 @@
+# EVOLVE-BLOCK-START
+"""W-TinyLFU with optimized parameters"""
+
+# Globals
+g_window = dict()
+g_probation = dict()
+g_protected = dict()
+
+# Frequency Sketch
+g_freq = dict()
+g_doorkeeper = set()
+
+# Configuration
+g_window_limit = 0
+g_protected_limit = 0
+g_access_counter = 0
+
+def evict(cache_snapshot, obj):
+    '''
+    W-TinyLFU Eviction:
+    - Maintains Window (1%), Probation, Protected segments.
+    - If Window > Limit:
+        - TinyLFU duel: Window LRU vs Probation LRU.
+        - If Window LRU has higher freq, evict Probation LRU and move Window item to Probation.
+        - Else evict Window LRU.
+    - Else:
+        - Evict Probation LRU.
+    '''
+    global g_window, g_probation, g_protected, g_window_limit, g_freq, g_doorkeeper
+    
+    # Identify candidates (LRU is first in dict iteration)
+    window_candidate = next(iter(g_window)) if g_window else None
+    probation_candidate = next(iter(g_probation)) if g_probation else None
+    
+    # 1. Window Overflow Handling with Duel
+    # We only trigger the duel if the Window is exceeding its allowance.
+    if window_candidate is not None and len(g_window) > g_window_limit:
+        if probation_candidate is None:
+            return window_candidate
+        
+        # Frequencies
+        fw = g_freq.get(window_candidate, 0) + (1 if window_candidate in g_doorkeeper else 0)
+        fp = g_freq.get(probation_candidate, 0) + (1 if probation_candidate in g_doorkeeper else 0)
+        
+        # Bias: Favor Main by +1 to reduce churn
+        if fw > fp + 1:
+            # Window wins: Promote Window Candidate to Probation, Evict Probation Candidate
+            # Move window_candidate to Probation MRU
+            val = g_window.pop(window_candidate)
+            g_probation[window_candidate] = val
+            return probation_candidate
+        else:
+            # Main wins (or tie): Evict Window Candidate
+            return window_candidate
+            
+    # 2. Main Cache Full Handling (or Window small)
+    # Prefer evicting from Probation, then Protected
+    if probation_candidate is not None:
+        return probation_candidate
+    
+    if g_protected:
+        return next(iter(g_protected))
+        
+    # Fallback
+    if window_candidate is not None:
+        return window_candidate
+        
+    return next(iter(cache_snapshot.cache))
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    On Hit:
+    - Update Frequency.
+    - Update Position (LRU/MRU) and Segment.
+    '''
+    global g_window, g_probation, g_protected, g_freq, g_doorkeeper, g_protected_limit
+    
+    key = obj.key
+    
+    # Update Frequency (Cap at 15)
+    curr = g_freq.get(key, 0)
+    if curr < 15:
+        g_freq[key] = curr + 1
+        
+    # Segment Management
+    if key in g_window:
+        # Move to MRU
+        val = g_window.pop(key)
+        g_window[key] = val
+    elif key in g_probation:
+        # Promote to Protected MRU
+        val = g_probation.pop(key)
+        g_protected[key] = val
+        # Handle Protected Overflow: Demote LRU to Probation MRU
+        if len(g_protected) > g_protected_limit:
+            lru_p_key = next(iter(g_protected))
+            val_p = g_protected.pop(lru_p_key)
+            g_probation[lru_p_key] = val_p
+    elif key in g_protected:
+        # Move to MRU
+        val = g_protected.pop(key)
+        g_protected[key] = val
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On Insert (Miss):
+    - Initialize if needed.
+    - Update Frequency/Doorkeeper.
+    - Insert into Window.
+    - Periodic Reset.
+    '''
+    global g_window, g_probation, g_protected, g_freq, g_doorkeeper
+    global g_window_limit, g_protected_limit, g_access_counter
+    
+    capacity = cache_snapshot.capacity
+    
+    # Init
+    if cache_snapshot.access_count <= 1:
+        g_window.clear()
+        g_probation.clear()
+        g_protected.clear()
+        g_freq.clear()
+        g_doorkeeper.clear()
+        g_access_counter = 0
+        g_window_limit = max(1, int(capacity * 0.01))
+        # Main is 99%, Protected is 80% of Main
+        main = capacity - g_window_limit
+        g_protected_limit = int(main * 0.8)
+
+    key = obj.key
+    g_access_counter += 1
+    
+    # Update Frequency
+    if key not in g_doorkeeper:
+        g_doorkeeper.add(key)
+    else:
+        curr = g_freq.get(key, 0)
+        if curr < 15:
+            g_freq[key] = curr + 1
+
+    # Insert to Window MRU
+    g_window[key] = None
+    
+    # Aging / Reset
+    # 1. Clear Doorkeeper if too big
+    if len(g_doorkeeper) > capacity * 2:
+        g_doorkeeper.clear()
+        
+    # 2. Halve Frequencies periodically
+    if g_access_counter >= capacity * 10:
+        g_access_counter = 0
+        # Halve
+        for k in list(g_freq):
+            g_freq[k] //= 2
+            if g_freq[k] == 0:
+                del g_freq[k]
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    After Eviction:
+    - Remove from internal structure.
+    '''
+    global g_window, g_probation, g_protected
+    
+    key = evicted_obj.key
+    if key in g_window:
+        del g_window[key]
+    elif key in g_probation:
+        del g_probation[key]
+    elif key in g_protected:
+        del g_protected[key]
+# EVOLVE-BLOCK-END

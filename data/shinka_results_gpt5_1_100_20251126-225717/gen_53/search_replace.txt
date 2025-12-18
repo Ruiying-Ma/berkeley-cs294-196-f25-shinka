@@ -1,0 +1,193 @@
+<NAME>
+window_scan_guard_and_segment_bias
+</NAME>
+
+<DESCRIPTION>
+I propose three complementary improvements:
+
+1) Window-accurate scan detection: The previous scan-mode trigger used the global hit rate, which can spuriously activate early and suppress useful promotions. I add per-window hit/access counters and compute scan signals based on the last decay window only (using unique key density over the last window and its hit rate). This reduces false scan detection and helps workloads with intermittent locality (e.g., traces where performance previously regressed).
+
+2) Safer admission guard: The doorkeeper demoted new items to probation-LRU when their score was less than or equal to the last victim’s score. That over-penalized newcomers in many normal patterns. I change the condition to strictly less-than, so ties don’t get unfairly pushed to LRU, improving recency responsiveness.
+
+3) Segment-first bias under “all-hotter” pressure: In eviction selection, when all candidates are hotter than the incoming object, the old ordering would prefer evicting the lowest-score overall even if that was in protected. I re-order the candidate tuple to prefer evicting probation items ahead of protected when faced with hotter-than-incoming items, preserving hot sets better. I also slightly reduce the initial protected fraction to 0.75 to give a bit more room for probation recency without waiting for adaptation.
+
+These changes preserve all existing mechanisms (SLRU, decayed tiny-LFU counters, ghost-based readmission, and adaptive protected sizing), while making scan resistance more precise, admission smoother, and protected items less likely to be sacrificed unnecessarily. This should reduce miss rate across mixed workloads and avoid prior regressions on certain traces.
+
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+_PROTECTED_FRAC = 0.8        # target fraction of cache to allocate to protected segment
+_ADAPT_STEP = 0.02           # step used to adjust protected fraction within [0.05, 0.95]
+
+# Scan-resistance and two-touch gating (epoch-scoped, low overhead)
+_scan_mode = False
+_scan_mode_epochs_left = 0
+_epoch_unique = set()        # unique keys observed within the current decay window
+_touched_once = {}           # key -> epoch when first touched in probation (for two-touch in scan mode)
+=======
+# Start with a slightly lower protected share to give recency more runway.
+_PROTECTED_FRAC = 0.75       # target fraction of cache to allocate to protected segment
+_ADAPT_STEP = 0.02           # step used to adjust protected fraction within [0.05, 0.95]
+
+# Scan-resistance and two-touch gating (epoch-scoped, low overhead)
+_scan_mode = False
+_scan_mode_epochs_left = 0
+_epoch_unique = set()        # unique keys observed within the current decay window
+_touched_once = {}           # key -> epoch when first touched in probation (for two-touch in scan mode)
+
+# Window-local stats for accurate scan detection
+_last_epoch_hits = 0
+_last_epoch_accesses = 0
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def _maybe_age(cache_snapshot):
+    """Advance epoch based on access_count, and trim ghost lists and manage scan mode."""
+    global _epoch, _last_epoch_tick, _scan_mode, _scan_mode_epochs_left, _epoch_unique
+    _ensure_params(cache_snapshot)
+    if cache_snapshot.access_count - _last_epoch_tick >= _DECAY_WINDOW:
+        # Evaluate the last window's uniqueness and hit rate to detect scans
+        window = max(1, _DECAY_WINDOW)
+        unique_density = min(1.0, len(_epoch_unique) / float(window))
+        hit_rate = cache_snapshot.hit_count / max(1, float(cache_snapshot.access_count))
+        if unique_density > 0.7 and hit_rate < 0.2:
+            _scan_mode = True
+            _scan_mode_epochs_left = 1
+            # During scans, lean away from protected a bit
+            _decrease_protected()
+        else:
+            if _scan_mode_epochs_left > 0:
+                _scan_mode_epochs_left -= 1
+            _scan_mode = _scan_mode_epochs_left > 0
+        # Reset unique tracker for the new window
+        _epoch_unique.clear()
+
+        _epoch += 1
+        _last_epoch_tick = cache_snapshot.access_count
+        # Trim ghost histories to bounded size
+        limit = max(1, _GHOST_LIMIT_MULT * max(cache_snapshot.capacity, 1))
+        while len(_ghost_probation) > limit:
+            _ghost_probation.popitem(last=False)
+        while len(_ghost_protected) > limit:
+            _ghost_protected.popitem(last=False)
+=======
+def _maybe_age(cache_snapshot):
+    """Advance epoch based on access_count, and trim ghost lists and manage scan mode."""
+    global _epoch, _last_epoch_tick, _scan_mode, _scan_mode_epochs_left, _epoch_unique
+    global _last_epoch_hits, _last_epoch_accesses
+    _ensure_params(cache_snapshot)
+    if cache_snapshot.access_count - _last_epoch_tick >= _DECAY_WINDOW:
+        # Evaluate the last window's uniqueness and hit rate to detect scans (window-local)
+        window_accesses = max(1, cache_snapshot.access_count - _last_epoch_accesses)
+        window_hits = max(0, cache_snapshot.hit_count - _last_epoch_hits)
+        unique_density = min(1.0, len(_epoch_unique) / float(window_accesses))
+        window_hit_rate = window_hits / float(window_accesses)
+
+        if unique_density > 0.7 and window_hit_rate < 0.2:
+            _scan_mode = True
+            _scan_mode_epochs_left = 1
+            # During scans, lean away from protected a bit
+            _decrease_protected()
+        else:
+            if _scan_mode_epochs_left > 0:
+                _scan_mode_epochs_left -= 1
+            _scan_mode = _scan_mode_epochs_left > 0
+
+        # Reset unique tracker for the new window
+        _epoch_unique.clear()
+
+        _epoch += 1
+        _last_epoch_tick = cache_snapshot.access_count
+        _last_epoch_hits = cache_snapshot.hit_count
+        _last_epoch_accesses = cache_snapshot.access_count
+
+        # Trim ghost histories to bounded size
+        limit = max(1, _GHOST_LIMIT_MULT * max(cache_snapshot.capacity, 1))
+        while len(_ghost_probation) > limit:
+            _ghost_probation.popitem(last=False)
+        while len(_ghost_protected) > limit:
+            _ghost_protected.popitem(last=False)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Build candidate tuples from both segments' LRU sides
+    candidates = []
+    # Probation candidates
+    pkeys = _sample_lru_keys(_probation, prob_sample)
+    for idx, pk in enumerate(pkeys):
+        if pk in cache_snapshot.cache:
+            s = _score(pk)
+            hotter = 1 if (_ADMISSION_GUARD and s > incoming_score) else 0
+            segpref = 0  # probation preferred
+            candidates.append((hotter, s, segpref, idx, pk))
+    # Protected candidates
+    tkeys = _sample_lru_keys(_protected, prot_sample)
+    for idx, tk in enumerate(tkeys):
+        if tk in cache_snapshot.cache:
+            s = _score(tk)
+            hotter = 1 if (_ADMISSION_GUARD and s > incoming_score) else 0
+            segpref = 1  # protected less preferred
+            candidates.append((hotter, s, segpref, idx, tk))
+
+    if not candidates:
+        # Fallback: pick any key from cache if metadata got desynced
+        return next(iter(cache_snapshot.cache.keys()))
+
+    # Choose coldest by (hotter_than_incoming, score, segment preference, recency)
+    best = min(candidates)
+    candid_obj_key = best[4]
+=======
+    # Build candidate tuples from both segments' LRU sides
+    candidates = []
+    # Probation candidates
+    pkeys = _sample_lru_keys(_probation, prob_sample)
+    for idx, pk in enumerate(pkeys):
+        if pk in cache_snapshot.cache:
+            s = _score(pk)
+            hotter = 1 if (_ADMISSION_GUARD and s > incoming_score) else 0
+            segpref = 0  # probation preferred
+            # Prefer segment before score under hotter pressure: (hotter, segpref, score, recency, key)
+            candidates.append((hotter, segpref, s, idx, pk))
+    # Protected candidates
+    tkeys = _sample_lru_keys(_protected, prot_sample)
+    for idx, tk in enumerate(tkeys):
+        if tk in cache_snapshot.cache:
+            s = _score(tk)
+            hotter = 1 if (_ADMISSION_GUARD and s > incoming_score) else 0
+            segpref = 1  # protected less preferred
+            candidates.append((hotter, segpref, s, idx, tk))
+
+    if not candidates:
+        # Fallback: pick any key from cache if metadata got desynced
+        return next(iter(cache_snapshot.cache.keys()))
+
+    # Choose coldest by (hotter_than_incoming, segment preference, score, recency)
+    best = min(candidates)
+    candid_obj_key = best[4]
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            # Admission guard: if incoming is not hotter than last victim, insert cold at probation LRU
+            if _ADMISSION_GUARD and incoming_score <= _last_victim_score:
+                _probation[k] = None
+                _key_seg[k] = 'prob'
+                _probation.move_to_end(k, last=False)  # LRU side (deprioritize)
+=======
+            # Admission guard: if incoming is colder than last victim, insert cold at probation LRU
+            if _ADMISSION_GUARD and incoming_score < _last_victim_score:
+                _probation[k] = None
+                _key_seg[k] = 'prob'
+                _probation.move_to_end(k, last=False)  # LRU side (deprioritize)
+>>>>>>> REPLACE
+
+</DIFF>

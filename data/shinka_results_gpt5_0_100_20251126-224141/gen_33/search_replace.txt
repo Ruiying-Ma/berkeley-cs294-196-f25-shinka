@@ -1,0 +1,193 @@
+<NAME>
+arc_lfu_tuning_and_selective_freq
+</NAME>
+
+<DESCRIPTION>
+I propose four targeted improvements to the current ARC+LFU hybrid:
+
+1) Tighten LFU aging to be more responsive to workload changes. Reducing the AGE_INTERVAL_FACTOR (8→4) and the minimum interval (1000→500) accelerates decay of stale popularity, preventing outdated high-frequency items from being overly protected.
+
+2) Improve victim selection among the oldest candidates by adding a timestamp-based tie-breaker for equal frequencies. This prefers evicting the truly oldest in case of equal LFU scores.
+
+3) Increase the candidate sample size for LFU-based selection, scaling with capacity (up to 16 and at least 2). This improves the chance of identifying the least frequent among the older items without scanning the entire list.
+
+4) Make LFU counting more selective: stop bumping frequency on brand-new insertions (which pollute LFU with scan noise), but do bump on re-admission via ghost hits (B1/B2), as those indicate reuse. This aligns with TinyLFU-style wisdom while remaining within the ARC framework.
+
+These changes preserve ARC invariants, maintain ghost bookkeeping, and improve scan-resistance and stability, aiming to reduce miss rates across diverse traces.
+
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+AGE_INTERVAL_FACTOR = 8  # age every ~8×capacity accesses (at least 1000)
+=======
+AGE_INTERVAL_FACTOR = 4  # age every ~4×capacity accesses (at least 500)
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    interval = max(1000, arc_capacity * AGE_INTERVAL_FACTOR)
+=======
+    interval = max(500, arc_capacity * AGE_INTERVAL_FACTOR)
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def _pick_lfu_among_lru(od, sample_k):
+    # Among the k oldest in od, pick the key with the lowest frequency (ties by oldest)
+    if not od:
+        return None
+    k = max(1, sample_k)
+    best_key = None
+    best_freq = None
+    count = 0
+    for key in od.keys():
+        f = m_freq.get(key, 0)
+        if best_freq is None or f < best_freq:
+            best_freq = f
+            best_key = key
+        count += 1
+        if count >= k:
+            break
+    return best_key if best_key is not None else next(iter(od))
+=======
+def _pick_lfu_among_lru(od, sample_k):
+    # Among the k oldest in od, pick the key with the lowest frequency.
+    # Tie-break by oldest timestamp to better approximate true LRU for equals.
+    if not od:
+        return None
+    k = max(1, sample_k)
+    best_key = None
+    best_freq = None
+    best_ts = None
+    count = 0
+    for key in od.keys():
+        f = m_freq.get(key, 0)
+        ts = m_key_timestamp.get(key, float('inf'))
+        if (best_freq is None or
+            f < best_freq or
+            (f == best_freq and ts < best_ts)):
+            best_freq = f
+            best_ts = ts
+            best_key = key
+        count += 1
+        if count >= k:
+            break
+    return best_key if best_key is not None else next(iter(od))
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    sample_k = min(8, max(1, (arc_capacity if arc_capacity else 1) // 16))
+=======
+    sample_k = min(16, max(2, (arc_capacity if arc_capacity else 1) // 8))
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp, arc_p
+    _ensure_capacity(cache_snapshot)
+    _maybe_age(cache_snapshot)
+    key = obj.key
+    # Use boundary-aware step to prevent p overshoot
+    cap = arc_capacity if arc_capacity is not None else 1
+    step_cap = max(1, cap // 8)
+
+    # ARC admission policy
+    if key in arc_B1:
+        # Previously evicted from T1: favor recency by increasing p
+        ratio = max(1, len(arc_B2) // max(1, len(arc_B1)))
+        inc = min(ratio, step_cap, max(0, cap - arc_p))
+        arc_p = min(cap, arc_p + inc)
+        arc_B1.pop(key, None)
+        _move_to_mru(arc_T2, key)
+    elif key in arc_B2:
+        # Previously frequent: favor frequency by decreasing p
+        ratio = max(1, len(arc_B1) // max(1, len(arc_B2)))
+        dec = min(ratio, step_cap, arc_p)
+        arc_p = max(0, arc_p - dec)
+        arc_B2.pop(key, None)
+        _move_to_mru(arc_T2, key)
+    else:
+        # Brand new: insert into T1 (recent)
+        _move_to_mru(arc_T1, key)
+
+    # Bound p and keep ghosts disjoint with residents and trimmed
+    arc_p = min(max(arc_p, 0), cap)
+    arc_B1.pop(key, None)
+    arc_B2.pop(key, None)
+    _trim_ghosts()
+    # Track access time and initialize/update LFU
+    m_key_timestamp[key] = cache_snapshot.access_count
+    m_freq[key] = m_freq.get(key, 0) + 1
+
+    # Defensive: repair metadata drift if any
+    if (len(arc_T1) + len(arc_T2)) != len(cache_snapshot.cache):
+        _resync(cache_snapshot)
+=======
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp, arc_p, m_freq
+    _ensure_capacity(cache_snapshot)
+    _maybe_age(cache_snapshot)
+    key = obj.key
+    # Use boundary-aware step to prevent p overshoot
+    cap = arc_capacity if arc_capacity is not None else 1
+    step_cap = max(1, cap // 8)
+
+    was_ghost = False
+    # ARC admission policy
+    if key in arc_B1:
+        # Previously evicted from T1: favor recency by increasing p
+        ratio = max(1, len(arc_B2) // max(1, len(arc_B1)))
+        inc = min(ratio, step_cap, max(0, cap - arc_p))
+        arc_p = min(cap, arc_p + inc)
+        arc_B1.pop(key, None)
+        _move_to_mru(arc_T2, key)
+        was_ghost = True
+    elif key in arc_B2:
+        # Previously frequent: favor frequency by decreasing p
+        ratio = max(1, len(arc_B1) // max(1, len(arc_B2)))
+        dec = min(ratio, step_cap, arc_p)
+        arc_p = max(0, arc_p - dec)
+        arc_B2.pop(key, None)
+        _move_to_mru(arc_T2, key)
+        was_ghost = True
+    else:
+        # Brand new: insert into T1 (recent)
+        _move_to_mru(arc_T1, key)
+
+    # Bound p and keep ghosts disjoint with residents and trimmed
+    arc_p = min(max(arc_p, 0), cap)
+    arc_B1.pop(key, None)
+    arc_B2.pop(key, None)
+    _trim_ghosts()
+    # Track access time; bump frequency only for ghost re-admissions (reuse signal)
+    m_key_timestamp[key] = cache_snapshot.access_count
+    if was_ghost:
+        m_freq[key] = m_freq.get(key, 0) + 1
+
+    # Defensive: repair metadata drift if any
+    if (len(arc_T1) + len(arc_T2)) != len(cache_snapshot.cache):
+        _resync(cache_snapshot)
+>>>>>>> REPLACE
+
+</DIFF>

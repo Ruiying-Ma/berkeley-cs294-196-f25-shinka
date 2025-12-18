@@ -1,0 +1,482 @@
+<NAME>
+arc_tinylfu_sampling_aging
+</NAME>
+
+<DESCRIPTION>
+I introduce three complementary improvements to the current ARC-inspired policy to reduce miss rate across diverse traces:
+
+1) Frequency-aware victim sampling: In evict(), instead of evicting the single LRU key from the chosen ARC segment, we sample a few LRU-side candidates (k ≈ 3–6 depending on capacity) and evict the one with the lowest observed frequency. This LFU-influenced tie-breaker preserves hotter items and is especially beneficial when recency alone is misleading. When ARC prefers T2, we additionally compare with T1’s sampled coldest to avoid evicting a hotter T2 key if T1 has a colder candidate.
+
+2) TinyLFU-lite with aging: We maintain a lightweight per-key frequency dictionary with periodic halving (adaptive aging) every ~4×capacity accesses. We bump on hits and inserts, cap counts, and prune zeros. This keeps the frequency signal fresh and prevents stale keys from being over-protected.
+
+3) Smarter admission and ARC steering: On insert, we perform hot admission to protected if the estimated frequency is high (≥3). We also compare the new key’s frequency to the last victim’s; if the newcomer is colder, we keep it probationary to avoid replacing a hotter resident. We move ghost-triggered adaptation from evict() to update_after_insert() and maintain protected target sizing by demoting protected LRU to probation when it grows too large. These steps improve scan resilience and speed up warmup for hot keys without starving recency.
+
+These changes preserve the ARC structure while adding frequency-sensitive choices and lightweight TinyLFU behavior, expected to improve hit rates across both recency-dominated and frequency-heavy workloads.
+
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+m_probation = OrderedDict()
+m_protected = OrderedDict()
+m_b1 = OrderedDict()
+m_b2 = OrderedDict()
+m_freq = dict()
+m_p = 0
+_m_last_seen_access = -1  # detect new traces to reset metadata
+=======
+m_probation = OrderedDict()
+m_protected = OrderedDict()
+m_b1 = OrderedDict()
+m_b2 = OrderedDict()
+m_freq = dict()
+m_p = 0
+_m_last_seen_access = -1  # detect new traces to reset metadata
+
+# New globals for TinyLFU-lite aging and victim sampling
+m_last_victim_key = None
+m_sample_k = 4
+m_last_decay_access = 0
+m_decay_interval = 512  # will be adjusted based on capacity
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def _reset_if_new_run(cache_snapshot):
+    """Reset metadata when a new trace/cache run starts."""
+    global m_probation, m_protected, m_b1, m_b2, m_freq, m_p, _m_last_seen_access
+    # New run if access counter restarts or at very beginning
+    if cache_snapshot.access_count <= 1 or _m_last_seen_access > cache_snapshot.access_count:
+        m_probation.clear()
+        m_protected.clear()
+        m_b1.clear()
+        m_b2.clear()
+        m_freq.clear()
+        m_p = 0
+    _m_last_seen_access = cache_snapshot.access_count
+=======
+def _reset_if_new_run(cache_snapshot):
+    """Reset metadata when a new trace/cache run starts."""
+    global m_probation, m_protected, m_b1, m_b2, m_freq, m_p, _m_last_seen_access
+    global m_last_victim_key, m_sample_k, m_last_decay_access, m_decay_interval
+    # New run if access counter restarts or at very beginning
+    if cache_snapshot.access_count <= 1 or _m_last_seen_access > cache_snapshot.access_count:
+        m_probation.clear()
+        m_protected.clear()
+        m_b1.clear()
+        m_b2.clear()
+        m_freq.clear()
+        m_p = 0
+        m_last_victim_key = None
+        cap = max(int(cache_snapshot.capacity), 1)
+        # sampling: 3..6 based on capacity
+        m_sample_k = max(3, min(6, cap // 16 or 3))
+        # aging interval proportional to capacity (with sane floor)
+        m_decay_interval = max(256, 4 * cap)
+        m_last_decay_access = cache_snapshot.access_count
+    _m_last_seen_access = cache_snapshot.access_count
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def _protected_target_size(cache_snapshot):
+    """Aim to keep most entries protected while leaving room in probation."""
+    cap = max(int(cache_snapshot.capacity), 1)
+    return max(1, int(cap * 0.8))
+=======
+def _protected_target_size(cache_snapshot):
+    """Aim to keep most entries protected while leaving room in probation."""
+    cap = max(int(cache_snapshot.capacity), 1)
+    return max(1, int(cap * 0.8))
+
+
+# --------- TinyLFU-lite helpers ---------
+def _maybe_age_freq(cache_snapshot):
+    """Periodically halve frequencies to age out stale history."""
+    global m_freq, m_last_decay_access, m_decay_interval
+    cap = max(int(cache_snapshot.capacity), 1)
+    if m_decay_interval <= 0:
+        m_decay_interval = max(256, 4 * cap)
+    if cache_snapshot.access_count - m_last_decay_access >= m_decay_interval:
+        to_del = []
+        for k, v in m_freq.items():
+            nv = v >> 1
+            if nv <= 0:
+                to_del.append(k)
+            else:
+                m_freq[k] = nv
+        for k in to_del:
+            m_freq.pop(k, None)
+        m_last_decay_access = cache_snapshot.access_count
+        # readjust interval if capacity changed
+        m_decay_interval = max(256, 4 * cap)
+
+
+def _freq_inc(key: str, amt: int = 1):
+    v = m_freq.get(key, 0) + amt
+    if v > 255:
+        v = 255
+    m_freq[key] = v
+
+
+def _pick_sampled_lru_min_freq(od: OrderedDict, sample_k: int) -> str:
+    """Sample a few LRU-side candidates and pick the one with lowest frequency."""
+    if not od:
+        return None
+    k = min(sample_k, len(od))
+    it = iter(od.keys())
+    min_key = None
+    min_f = None
+    for _ in range(k):
+        key = next(it)
+        f = m_freq.get(key, 0)
+        if min_f is None or f < min_f:
+            min_f = f
+            min_key = key
+    if min_key is None:
+        min_key = next(iter(od))
+    return min_key
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    global m_probation, m_protected, m_b1, m_b2, m_freq, m_p
+    _reset_if_new_run(cache_snapshot)
+    _prune_metadata(cache_snapshot)
+
+    # Seed metadata if empty by placing all current cache keys into probation.
+    if not m_probation and not m_protected and cache_snapshot.cache:
+        for k0 in cache_snapshot.cache.keys():
+            m_probation[k0] = None
+
+    # ARC: adjust target m_p based on ghost hit of incoming key
+    cap = max(int(cache_snapshot.capacity), 1)
+    k = obj.key
+    if k in m_b1:
+        delta = max(1, len(m_b2) // max(1, len(m_b1)))
+        m_p = min(cap, m_p + delta)
+    elif k in m_b2:
+        delta = max(1, len(m_b1) // max(1, len(m_b2)))
+        m_p = max(0, m_p - delta)
+
+    # ARC replacement decision (do not mutate structures here)
+    candid_obj_key = None
+    if m_probation and ((k in m_b2 and len(m_probation) == m_p) or (len(m_probation) > m_p)):
+        # Evict LRU from probation (T1)
+        candid_obj_key = next(iter(m_probation))
+    elif m_protected:
+        # Evict LRU from protected (T2)
+        candid_obj_key = next(iter(m_protected))
+    elif m_probation:
+        candid_obj_key = next(iter(m_probation))
+    else:
+        # Fallback: choose any key from the cache
+        for k_any in cache_snapshot.cache.keys():
+            candid_obj_key = k_any
+            break
+    return candid_obj_key
+=======
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    global m_probation, m_protected, m_b1, m_b2, m_freq, m_p, m_sample_k
+    _reset_if_new_run(cache_snapshot)
+    _prune_metadata(cache_snapshot)
+
+    # Seed metadata if empty by placing all current cache keys into probation.
+    if not m_probation and not m_protected and cache_snapshot.cache:
+        for k0 in cache_snapshot.cache.keys():
+            m_probation[k0] = None
+
+    cap = max(int(cache_snapshot.capacity), 1)
+    # adapt sampling to capacity
+    m_sample_k = max(3, min(6, cap // 16 or 3))
+
+    k_new = obj.key
+
+    # ARC replacement decision (do not mutate structures here)
+    choose_T1 = bool(m_probation) and ((k_new in m_b2 and len(m_probation) == m_p) or (len(m_probation) > m_p))
+
+    candid_obj_key = None
+    if choose_T1 and m_probation:
+        candid_obj_key = _pick_sampled_lru_min_freq(m_probation, m_sample_k)
+    elif m_protected:
+        # Prefer T2 per ARC, but avoid evicting hotter T2 when T1 has a colder key
+        t2_victim = _pick_sampled_lru_min_freq(m_protected, m_sample_k)
+        if m_probation:
+            t1_victim = _pick_sampled_lru_min_freq(m_probation, m_sample_k)
+            f_t2 = m_freq.get(t2_victim, 0)
+            f_t1 = m_freq.get(t1_victim, 0)
+            if f_t1 + 1 <= f_t2:
+                candid_obj_key = t1_victim
+            else:
+                candid_obj_key = t2_victim
+        else:
+            candid_obj_key = t2_victim
+    elif m_probation:
+        candid_obj_key = _pick_sampled_lru_min_freq(m_probation, m_sample_k)
+    else:
+        # Fallback: choose any key from the cache
+        for k_any in cache_snapshot.cache.keys():
+            candid_obj_key = k_any
+            break
+    return candid_obj_key
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_probation, m_protected, m_b1, m_b2, m_freq
+    _reset_if_new_run(cache_snapshot)
+    _prune_metadata(cache_snapshot)
+
+    k = obj.key
+    # Bump lightweight frequency (not central to ARC but harmless)
+    m_freq[k] = m_freq.get(k, 0) + 1
+
+    if k in m_protected:
+        # Refresh recency in protected
+        m_protected.move_to_end(k, last=True)
+    elif k in m_probation:
+        # Promote to protected on hit
+        m_probation.pop(k, None)
+        m_protected[k] = None
+    else:
+        # Metadata miss but cache hit: treat as hot and place into protected
+        m_protected[k] = None
+=======
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_probation, m_protected, m_b1, m_b2, m_freq
+    _reset_if_new_run(cache_snapshot)
+    _prune_metadata(cache_snapshot)
+
+    _maybe_age_freq(cache_snapshot)
+    k = obj.key
+    _freq_inc(k, 1)
+
+    if k in m_protected:
+        # Refresh recency in protected
+        m_protected.move_to_end(k, last=True)
+    elif k in m_probation:
+        # Promote to protected on hit
+        m_probation.pop(k, None)
+        m_protected[k] = None
+    else:
+        # Metadata miss but cache hit: treat as hot and place into protected
+        m_protected[k] = None
+
+    # Keep protected list within target by demoting its LRU into probation
+    prot_tgt = _protected_target_size(cache_snapshot)
+    if len(m_protected) > prot_tgt:
+        dem_k, _ = m_protected.popitem(last=False)
+        # Demote to probation (recency segment)
+        m_probation.pop(dem_k, None)
+        m_probation[dem_k] = None
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_probation, m_protected, m_b1, m_b2, m_freq
+    _reset_if_new_run(cache_snapshot)
+    _prune_metadata(cache_snapshot)
+
+    k = obj.key
+    # Remove any stale placements
+    m_protected.pop(k, None)
+    m_probation.pop(k, None)
+
+    # ARC admission: if key was in ghosts, insert to protected (T2); else to probation (T1)
+    if k in m_b1:
+        m_b1.pop(k, None)
+        m_protected[k] = None
+    elif k in m_b2:
+        m_b2.pop(k, None)
+        m_protected[k] = None
+    else:
+        m_probation[k] = None
+
+    # Light frequency credit
+    m_freq[k] = m_freq.get(k, 0) + 1
+
+    # Bound ghost sizes to capacity
+    cap = max(int(cache_snapshot.capacity), 1)
+    while len(m_b1) > cap:
+        m_b1.popitem(last=False)
+    while len(m_b2) > cap:
+        m_b2.popitem(last=False)
+=======
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_probation, m_protected, m_b1, m_b2, m_freq, m_p, m_last_victim_key
+    _reset_if_new_run(cache_snapshot)
+    _prune_metadata(cache_snapshot)
+
+    _maybe_age_freq(cache_snapshot)
+    k = obj.key
+    # Remove any stale placements
+    m_protected.pop(k, None)
+    m_probation.pop(k, None)
+
+    # Frequency credit on insertion (TinyLFU counts misses too)
+    _freq_inc(k, 1)
+
+    cap = max(int(cache_snapshot.capacity), 1)
+
+    # ARC adaptation on ghost hits; insert to protected if from ghosts
+    if k in m_b1:
+        delta = max(1, len(m_b2) // max(1, len(m_b1)))
+        m_p = min(cap, m_p + delta)
+        m_b1.pop(k, None)
+        m_protected[k] = None
+    elif k in m_b2:
+        delta = max(1, len(m_b1) // max(1, len(m_b2)))
+        m_p = max(0, m_p - delta)
+        m_b2.pop(k, None)
+        m_protected[k] = None
+    else:
+        # New key: admission decision using TinyLFU-lite and last victim comparison
+        hot_thresh = 3
+        new_f = m_freq.get(k, 0)
+        if m_last_victim_key is not None:
+            vict_f = m_freq.get(m_last_victim_key, 0)
+        else:
+            vict_f = -1
+        if new_f >= hot_thresh and new_f >= vict_f:
+            m_protected[k] = None
+        else:
+            m_probation[k] = None
+
+    # Keep protected within target by demoting its LRU into probation
+    prot_tgt = _protected_target_size(cache_snapshot)
+    if len(m_protected) > prot_tgt:
+        dem_k, _ = m_protected.popitem(last=False)
+        m_probation.pop(dem_k, None)
+        m_probation[dem_k] = None
+
+    # Bound ghost sizes to capacity
+    while len(m_b1) > cap:
+        m_b1.popitem(last=False)
+    while len(m_b2) > cap:
+        m_b2.popitem(last=False)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    global m_probation, m_protected, m_b1, m_b2
+    _reset_if_new_run(cache_snapshot)
+    # Move evicted object into appropriate ghost list
+    k = evicted_obj.key
+    if k in m_probation:
+        m_probation.pop(k, None)
+        m_b1.pop(k, None)
+        m_b1[k] = None  # MRU of B1
+    elif k in m_protected:
+        m_protected.pop(k, None)
+        m_b2.pop(k, None)
+        m_b2[k] = None  # MRU of B2
+    else:
+        # No segment info; do nothing
+        pass
+
+    # Bound ghost sizes to capacity
+    cap = max(int(cache_snapshot.capacity), 1)
+    while len(m_b1) > cap:
+        m_b1.popitem(last=False)
+    while len(m_b2) > cap:
+        m_b2.popitem(last=False)
+=======
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    global m_probation, m_protected, m_b1, m_b2, m_last_victim_key
+    _reset_if_new_run(cache_snapshot)
+    # Record the last victim for admission comparison
+    m_last_victim_key = evicted_obj.key
+
+    # Move evicted object into appropriate ghost list
+    k = evicted_obj.key
+    if k in m_probation:
+        m_probation.pop(k, None)
+        m_b1.pop(k, None)
+        m_b1[k] = None  # MRU of B1
+    elif k in m_protected:
+        m_protected.pop(k, None)
+        m_b2.pop(k, None)
+        m_b2[k] = None  # MRU of B2
+    else:
+        # Unknown segment: default to recency ghost (B1)
+        m_b1.pop(k, None)
+        m_b1[k] = None
+
+    # Bound ghost sizes to capacity
+    cap = max(int(cache_snapshot.capacity), 1)
+    while len(m_b1) > cap:
+        m_b1.popitem(last=False)
+    while len(m_b2) > cap:
+        m_b2.popitem(last=False)
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,201 @@
+# EVOLVE-BLOCK-START
+"""
+Adaptive W-TinyLFU (ARC-TinyLFU Hybrid).
+Combines W-TinyLFU's frequency-based admission (Doorkeeper, Aging, Duel) 
+with ARC's adaptive sizing for the Window vs Main split.
+"""
+from collections import OrderedDict
+
+# Global State
+algo_state = {
+    'window': OrderedDict(),    # key -> size (LRU first)
+    'probation': OrderedDict(), # key -> size (LRU first)
+    'protected': OrderedDict(), # key -> size (LRU first)
+    'w_size': 0,
+    'prob_size': 0,
+    'prot_size': 0,
+    'freq': {},                 # key -> count
+    'doorkeeper': set(),        # One-hit wonder filter
+    'ghost': OrderedDict(),     # key -> 'w' or 'm'
+    'w_ratio': 0.01,            # Ratio of cache for Window (adaptive)
+    'freq_counter': 0,
+    'max_time': 0
+}
+
+def _check_reset(cache_snapshot):
+    current_time = cache_snapshot.access_count
+    if current_time < algo_state['max_time']:
+        algo_state['window'].clear()
+        algo_state['probation'].clear()
+        algo_state['protected'].clear()
+        algo_state['w_size'] = 0
+        algo_state['prob_size'] = 0
+        algo_state['prot_size'] = 0
+        algo_state['freq'].clear()
+        algo_state['doorkeeper'].clear()
+        algo_state['ghost'].clear()
+        algo_state['w_ratio'] = 0.01
+        algo_state['freq_counter'] = 0
+        algo_state['max_time'] = 0
+    algo_state['max_time'] = current_time
+
+def _update_freq(key, capacity):
+    state = algo_state
+    
+    # Aging Mechanism (5x capacity reset)
+    state['freq_counter'] += 1
+    if state['freq_counter'] >= capacity * 5:
+        state['freq_counter'] = 0
+        state['doorkeeper'].clear()
+        rem = []
+        for k, v in state['freq'].items():
+            nv = v // 2
+            if nv == 0: rem.append(k)
+            else: state['freq'][k] = nv
+        for k in rem: del state['freq'][k]
+
+    # Frequency Update
+    if key in state['freq']:
+        state['freq'][key] = min(state['freq'][key] + 1, 15)
+    elif key in state['doorkeeper']:
+        state['doorkeeper'].remove(key)
+        state['freq'][key] = 2
+    else:
+        state['doorkeeper'].add(key)
+
+def _get_freq(key):
+    if key in algo_state['freq']:
+        return algo_state['freq'][key]
+    if key in algo_state['doorkeeper']:
+        return 1
+    return 0
+
+def evict(cache_snapshot, obj):
+    _check_reset(cache_snapshot)
+    state = algo_state
+    capacity = cache_snapshot.capacity
+    
+    # Adaptive Window Capacity
+    w_cap = max(1, int(capacity * state['w_ratio']))
+    
+    # Candidates
+    cand_w_key = next(iter(state['window'])) if state['window'] else None
+    cand_m_key = None
+    if state['probation']:
+        cand_m_key = next(iter(state['probation']))
+    elif state['protected']:
+        cand_m_key = next(iter(state['protected']))
+    
+    if cand_w_key is None and cand_m_key is None: return None
+    if cand_w_key is None: return cand_m_key
+    if cand_m_key is None: return cand_w_key
+
+    fw = _get_freq(cand_w_key)
+    fm = _get_freq(cand_m_key)
+
+    # 1. Window Growing Phase
+    # If Window is smaller than target, we usually evict Main to let Window grow.
+    if state['w_size'] < w_cap:
+        # Exception: If Main victim is much more valuable, sacrifice Window instead.
+        if fm > fw + 5: 
+             return cand_w_key
+        return cand_m_key
+    
+    # 2. Window Full - Duel
+    # Tie-breaker bias towards Main (avoid churn)
+    if fw > fm: 
+        return cand_m_key
+    else:
+        return cand_w_key
+
+def update_after_hit(cache_snapshot, obj):
+    _check_reset(cache_snapshot)
+    state = algo_state
+    key = obj.key
+    capacity = cache_snapshot.capacity
+    
+    _update_freq(key, capacity)
+    
+    if key in state['window']:
+        state['window'].move_to_end(key)
+    elif key in state['protected']:
+        state['protected'].move_to_end(key)
+    elif key in state['probation']:
+        # Promote Probation -> Protected
+        val = state['probation'].pop(key)
+        state['prob_size'] -= val
+        state['protected'][key] = val
+        state['prot_size'] += val
+        
+        # Enforce Protected Limit (80% of Main Cache)
+        w_cap = max(1, int(capacity * state['w_ratio']))
+        m_cap = capacity - w_cap
+        limit = int(m_cap * 0.8)
+        
+        while state['prot_size'] > limit and state['protected']:
+            k, v = state['protected'].popitem(last=False)
+            state['prot_size'] -= v
+            state['probation'][k] = v
+            state['prob_size'] += v
+            state['probation'].move_to_end(k)
+
+def update_after_insert(cache_snapshot, obj):
+    _check_reset(cache_snapshot)
+    state = algo_state
+    key = obj.key
+    size = obj.size
+    capacity = cache_snapshot.capacity
+
+    # Adapt Window Ratio based on Ghost hits
+    if key in state['ghost']:
+        type_ = state['ghost'].pop(key)
+        step = 0.05
+        if type_ == 'w':
+            # Hit in ghost window -> Window was too small
+            state['w_ratio'] = min(0.99, state['w_ratio'] + step)
+        elif type_ == 'm':
+            # Hit in ghost main -> Main was too small
+            state['w_ratio'] = max(0.01, state['w_ratio'] - step)
+
+    _update_freq(key, capacity)
+    
+    # Insert to Window
+    state['window'][key] = size
+    state['w_size'] += size
+    
+    # Handle Overflow: Window -> Probation
+    w_cap = max(1, int(capacity * state['w_ratio']))
+    while state['w_size'] > w_cap and state['window']:
+        k, v = state['window'].popitem(last=False)
+        state['w_size'] -= v
+        state['probation'][k] = v
+        state['prob_size'] += v
+        state['probation'].move_to_end(k)
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    state = algo_state
+    key = evicted_obj.key
+    size = evicted_obj.size
+    
+    type_ = None
+    if key in state['window']:
+        del state['window'][key]
+        state['w_size'] -= size
+        type_ = 'w'
+    elif key in state['probation']:
+        del state['probation'][key]
+        state['prob_size'] -= size
+        type_ = 'm'
+    elif key in state['protected']:
+        del state['protected'][key]
+        state['prot_size'] -= size
+        type_ = 'm'
+    
+    # Add to ghost list
+    if type_:
+        state['ghost'][key] = type_
+        state['ghost'].move_to_end(key)
+        # Limit ghost size to capacity
+        if len(state['ghost']) > capacity:
+            state['ghost'].popitem(last=False)
+# EVOLVE-BLOCK-END

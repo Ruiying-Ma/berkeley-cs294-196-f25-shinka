@@ -1,0 +1,355 @@
+<NAME>
+w_tinylfu_slru
+</NAME>
+
+<DESCRIPTION>
+Implement a W-TinyLFU inspired algorithm using SLRU for the main cache and a Window for new items.
+- **Window Cache (5%)**: New items enter here. Acts as a filter for scans.
+- **Main Cache (95%)**: Split into Probation (20%) and Protected (80%) segments (SLRU).
+- **Admission Policy**: When the cache is full and Window is full, the eviction candidate from Window (LRU) competes with the eviction candidate from Main Probation (LRU) based on approximate frequency.
+- **Frequency Tracking**: Uses a simple counter with periodic aging (halving values) to approximate a frequency sketch.
+- **Tie-Breaking**: Prefers the Main cache victim (incumbent) if frequencies are equal, ensuring static caching behavior for loops larger than cache (Scan Resistance).
+This structure addresses the weakness of LRU/ARC on large loops and scans (Traces 14-19) while maintaining high hit rates on recency-biased workloads (Trace 27, 28) via the SLRU and Protected segment.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+# EVOLVE-BLOCK-START
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+from collections import deque
+
+# ARC with S3-FIFO Nursery State
+algo_state = {
+    'S': deque(),        # Small FIFO nursery
+    'S_set': set(),      # Fast lookup for S
+    'S_accessed': set(), # Track access in S
+    't1': {},    # key -> None (OrderedDict behavior for LRU)
+    't2': {},    # key -> None
+    'b1': {},    # key -> None
+    'b2': {},    # key -> None
+    'p': 0.0,    # Target size of T1
+    'max_time': 0
+}
+
+def _check_reset(current_time):
+    if current_time < algo_state['max_time']:
+        algo_state['S'].clear()
+        algo_state['S_set'].clear()
+        algo_state['S_accessed'].clear()
+        algo_state['t1'].clear()
+        algo_state['t2'].clear()
+        algo_state['b1'].clear()
+        algo_state['b2'].clear()
+        algo_state['p'] = 0.0
+        algo_state['max_time'] = 0
+    algo_state['max_time'] = current_time
+
+def evict(cache_snapshot, obj):
+    '''
+    Hybrid Eviction:
+    1. Check S (Nursery):
+       - If S is full (>10%), evict from S.
+       - Move accessed items from S to T1 (ARC).
+       - Evict unaccessed items from S.
+    2. If S not full, evict from ARC (T1/T2).
+    '''
+    S = algo_state['S']
+    S_set = algo_state['S_set']
+    S_accessed = algo_state['S_accessed']
+    t1 = algo_state['t1']
+    t2 = algo_state['t2']
+    b1 = algo_state['b1']
+    b2 = algo_state['b2']
+    p = algo_state['p']
+
+    capacity = cache_snapshot.capacity
+    target_S_size = max(1, int(capacity * 0.1))
+
+    victim = None
+
+    while victim is None:
+        evict_from_S = False
+        if len(S) > target_S_size:
+            evict_from_S = True
+        elif (len(t1) + len(t2)) == 0:
+            evict_from_S = True
+
+        if evict_from_S:
+            if not S: break
+            candidate = S[0]
+            if candidate in S_accessed:
+                S.popleft()
+                S_set.remove(candidate)
+                S_accessed.remove(candidate)
+                t1[candidate] = None
+            else:
+                victim = candidate
+        else:
+            curr_p = p
+            key = obj.key
+            if key in b1:
+                delta = 1
+                if len(b2) > len(b1): delta = len(b2) / len(b1)
+                curr_p = min(capacity, p + delta)
+            elif key in b2:
+                delta = 1
+                if len(b1) > len(b2): delta = len(b1) / len(b2)
+                curr_p = max(0, p - delta)
+
+            evict_t1 = False
+            if len(t1) > 0 and (len(t1) > curr_p or (key in b2 and len(t1) == int(curr_p))):
+                evict_t1 = True
+            elif len(t2) == 0:
+                evict_t1 = True
+
+            if evict_t1:
+                victim = next(iter(t1))
+            else:
+                victim = next(iter(t2))
+
+    return victim
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    Hit:
+    - If in S: Mark accessed.
+    - If in T1: Move to T2.
+    - If in T2: Move to T2 MRU.
+    '''
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+
+    if key in algo_state['S_set']:
+        algo_state['S_accessed'].add(key)
+    elif key in algo_state['t1']:
+        del algo_state['t1'][key]
+        algo_state['t2'][key] = None
+    elif key in algo_state['t2']:
+        del algo_state['t2'][key]
+        algo_state['t2'][key] = None
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Insert:
+    - If in Ghost (B1/B2): Update p, insert to T2 (skip S).
+    - Else: Insert to S.
+    '''
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+    t1 = algo_state['t1']
+    t2 = algo_state['t2']
+    b1 = algo_state['b1']
+    b2 = algo_state['b2']
+    p = algo_state['p']
+    capacity = cache_snapshot.capacity
+
+    if key in b1:
+        delta = 1
+        if len(b2) > len(b1):
+            delta = len(b2) / len(b1)
+        algo_state['p'] = min(capacity, p + delta)
+        del b1[key]
+        t2[key] = None
+
+    elif key in b2:
+        delta = 1
+        if len(b1) > len(b2):
+            delta = len(b1) / len(b2)
+        algo_state['p'] = max(0, p - delta)
+        del b2[key]
+        t2[key] = None
+
+    else:
+        algo_state['S'].append(key)
+        algo_state['S_set'].add(key)
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Evict:
+    - If from S: Remove from S structures.
+    - If from T1/T2: Move to ghost, enforce ghost limits.
+    '''
+    v_key = evicted_obj.key
+
+    if v_key in algo_state['S_set']:
+        if algo_state['S'] and algo_state['S'][0] == v_key:
+            algo_state['S'].popleft()
+        else:
+            try: algo_state['S'].remove(v_key)
+            except ValueError: pass
+        algo_state['S_set'].remove(v_key)
+        if v_key in algo_state['S_accessed']:
+            algo_state['S_accessed'].remove(v_key)
+        return
+
+    t1 = algo_state['t1']
+    t2 = algo_state['t2']
+    b1 = algo_state['b1']
+    b2 = algo_state['b2']
+    capacity = cache_snapshot.capacity
+
+    if v_key in t1:
+        del t1[v_key]
+        b1[v_key] = None
+    elif v_key in t2:
+        del t2[v_key]
+        b2[v_key] = None
+
+    ghost_capacity = capacity * 2
+    while len(b1) + len(b2) > ghost_capacity:
+        if len(b1) > len(b2):
+             if b1: del b1[next(iter(b1))]
+        else:
+             if b2: del b2[next(iter(b2))]
+=======
+# EVOLVE-BLOCK-START
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+from collections import OrderedDict
+
+# W-TinyLFU inspired State
+algo_state = {
+    'window': OrderedDict(),    # Window Cache (SLRU or LRU)
+    'probation': OrderedDict(), # Main Cache - Probation (SLRU)
+    'protected': OrderedDict(), # Main Cache - Protected (SLRU)
+    'freq': {},                 # Frequency Counter
+    'freq_count': 0,            # Total increments for reset
+    'max_time': 0
+}
+
+def _check_reset(current_time):
+    if current_time < algo_state['max_time']:
+        algo_state['window'].clear()
+        algo_state['probation'].clear()
+        algo_state['protected'].clear()
+        algo_state['freq'].clear()
+        algo_state['freq_count'] = 0
+        algo_state['max_time'] = 0
+    algo_state['max_time'] = current_time
+
+def evict(cache_snapshot, obj):
+    '''
+    W-TinyLFU Eviction Logic
+    '''
+    window = algo_state['window']
+    probation = algo_state['probation']
+    protected = algo_state['protected']
+    freq = algo_state['freq']
+
+    capacity = cache_snapshot.capacity
+    w_cap = max(1, int(capacity * 0.05)) # 5% Window
+
+    # Candidates
+    candidate_w = next(iter(window)) if window else None
+
+    # Main Candidate: Probation LRU, else Protected LRU
+    candidate_m = None
+    if probation:
+        candidate_m = next(iter(probation))
+    elif protected:
+        candidate_m = next(iter(protected))
+
+    victim = None
+
+    # 1. If Window needs space (is below target), grow it by evicting Main
+    # (Unless Main is empty, then evict Window)
+    if len(window) < w_cap and candidate_m:
+        victim = candidate_m
+    elif not candidate_m:
+        victim = candidate_w
+    elif not candidate_w:
+        victim = candidate_m
+    else:
+        # 2. Window is full. Duel.
+        # Compare frequency
+        fw = freq.get(candidate_w, 0)
+        fm = freq.get(candidate_m, 0)
+
+        # Tie-breaker: Prefer Main (Incumbent) -> Evict Window
+        # This provides scan and loop resistance
+        if fw > fm:
+            victim = candidate_m
+        else:
+            victim = candidate_w
+
+    return victim
+
+def update_after_hit(cache_snapshot, obj):
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+    window = algo_state['window']
+    probation = algo_state['probation']
+    protected = algo_state['protected']
+    freq = algo_state['freq']
+
+    # Frequency
+    freq[key] = freq.get(key, 0) + 1
+    algo_state['freq_count'] += 1
+    if algo_state['freq_count'] >= cache_snapshot.capacity * 10:
+        to_remove = []
+        for k in freq:
+            freq[k] //= 2
+            if freq[k] == 0: to_remove.append(k)
+        for k in to_remove: del freq[k]
+        algo_state['freq_count'] = 0
+
+    # Cache Maintenance
+    if key in window:
+        window.move_to_end(key)
+    elif key in protected:
+        protected.move_to_end(key)
+    elif key in probation:
+        # Promote
+        del probation[key]
+        protected[key] = None
+
+        # Enforce Protected Limit
+        w_cap = max(1, int(cache_snapshot.capacity * 0.05))
+        m_cap = cache_snapshot.capacity - w_cap
+        p_cap = int(m_cap * 0.8) # 80% of Main
+
+        while len(protected) > p_cap:
+            k, _ = protected.popitem(last=False)
+            probation[k] = None # Move to Probation MRU
+            probation.move_to_end(k)
+
+def update_after_insert(cache_snapshot, obj):
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+    freq = algo_state['freq']
+
+    # Frequency
+    freq[key] = freq.get(key, 0) + 1
+    algo_state['freq_count'] += 1
+    if algo_state['freq_count'] >= cache_snapshot.capacity * 10:
+        to_remove = []
+        for k in freq:
+            freq[k] //= 2
+            if freq[k] == 0: to_remove.append(k)
+        for k in to_remove: del freq[k]
+        algo_state['freq_count'] = 0
+
+    # Insert to Window MRU
+    algo_state['window'][key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    v_key = evicted_obj.key
+    window = algo_state['window']
+    probation = algo_state['probation']
+    protected = algo_state['protected']
+
+    if v_key in window:
+        del window[v_key]
+    elif v_key in probation:
+        del probation[v_key]
+    elif v_key in protected:
+        del protected[v_key]
+
+    # Check for Window promotion
+    # If we evicted Main, and Window is now > Cap (it wasn't evicted), move Window LRU to Probation
+    w_cap = max(1, int(cache_snapshot.capacity * 0.05))
+    if len(window) > w_cap:
+        k, _ = window.popitem(last=False)
+        probation[k] = None # To Probation MRU
+        probation.move_to_end(k)
+>>>>>>> REPLACE
+</DIFF>

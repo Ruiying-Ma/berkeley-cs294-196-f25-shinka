@@ -1,0 +1,276 @@
+<NAME>
+two_way_sampling_tinyLFU_gated
+</NAME>
+
+<DESCRIPTION>
+I introduce a two-way sampled, TinyLFU-gated eviction policy with a protected-segment bias and adaptive promotion thresholds. The main ideas:
+
+- In evict: Sample candidates from both probationary and protected segments, estimate TinyLFU frequencies for each, and choose the victim by comparing adjusted scores. We add a bias to protect the protected segment, avoid evicting protected items hotter than the incoming object, and respect the protected target size to retain hot sets. This approximates TinyLFU’s admission logic even though we cannot reject insertions.
+- In update_after_hit: Adapt the promotion threshold based on online signals. When hit-rate is high, promote more eagerly; during scan-like periods (long miss streaks), promote more conservatively. This reduces pollution while retaining hot items.
+- In update_after_insert: Early promotion for very hot items (based on TinyLFU estimates), with thresholds relaxed when the system is in a hot regime and tightened when scans are detected. This accelerates convergence to a good steady state on recurring popularity.
+- We continue to enforce the adaptive protected target via demotion, balancing recency (probation) and frequency (protected).
+
+These changes generally reduce misses across mixed workloads by making eviction aware of both the new object’s estimated value and the segments’ cold tails while stabilizing promotions/demotions to handle scans and phase shifts.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    _reset_if_new_run(cache_snapshot)
+    _prune_metadata(cache_snapshot)
+    _ensure_sketch(cache_snapshot)
+    _seed_from_cache(cache_snapshot)
+
+    # Prefer evicting from probation; fall back to protected when necessary.
+    if m_probation:
+        victim = _eviction_sample(cache_snapshot, m_probation, sample_k=8)
+        if victim is not None:
+            return victim
+    if m_protected:
+        victim = _eviction_sample(cache_snapshot, m_protected, sample_k=8)
+        if victim is not None:
+            return victim
+    # Fallback: choose any key from the cache
+    for k in cache_snapshot.cache.keys():
+        return k
+    return None
+=======
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    _reset_if_new_run(cache_snapshot)
+    _prune_metadata(cache_snapshot)
+    _ensure_sketch(cache_snapshot)
+    _seed_from_cache(cache_snapshot)
+
+    # TinyLFU-aware, two-way sampled choice with protected bias.
+    target_prot = _protected_target_size(cache_snapshot)
+    new_k = obj.key
+    new_f = _sketch_est(cache_snapshot, new_k)
+
+    cand_p = _eviction_sample(cache_snapshot, m_probation, sample_k=8) if m_probation else None
+    f_p = _sketch_est(cache_snapshot, cand_p) if cand_p is not None else None
+
+    cand_t = _eviction_sample(cache_snapshot, m_protected, sample_k=8) if m_protected else None
+    f_t = _sketch_est(cache_snapshot, cand_t) if cand_t is not None else None
+
+    # Decide victim.
+    if cand_p is None and cand_t is None:
+        # Fallback: choose any key from the cache
+        for k in cache_snapshot.cache.keys():
+            return k
+        return None
+    if cand_p is None:
+        return cand_t
+    if cand_t is None:
+        return cand_p
+
+    # Compute adjusted scores; lower is colder and more evictable.
+    score_p = f_p if f_p is not None else 0
+    score_t = (f_t if f_t is not None else 0) + 1  # bias to protect T2
+
+    # If protected is under target, heavily penalize evicting from it.
+    if len(m_protected) < target_prot:
+        score_t += 1_000_000
+
+    # Do not evict a protected candidate that is clearly hotter than the incoming object.
+    if f_t is not None and new_f + 1 < f_t:
+        score_t += 1_000_000
+
+    # Choose the colder candidate after adjustments.
+    if score_p <= score_t:
+        return cand_p
+    else:
+        return cand_t
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_miss_streak
+    _reset_if_new_run(cache_snapshot)
+    _prune_metadata(cache_snapshot)
+    _ensure_sketch(cache_snapshot)
+
+    k = obj.key
+    m_miss_streak = 0
+    # Learn frequency
+    _sketch_add(cache_snapshot, k, 1)
+
+    if k in m_protected:
+        # Refresh recency in protected
+        m_protected.move_to_end(k, last=True)
+    elif k in m_probation:
+        # Promote only if sufficiently frequent; else refresh in probation
+        if _sketch_est(cache_snapshot, k) >= 2:
+            m_probation.pop(k, None)
+            m_protected[k] = None
+        else:
+            m_probation.move_to_end(k, last=True)
+    else:
+        # Metadata miss but cache hit: re-admit conservatively
+        if _sketch_est(cache_snapshot, k) >= 2:
+            m_protected[k] = None
+        else:
+            m_probation[k] = None
+
+    # Keep protected near its target by demoting oldest if needed
+    target = _protected_target_size(cache_snapshot)
+    while len(m_protected) > target:
+        demote_k, _ = m_protected.popitem(last=False)  # LRU of protected
+        m_probation[demote_k] = None
+=======
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_miss_streak
+    _reset_if_new_run(cache_snapshot)
+    _prune_metadata(cache_snapshot)
+    _ensure_sketch(cache_snapshot)
+
+    k = obj.key
+    # Capture prior miss streak to adapt promotion aggressiveness
+    prev_miss = m_miss_streak
+    m_miss_streak = 0
+    # Learn frequency
+    _sketch_add(cache_snapshot, k, 1)
+
+    # Adaptive promotion threshold:
+    cap = max(1, int(cache_snapshot.capacity))
+    hr = (cache_snapshot.hit_count / cache_snapshot.access_count) if cache_snapshot.access_count > 0 else 0.0
+    promote_thr = 2
+    if hr >= 0.65:
+        promote_thr = 1
+    elif prev_miss > cap:
+        promote_thr = 3
+
+    est = _sketch_est(cache_snapshot, k)
+
+    if k in m_protected:
+        # Refresh recency in protected
+        m_protected.move_to_end(k, last=True)
+    elif k in m_probation:
+        # Promote only if sufficiently frequent; else refresh in probation
+        if est >= promote_thr:
+            m_probation.pop(k, None)
+            m_protected[k] = None
+        else:
+            m_probation.move_to_end(k, last=True)
+    else:
+        # Metadata miss but cache hit: re-admit conservatively/optimistically per threshold
+        if est >= promote_thr:
+            m_protected[k] = None
+        else:
+            m_probation[k] = None
+
+    # Keep protected near its target by demoting oldest if needed
+    target = _protected_target_size(cache_snapshot)
+    while len(m_protected) > target:
+        demote_k, _ = m_protected.popitem(last=False)  # LRU of protected
+        m_probation[demote_k] = None
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_miss_streak
+    _reset_if_new_run(cache_snapshot)
+    _prune_metadata(cache_snapshot)
+    _ensure_sketch(cache_snapshot)
+
+    k = obj.key
+    m_miss_streak += 1
+
+    # New items enter probation (doorkeeper credit to sketch)
+    _sketch_add(cache_snapshot, k, 1)
+    m_protected.pop(k, None)
+    m_probation.pop(k, None)
+    m_probation[k] = None
+
+    # Ensure protected doesn't exceed its target (shouldn't change on insert,
+    # but keep the invariant in case of out-of-band changes)
+    target = _protected_target_size(cache_snapshot)
+    while len(m_protected) > target:
+        demote_k, _ = m_protected.popitem(last=False)
+        m_probation[demote_k] = None
+=======
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_miss_streak
+    _reset_if_new_run(cache_snapshot)
+    _prune_metadata(cache_snapshot)
+    _ensure_sketch(cache_snapshot)
+
+    k = obj.key
+    m_miss_streak += 1
+
+    # Learn a bit on admission (doorkeeper credit to sketch)
+    _sketch_add(cache_snapshot, k, 1)
+    est = _sketch_est(cache_snapshot, k)
+
+    # Adaptive early promotion for known-hot items; resist during scans
+    cap = max(1, int(cache_snapshot.capacity))
+    hr = (cache_snapshot.hit_count / cache_snapshot.access_count) if cache_snapshot.access_count > 0 else 0.0
+    hot_thr = 4
+    if hr >= 0.6:
+        hot_thr = 3
+    if m_miss_streak > cap:
+        hot_thr += 1
+
+    # Reposition in segments based on estimated hotness
+    m_protected.pop(k, None)
+    m_probation.pop(k, None)
+    if est >= hot_thr:
+        m_protected[k] = None
+    else:
+        m_probation[k] = None
+
+    # Ensure protected doesn't exceed its target (shouldn't change on insert,
+    # but keep the invariant in case of out-of-band changes)
+    target = _protected_target_size(cache_snapshot)
+    while len(m_protected) > target:
+        demote_k, _ = m_protected.popitem(last=False)
+        m_probation[demote_k] = None
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,195 @@
+# EVOLVE-BLOCK-START
+"""
+W-TinyLFU Optimized Implementation
+Improvements:
+1. Strict Incumbency Bias: Main cache victims require significant frequency advantage to be displaced.
+2. Decoupled Doorkeeper: Resets based on size (2x capacity) rather than aging timer.
+3. Fast Saturation: Max frequency cap reduced to 15 to adapt quickly to workload phases.
+4. Robust SLRU: Standard promotion/demotion with correct migration logic.
+"""
+
+from collections import OrderedDict
+
+class WTinyLFUState:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        # Configuration
+        self.window_limit = max(1, int(capacity * 0.01))
+        self.main_limit = capacity - self.window_limit
+        self.protected_limit = int(self.main_limit * 0.8)
+        
+        # Cache Segments
+        self.window = OrderedDict()
+        self.probation = OrderedDict()
+        self.protected = OrderedDict()
+        
+        # Frequency Sketch
+        self.freq = {}
+        self.doorkeeper = set()
+        self.access_counter = 0
+        
+        # Tuned Parameters
+        self.max_freq = 15                 # Low cap for fast adaptation
+        self.aging_interval = capacity * 10 # Slow aging to retain history
+        self.doorkeeper_limit = capacity * 2 # Size-based reset
+        
+    def get_freq(self, key):
+        # 1 from Doorkeeper + Value in CountMin
+        val = self.freq.get(key, 0)
+        if key in self.doorkeeper:
+            val += 1
+        return val
+    
+    def record_access(self, key):
+        self.access_counter += 1
+        
+        if key not in self.doorkeeper:
+            self.doorkeeper.add(key)
+        else:
+            # Increment frequency up to cap
+            curr = self.freq.get(key, 0)
+            if curr < self.max_freq:
+                self.freq[key] = curr + 1
+            
+        # Aging logic (Periodic Halving)
+        if self.access_counter >= self.aging_interval:
+            self.age_frequencies()
+            self.access_counter = 0
+            
+        # Doorkeeper Maintenance (Size-based)
+        if len(self.doorkeeper) > self.doorkeeper_limit:
+            self.doorkeeper.clear()
+            
+    def age_frequencies(self):
+        # Halve all frequencies
+        removals = []
+        for k, v in self.freq.items():
+            new_v = v // 2
+            if new_v == 0:
+                removals.append(k)
+            else:
+                self.freq[k] = new_v
+        for k in removals:
+            del self.freq[k]
+            
+    def maintain_slru_invariant(self):
+        # Enforce Protected segment size
+        while len(self.protected) > self.protected_limit:
+            # Demote from Protected LRU to Probation MRU
+            k, _ = self.protected.popitem(last=False)
+            self.probation[k] = None
+
+_state = None
+
+def get_state(cache_snapshot):
+    global _state
+    current_id = id(cache_snapshot.cache)
+    if _state is None or getattr(_state, 'cache_id', None) != current_id:
+        _state = WTinyLFUState(cache_snapshot.capacity)
+        _state.cache_id = current_id
+    
+    # Sync Check
+    total_len = len(_state.window) + len(_state.probation) + len(_state.protected)
+    if abs(total_len - len(cache_snapshot.cache)) > 5:
+        # Rebuild state (fail-safe)
+        _state = WTinyLFUState(cache_snapshot.capacity)
+        _state.cache_id = current_id
+        for k in cache_snapshot.cache:
+            _state.probation[k] = None
+            
+    return _state
+
+def evict(cache_snapshot, obj):
+    state = get_state(cache_snapshot)
+    
+    # Candidates
+    window_candidate = next(iter(state.window)) if state.window else None
+    probation_candidate = next(iter(state.probation)) if state.probation else None
+    if not probation_candidate and state.protected:
+        probation_candidate = next(iter(state.protected))
+        
+    # Policy:
+    # 1. Fill Window if possible (prefer evicting Main)
+    # 2. If Window full, Duel (Window LRU vs Main LRU)
+    
+    if len(state.window) < state.window_limit:
+        if probation_candidate:
+            return probation_candidate
+        return window_candidate or next(iter(cache_snapshot.cache))
+    else:
+        # Window Full - Duel
+        if window_candidate and probation_candidate:
+            freq_w = state.get_freq(window_candidate)
+            freq_p = state.get_freq(probation_candidate)
+            
+            # Incumbency Bias: Window item must be significantly better to displace Main
+            if freq_w > freq_p + 1:
+                return probation_candidate
+            else:
+                return window_candidate
+        elif window_candidate:
+            return window_candidate
+        elif probation_candidate:
+            return probation_candidate
+            
+    return next(iter(cache_snapshot.cache))
+
+def update_after_hit(cache_snapshot, obj):
+    state = get_state(cache_snapshot)
+    key = obj.key
+    state.record_access(key)
+    
+    if key in state.window:
+        state.window.move_to_end(key)
+    elif key in state.probation:
+        # Promote Probation -> Protected
+        del state.probation[key]
+        state.protected[key] = None
+        state.maintain_slru_invariant()
+    elif key in state.protected:
+        state.protected.move_to_end(key)
+
+def update_after_insert(cache_snapshot, obj):
+    state = get_state(cache_snapshot)
+    key = obj.key
+    state.record_access(key)
+    
+    # Insert into Window
+    state.window[key] = None
+    
+    # Admission: If Window full, migrate LRU to Probation
+    if len(state.window) > state.window_limit:
+        migrant_key, _ = state.window.popitem(last=False)
+        state.probation[migrant_key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    state = get_state(cache_snapshot)
+    key = evicted_obj.key
+    
+    if key in state.window:
+        del state.window[key]
+    elif key in state.probation:
+        del state.probation[key]
+    elif key in state.protected:
+        del state.protected[key]
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

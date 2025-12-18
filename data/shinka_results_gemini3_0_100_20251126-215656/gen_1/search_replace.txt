@@ -1,0 +1,169 @@
+<NAME>
+hyperbolic_caching_with_history
+</NAME>
+
+<DESCRIPTION>
+I propose replacing the LRU algorithm with a Hyperbolic Caching algorithm that also retains frequency history for evicted items (Ghost Cache).
+
+1.  **Hyperbolic Caching**: The eviction score is calculated as `Frequency / (CurrentTime - LastAccessTime)`.
+    *   Items with high frequency are protected (LFU-like).
+    *   Items recently accessed are protected (LRU-like).
+    *   The combined score effectively identifies the "active working set".
+    *   Unlike LRU, it resists cache pollution from scans if the working set is active (has high frequency and low age).
+    *   Unlike LFU, the "Age" factor in the denominator ensures that old high-frequency items eventually decay and get evicted, adapting to shifting workloads.
+
+2.  **Frequency History (Ghost Cache)**:
+    *   I added `m_key_frequency` to track the number of accesses for each key.
+    *   Crucially, `m_key_frequency` is *not* cleared upon eviction. When an item is re-inserted (e.g., in a looping pattern larger than the cache), it resumes with its previous frequency plus one. This helps the algorithm recognize cyclic patterns and potentially pin frequently recurring items better than stateless eviction.
+
+3.  **Tie-Breaking**:
+    *   If scores are equal, the algorithm defaults to LRU (evicting the item with the largest age), which is a robust fallback.
+
+4.  **Implementation Details**:
+    *   The score comparison `f1/a1 < f2/a2` is implemented as `f1*a2 < f2*a1` to avoid floating-point division and precision issues.
+    *   The algorithm iterates over the cache to find the victim with the minimum score.
+
+This approach addresses the low hit rates observed in trace metrics by handling both frequency-dominant and recency-dominant patterns better than simple LRU.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+
+m_key_timestamp = dict()
+
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    candid_obj_key = None
+    min_ts = min(m_key_timestamp.values())
+    candid_obj_keys = list(key for key in cache_snapshot.cache if m_key_timestamp[key] == min_ts)
+    candid_obj_key = candid_obj_keys[0]
+    return candid_obj_key
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_key_timestamp
+    assert obj.key in m_key_timestamp
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp
+    assert obj.key not in m_key_timestamp
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp
+    assert obj.key not in m_key_timestamp
+    assert evicted_obj.key in m_key_timestamp
+    m_key_timestamp.pop(evicted_obj.key)
+=======
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+
+m_key_timestamp = dict()
+m_key_frequency = dict()
+
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    Uses Hyperbolic Caching: Score = Frequency / (CurrentTime - LastAccessTime).
+    Evicts the object with the lowest score.
+    '''
+    current_time = cache_snapshot.access_count
+
+    # Find key with minimum hyperbolic score
+    # We compare f1/a1 < f2/a2 <=> f1*a2 < f2*a1 to avoid division and floats
+
+    min_key = None
+    min_freq = -1
+    min_age = -1
+
+    for key in cache_snapshot.cache:
+        # Safety check, though keys in cache should be in m_key_timestamp
+        if key not in m_key_timestamp: continue
+
+        freq = m_key_frequency.get(key, 1)
+        last_access = m_key_timestamp[key]
+        age = current_time - last_access
+        if age <= 0: age = 1
+
+        if min_key is None:
+            min_key = key
+            min_freq = freq
+            min_age = age
+        else:
+            # Compare current (freq, age) with min (min_freq, min_age)
+            # freq / age < min_freq / min_age  <=> freq * min_age < min_freq * age
+            val1 = freq * min_age
+            val2 = min_freq * age
+
+            if val1 < val2:
+                min_key = key
+                min_freq = freq
+                min_age = age
+            elif val1 == val2:
+                # Tie-breaker: LRU (oldest timestamp => largest age)
+                if age > min_age:
+                    min_key = key
+                    min_freq = freq
+                    min_age = age
+
+    return min_key
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    Update metadata after hit: update timestamp and increment frequency.
+    '''
+    global m_key_timestamp, m_key_frequency
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+    m_key_frequency[obj.key] = m_key_frequency.get(obj.key, 0) + 1
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Update metadata after insert: set timestamp, init or increment frequency (Ghost).
+    '''
+    global m_key_timestamp, m_key_frequency
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+    # Keep frequency history if available (Ghost Cache behavior)
+    if obj.key in m_key_frequency:
+        m_key_frequency[obj.key] += 1
+    else:
+        m_key_frequency[obj.key] = 1
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Update metadata after evict: remove timestamp, keep frequency.
+    '''
+    global m_key_timestamp
+    if evicted_obj.key in m_key_timestamp:
+        m_key_timestamp.pop(evicted_obj.key)
+    # We purposefully do NOT remove from m_key_frequency to retain history
+>>>>>>> REPLACE
+</DIFF>

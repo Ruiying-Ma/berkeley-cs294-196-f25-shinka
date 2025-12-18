@@ -1,0 +1,313 @@
+# EVOLVE-BLOCK-START
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+
+from collections import OrderedDict
+from itertools import islice
+
+
+class ARCPlus:
+    # Core ARC state
+    T1 = OrderedDict()   # recent, resident
+    T2 = OrderedDict()   # frequent, resident
+    B1 = OrderedDict()   # ghost of T1 (recent history)
+    B2 = OrderedDict()   # ghost of T2 (frequent history)
+    p = 0                # target size of T1 (in items)
+    capacity = None      # cache capacity (items)
+
+    # Aux state
+    ts = dict()          # key -> last access_count (for LRU tie-breaking/fallback)
+    last_ghost_hit_access = -1  # last access_count when B1/B2 was hit
+    cold_streak = 0               # count of consecutive brand-new inserts (no ghost)
+
+    @classmethod
+    def ensure_capacity(cls, cache_snapshot):
+        if cls.capacity is None:
+            cls.capacity = max(int(cache_snapshot.capacity), 1)
+
+    @classmethod
+    def move_to_mru(cls, od, key):
+        if key in od:
+            od.pop(key, None)
+        od[key] = True
+
+    @classmethod
+    def pop_lru(cls, od):
+        if od:
+            k, _ = od.popitem(last=False)
+            return k
+        return None
+
+    @classmethod
+    def trim_ghosts(cls):
+        # Keep total ghosts ≤ 2×capacity; bias trimming to proportional targets:
+        # |B1| ≈ 2C * (p/C) and |B2| ≈ 2C * ((C-p)/C)
+        total = len(cls.B1) + len(cls.B2)
+        C = (cls.capacity if cls.capacity is not None else 1)
+        limit = 2 * C
+        # Compute proportional targets
+        if C <= 0:
+            target_b1 = 0
+        else:
+            target_b1 = int(round(limit * (cls.p / float(C))))
+            target_b1 = max(0, min(limit, target_b1))
+        target_b2 = max(0, limit - target_b1)
+        while total > limit:
+            over_b1 = len(cls.B1) - target_b1
+            over_b2 = len(cls.B2) - target_b2
+            # Evict from the list exceeding its target more; break ties by the larger list
+            if over_b1 > 0 and (over_b1 >= over_b2 or over_b2 <= 0):
+                cls.pop_lru(cls.B1)
+            elif over_b2 > 0:
+                cls.pop_lru(cls.B2)
+            else:
+                # Neither exceeds target specifically; evict from the larger
+                if len(cls.B1) >= len(cls.B2):
+                    cls.pop_lru(cls.B1)
+                else:
+                    cls.pop_lru(cls.B2)
+            total = len(cls.B1) + len(cls.B2)
+
+    @classmethod
+    def resync(cls, cache_snapshot):
+        # Ensure resident metadata tracks actual cache content
+        cache_keys = set(cache_snapshot.cache.keys())
+        for k in list(cls.T1.keys()):
+            if k not in cache_keys:
+                cls.T1.pop(k, None)
+        for k in list(cls.T2.keys()):
+            if k not in cache_keys:
+                cls.T2.pop(k, None)
+        # Any cached keys not tracked: assume recent (T1)
+        for k in cache_keys:
+            if k not in cls.T1 and k not in cls.T2:
+                cls.T1[k] = True
+        # Keep ghosts disjoint from residents
+        for k in list(cls.B1.keys()):
+            if k in cls.T1 or k in cls.T2:
+                cls.B1.pop(k, None)
+        for k in list(cls.B2.keys()):
+            if k in cls.T1 or k in cls.T2:
+                cls.B2.pop(k, None)
+        cls.trim_ghosts()
+
+    @classmethod
+    def decay_p_if_idle(cls, cache_snapshot):
+        # If no ghost hits for a while, gently decay p toward 0 to recover from scans
+        if cls.last_ghost_hit_access >= 0:
+            idle = cache_snapshot.access_count - cls.last_ghost_hit_access
+            if idle > cls.capacity and cls.p > 0:
+                cls.p = max(0, cls.p - 1)
+
+    @classmethod
+    def choose_victim(cls, incoming_key):
+        # ARC replacement preference
+        x_in_B2 = incoming_key in cls.B2
+        t1_sz = len(cls.T1)
+        from_t1 = (t1_sz >= 1 and (t1_sz > cls.p or (x_in_B2 and t1_sz == cls.p)))
+
+        if from_t1 and cls.T1:
+            return next(iter(cls.T1))  # LRU from T1
+        if (not from_t1) and cls.T2:
+            return next(iter(cls.T2))  # LRU from T2
+
+        # If preferred list empty, try the other
+        if cls.T1:
+            return next(iter(cls.T1))
+        if cls.T2:
+            return next(iter(cls.T2))
+        return None
+
+    @classmethod
+    def fallback_victim(cls, cache_snapshot):
+        # Ghost-informed fallback: prefer evicting something present in B1 (recency-only)
+        for k in cache_snapshot.cache.keys():
+            if k in cls.B1:
+                return k
+        # Otherwise, prefer any key not in B2
+        for k in cache_snapshot.cache.keys():
+            if k not in cls.B2:
+                return k
+        # Timestamp tie-breaker
+        if cls.ts:
+            min_ts = min(cls.ts.get(k, float('inf')) for k in cache_snapshot.cache.keys())
+            for k in cache_snapshot.cache.keys():
+                if cls.ts.get(k, float('inf')) == min_ts:
+                    return k
+        # Last resort: arbitrary
+        if cache_snapshot.cache:
+            return next(iter(cache_snapshot.cache.keys()))
+        return None
+
+    @classmethod
+    def on_hit(cls, cache_snapshot, key):
+        # Immediate promotion to T2 (standard ARC)
+        if key in cls.T1:
+            cls.T1.pop(key, None)
+            cls.move_to_mru(cls.T2, key)
+        elif key in cls.T2:
+            cls.move_to_mru(cls.T2, key)
+        else:
+            # Drift: still a hit; place in T2 to reflect reuse
+            cls.move_to_mru(cls.T2, key)
+        # Resident keys must not exist in ghosts
+        cls.B1.pop(key, None)
+        cls.B2.pop(key, None)
+        # Reset cold streak on any hit
+        cls.cold_streak = 0
+        # Update timestamp
+        cls.ts[key] = cache_snapshot.access_count
+
+    @classmethod
+    def on_insert(cls, cache_snapshot, key):
+        # Adjust ARC target p using ghost hints (damped), then admit
+        step_cap = max(1, cls.capacity // 8)  # slightly faster adaptation without overshoot
+        if key in cls.B1:
+            # Favor recency: increase p
+            inc = max(1, len(cls.B2) // max(1, len(cls.B1)))
+            cls.p = min(cls.capacity, cls.p + min(inc, step_cap))
+            cls.last_ghost_hit_access = cache_snapshot.access_count
+            cls.cold_streak = 0
+            cls.B1.pop(key, None)
+            cls.B2.pop(key, None)  # keep ghosts disjoint
+            # On return, insert to T2 (has shown reuse)
+            cls.move_to_mru(cls.T2, key)
+        elif key in cls.B2:
+            # Favor frequency: decrease p
+            dec = max(1, len(cls.B1) // max(1, len(cls.B2)))
+            cls.p = max(0, cls.p - min(dec, step_cap))
+            cls.last_ghost_hit_access = cache_snapshot.access_count
+            cls.cold_streak = 0
+            cls.B2.pop(key, None)
+            cls.B1.pop(key, None)  # keep ghosts disjoint
+            cls.move_to_mru(cls.T2, key)
+        else:
+            # Brand-new: insert into T1 (probationary)
+            cls.move_to_mru(cls.T1, key)
+            # Scan clamp: prolonged cold stream -> push p down
+            cls.cold_streak += 1
+            if cls.cold_streak > cls.capacity:
+                cls.p = max(0, cls.p - max(1, cls.capacity // 4))
+            # Ensure ghosts are disjoint from residents
+            cls.B1.pop(key, None)
+            cls.B2.pop(key, None)
+
+        cls.ts[key] = cache_snapshot.access_count
+        cls.trim_ghosts()
+        # Light consistency guard
+        if (len(cls.T1) + len(cls.T2)) != len(cache_snapshot.cache):
+            cls.resync(cache_snapshot)
+
+    @classmethod
+    def on_evict(cls, cache_snapshot, evicted_key):
+        # Move evicted resident to corresponding ghost list
+        if evicted_key in cls.T1:
+            cls.T1.pop(evicted_key, None)
+            cls.move_to_mru(cls.B1, evicted_key)
+            # Maintain disjoint ghosts
+            cls.B2.pop(evicted_key, None)
+        elif evicted_key in cls.T2:
+            cls.T2.pop(evicted_key, None)
+            cls.move_to_mru(cls.B2, evicted_key)
+            cls.B1.pop(evicted_key, None)
+        else:
+            # Unknown membership: prefer existing ghost membership if any
+            if evicted_key in cls.B2:
+                cls.move_to_mru(cls.B2, evicted_key)
+                cls.B1.pop(evicted_key, None)
+            else:
+                cls.move_to_mru(cls.B1, evicted_key)
+                cls.B2.pop(evicted_key, None)
+        cls.ts.pop(evicted_key, None)
+        cls.trim_ghosts()
+
+
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    ARCPlus.ensure_capacity(cache_snapshot)
+    # Keep metadata consistent
+    if (len(ARCPlus.T1) + len(ARCPlus.T2)) != len(cache_snapshot.cache):
+        ARCPlus.resync(cache_snapshot)
+    # Recover from scan-like phases by decaying p if no ghost hits
+    ARCPlus.decay_p_if_idle(cache_snapshot)
+
+    candidate = ARCPlus.choose_victim(obj.key)
+    if candidate is not None:
+        return candidate
+    # Try to repair metadata and retry ARC replacement before falling back
+    ARCPlus.resync(cache_snapshot)
+    candidate = ARCPlus.choose_victim(obj.key)
+    if candidate is not None:
+        return candidate
+    # Fallback path
+    return ARCPlus.fallback_victim(cache_snapshot)
+
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    ARCPlus.ensure_capacity(cache_snapshot)
+    ARCPlus.decay_p_if_idle(cache_snapshot)
+    ARCPlus.on_hit(cache_snapshot, obj.key)
+    # Post-condition consistency (rare)
+    if (len(ARCPlus.T1) + len(ARCPlus.T2)) != len(cache_snapshot.cache):
+        ARCPlus.resync(cache_snapshot)
+
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    ARCPlus.ensure_capacity(cache_snapshot)
+    ARCPlus.decay_p_if_idle(cache_snapshot)
+    ARCPlus.on_insert(cache_snapshot, obj.key)
+
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    ARCPlus.ensure_capacity(cache_snapshot)
+    ARCPlus.on_evict(cache_snapshot, evicted_obj.key)
+
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

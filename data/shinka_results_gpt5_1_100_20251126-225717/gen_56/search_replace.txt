@@ -1,0 +1,405 @@
+<NAME>
+heatguard_bias_and_admission_guard
+</NAME>
+
+<DESCRIPTION>
+I introduce three targeted improvements based on SLRU+TinyLFU/ARC insights to reduce miss rate:
+
+1) Eviction with protected-bias and incoming-aware guard:
+   - Always prefer evicting from probation when possible, unless ghost signals or a substantial coldness gap indicate otherwise.
+   - Compute coldest candidates from both segments and apply a margin (bias) to shield protected entries unless they are clearly colder than probation.
+   - Incorporate an incoming-aware guard: when the incoming key is colder than the probation candidate, evict from probation to avoid displacing hotter items.
+
+2) Frequency updates that differentiate segments on hits:
+   - Increase the frequency increment for protected hits to better capture hot items, while still promoting probation hits and slightly adapting the protected quota on promotion.
+
+3) Stronger admission guard on insert using last-victim strength:
+   - If the incoming item appears colder than the last evicted victim, place it “older” in probation (timestamp backdating) and seed it with a lower initial frequency to reduce pollution.
+   - Ghost hits still get direct protected admission (ARC-like).
+
+4) Last victim score measures useful future reuse potential:
+   - Use decayed frequency with a small bias for protected victims to drive the admission guard, rather than pure heat, which can be negative due to the age component.
+
+These changes stabilize the protected segment, reduce harmful evictions of hot items, and curb scan-like pollution, thereby improving hit rates across diverse workloads.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    global _prot_ratio
+    _ensure_params(cache_snapshot)
+    prob_cap, prot_cap = _get_caps(cache_snapshot)
+    cap = max(int(getattr(cache_snapshot, "capacity", 1)), 1)
+
+    # Ghost-guided adaptation: respond aggressively to reuse signals
+    g_prot = obj.key in _ghost_protected
+    g_prob = obj.key in _ghost_probation
+    if g_prot and not g_prob:
+        _prot_ratio = _clamp(_prot_ratio + 0.1, 0.1, 0.9)
+    elif g_prob and not g_prot:
+        _prot_ratio = _clamp(_prot_ratio - 0.1, 0.1, 0.9)
+    # Recompute targets after potential adjustment
+    prob_cap, prot_cap = _get_caps(cache_snapshot)
+
+    # Choose eviction segment:
+    # - If incoming key has protected ghost, evict from probation (favor frequency).
+    # - If incoming key has probation ghost, evict from protected (favor recency).
+    # - Otherwise evict from segment exceeding its target, defaulting to probation.
+    victim_key = None
+    if g_prot and len(_probation) > 0:
+        victim_key = _pick_coldest(_probation, 'prob', cache_snapshot)
+    elif g_prob and len(_protected) > 0:
+        victim_key = _pick_coldest(_protected, 'prot', cache_snapshot)
+    else:
+        if len(_probation) > 0 and (len(_probation) >= prob_cap or len(_protected) == 0):
+            victim_key = _pick_coldest(_probation, 'prob', cache_snapshot)
+        if victim_key is None and len(_protected) > 0:
+            victim_key = _pick_coldest(_protected, 'prot', cache_snapshot)
+
+    if victim_key is None:
+        # Last-resort fallback: pick coldest overall using probation-like heat
+        cache_keys = list(cache_snapshot.cache.keys())
+        if cache_keys:
+            now = cache_snapshot.access_count
+            victim_key = min(cache_keys, key=lambda k: (_decayed_score(k, now) - (now - m_key_timestamp.get(k, now)) / max(1, cap)))
+        else:
+            return None
+    return victim_key
+=======
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    global _prot_ratio
+    _ensure_params(cache_snapshot)
+    cap = max(int(getattr(cache_snapshot, "capacity", 1)), 1)
+    now = cache_snapshot.access_count
+
+    # Ghost-guided adaptation: respond to reuse signals
+    g_prot = obj.key in _ghost_protected
+    g_prob = obj.key in _ghost_probation
+    if g_prot and not g_prob:
+        _prot_ratio = _clamp(_prot_ratio + 0.1, 0.1, 0.9)
+    elif g_prob and not g_prot:
+        _prot_ratio = _clamp(_prot_ratio - 0.1, 0.1, 0.9)
+
+    # Compute coldest candidates from both segments
+    p_cand = _pick_coldest(_probation, 'prob', cache_snapshot) if len(_probation) > 0 else None
+    t_cand = _pick_coldest(_protected, 'prot', cache_snapshot) if len(_protected) > 0 else None
+
+    # Incoming decayed score (TinyLFU-like)
+    s_in = _decayed_score(obj.key, now)
+
+    # If ghost evidence present, steer eviction segment accordingly
+    if g_prot and p_cand is not None:
+        victim_key = p_cand
+    elif g_prob and t_cand is not None:
+        victim_key = t_cand
+    else:
+        # Default: prefer evicting from probation when available, unless protected has a much colder candidate
+        if p_cand is None and t_cand is None:
+            # Fallback: pick coldest overall using age-adjusted score
+            cache_keys = list(cache_snapshot.cache.keys())
+            if cache_keys:
+                victim_key = min(
+                    cache_keys,
+                    key=lambda k: (_decayed_score(k, now) - (now - m_key_timestamp.get(k, now)) / max(1, cap))
+                )
+            else:
+                return None
+        elif p_cand is not None and t_cand is None:
+            victim_key = p_cand
+        elif p_cand is None and t_cand is not None:
+            victim_key = t_cand
+        else:
+            # Both candidates exist: protected-bias with incoming-aware guard
+            h_p = _heat(p_cand, 'prob', now, cap)
+            h_t = _heat(t_cand, 'prot', now, cap)
+            # Extra margin to shield protected; stronger when incoming is cold
+            bias = 0.3 + 0.2 * _clamp(s_in, 0.0, 3.0)
+            # If probation candidate is not hotter than incoming, evict it
+            if _decayed_score(p_cand, now) <= s_in + 0.1:
+                victim_key = p_cand
+            elif h_t < (h_p - bias):
+                victim_key = t_cand
+            else:
+                victim_key = p_cand
+
+    # Small adaptation of protected ratio based on the chosen segment
+    if victim_key in _protected:
+        _prot_ratio = _clamp(_prot_ratio - 0.02, 0.1, 0.9)
+    elif victim_key in _probation:
+        _prot_ratio = _clamp(_prot_ratio + 0.01, 0.1, 0.9)
+
+    return victim_key
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_key_timestamp, _prot_ratio
+    _ensure_params(cache_snapshot)
+    current_ts = cache_snapshot.access_count
+    k = obj.key
+
+    # Maintain a general timestamp ledger and decayed LFU
+    m_key_timestamp[k] = current_ts
+    s = _decayed_score(k, current_ts) + 1.0
+    _set_score(k, s, current_ts)
+
+    if k in _probation:
+        # Promote to protected on second touch
+        ts0 = _probation.pop(k, current_ts)
+        _protected[k] = current_ts
+        # Slightly favor protected upon successful reuse
+        delta = 1.0 / max(20, max(int(getattr(cache_snapshot, "capacity", 1)), 1))
+        _prot_ratio = _clamp(_prot_ratio + delta, 0.1, 0.9)
+    elif k in _protected:
+        # Refresh recency within protected
+        _protected[k] = current_ts
+    else:
+        # Metadata miss: treat as re-reference and place in protected
+        _protected[k] = current_ts
+
+    # Keep protected within target via demotion of coldest protected
+    _demote_until_quota(cache_snapshot)
+=======
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_key_timestamp, _prot_ratio
+    _ensure_params(cache_snapshot)
+    current_ts = cache_snapshot.access_count
+    cap = max(int(getattr(cache_snapshot, "capacity", 1)), 1)
+    k = obj.key
+
+    # Maintain a general timestamp ledger and decayed LFU
+    m_key_timestamp[k] = current_ts
+    # Heavier increment for protected hits to emphasize frequency
+    inc = 1.25 if k in _protected else 1.0
+    s = _decayed_score(k, current_ts) + inc
+    _set_score(k, s, current_ts)
+
+    if k in _probation:
+        # Promote to protected on second touch
+        _probation.pop(k, None)
+        _protected[k] = current_ts
+        # Favor protected upon successful reuse (slightly stronger)
+        delta = 1.0 / max(10, cap)
+        _prot_ratio = _clamp(_prot_ratio + delta, 0.1, 0.9)
+    elif k in _protected:
+        # Refresh recency within protected
+        _protected[k] = current_ts
+        # Mild adjustment to keep protected stable
+        delta = 1.0 / max(50, cap)
+        _prot_ratio = _clamp(_prot_ratio + delta, 0.1, 0.9)
+    else:
+        # Metadata miss: treat as re-reference and place in protected
+        _protected[k] = current_ts
+        delta = 1.0 / max(20, cap)
+        _prot_ratio = _clamp(_prot_ratio + delta, 0.1, 0.9)
+
+    # Keep protected within target via demotion of coldest protected
+    _demote_until_quota(cache_snapshot)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp, _prot_ratio
+    _ensure_params(cache_snapshot)
+    current_ts = cache_snapshot.access_count
+    k = obj.key
+    m_key_timestamp[k] = current_ts
+
+    # Ghost-aware admission and ratio adaptation
+    g_prot = k in _ghost_protected
+    g_prob = k in _ghost_probation
+    if g_prot or g_prob:
+        if g_prot:
+            _ghost_protected.pop(k, None)
+            _prot_ratio = _clamp(_prot_ratio + 0.05, 0.1, 0.9)
+        if g_prob:
+            _ghost_probation.pop(k, None)
+            _prot_ratio = _clamp(_prot_ratio - 0.05, 0.1, 0.9)
+        # Directly protect ghost hits (ARC-like)
+        _protected[k] = current_ts
+        # Seed frequency: protected ghosts are stronger than probation ghosts
+        base = 1.4 if g_prot and not g_prob else 0.6
+        _set_score(k, base, current_ts)
+    else:
+        # Default cold admission: probation
+        _probation[k] = current_ts
+        # Admission guard: if last victim was strong, down-seed newcomers
+        base = 0.0 if _last_victim_score > 2.0 else 0.05
+        _set_score(k, base, current_ts)
+
+    # Enforce protected target by demoting coldest if necessary
+    _demote_until_quota(cache_snapshot)
+
+    # Bound ghost histories
+    _trim_ghosts(cache_snapshot)
+=======
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp, _prot_ratio
+    _ensure_params(cache_snapshot)
+    current_ts = cache_snapshot.access_count
+    cap = max(int(getattr(cache_snapshot, "capacity", 1)), 1)
+    k = obj.key
+    m_key_timestamp[k] = current_ts
+
+    # Ghost-aware admission and ratio adaptation
+    g_prot = k in _ghost_protected
+    g_prob = k in _ghost_probation
+    if g_prot or g_prob:
+        if g_prot:
+            _ghost_protected.pop(k, None)
+            _prot_ratio = _clamp(_prot_ratio + 0.05, 0.1, 0.9)
+        if g_prob:
+            _ghost_probation.pop(k, None)
+            _prot_ratio = _clamp(_prot_ratio - 0.05, 0.1, 0.9)
+        # Directly protect ghost hits (ARC-like)
+        _protected[k] = current_ts
+        # Seed frequency: protected ghosts are stronger than probation ghosts
+        base = 1.4 if g_prot and not g_prob else 0.6
+        _set_score(k, base, current_ts)
+    else:
+        # Default cold admission: probation with admission guard via last victim strength
+        s_in = _decayed_score(k, current_ts)
+        guard = (_last_victim_score > s_in + 0.8)
+        # Place colder newcomers slightly older in probation to shed scans faster
+        ts_ins = current_ts - (min(5, max(1, cap // 10)) if guard else 0)
+        _probation[k] = ts_ins
+        base = 0.0 if guard else 0.1
+        _set_score(k, base, current_ts)
+
+    # Enforce protected target by demoting coldest if necessary
+    _demote_until_quota(cache_snapshot)
+
+    # Bound ghost histories
+    _trim_ghosts(cache_snapshot)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    global _last_victim_score
+    if evicted_obj is None:
+        return
+    _ensure_params(cache_snapshot)
+    k = evicted_obj.key
+    ts = cache_snapshot.access_count
+
+    # Compute victim's merit before removal and store for admission guard
+    _last_victim_score = _decayed_score(k, ts)
+
+    # Move evicted key into the corresponding ghost history
+    if k in _probation:
+        _probation.pop(k, None)
+        _ghost_probation[k] = ts
+    elif k in _protected:
+        _protected.pop(k, None)
+        _ghost_protected[k] = ts
+    else:
+        # Unknown to our metadata; assume probation
+        _ghost_probation[k] = ts
+
+    # Clean general ledger and LFU tables
+    m_key_timestamp.pop(k, None)
+    _freq.pop(k, None)
+    _freq_ts.pop(k, None)
+
+    # Bound ghost histories
+    _trim_ghosts(cache_snapshot)
+=======
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    global _last_victim_score
+    if evicted_obj is None:
+        return
+    _ensure_params(cache_snapshot)
+    k = evicted_obj.key
+    ts = cache_snapshot.access_count
+
+    # Compute victim's merit before removal and store for admission guard
+    # Bias protected victims slightly higher to better guard against over-admission
+    last_strength = _decayed_score(k, ts) + (0.3 if k in _protected else 0.0)
+    _last_victim_score = max(0.0, last_strength)
+
+    # Move evicted key into the corresponding ghost history
+    if k in _probation:
+        _probation.pop(k, None)
+        _ghost_probation[k] = ts
+    elif k in _protected:
+        _protected.pop(k, None)
+        _ghost_protected[k] = ts
+    else:
+        # Unknown to our metadata; assume probation
+        _ghost_probation[k] = ts
+
+    # Clean general ledger and LFU tables
+    m_key_timestamp.pop(k, None)
+    _freq.pop(k, None)
+    _freq_ts.pop(k, None)
+
+    # Bound ghost histories
+    _trim_ghosts(cache_snapshot)
+>>>>>>> REPLACE
+</DIFF>

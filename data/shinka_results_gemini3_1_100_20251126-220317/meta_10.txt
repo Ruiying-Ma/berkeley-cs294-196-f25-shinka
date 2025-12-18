@@ -1,0 +1,108 @@
+# INDIVIDUAL PROGRAM SUMMARIES
+
+The following are summaries of individual programs evaluated since the last meta update:
+
+**Program Name: Basic Dictionary-Based Least Recently Used (LRU)**
+- **Implementation**: The algorithm tracks the most recent access time (access count) for each object in a global dictionary and evicts the object with the lowest timestamp value.
+- **Performance**: It achieves a combined score of 0.21, performing strongly on traces with high temporal locality but poorly on scan-heavy or looping patterns.
+- **Feedback**: While the logic correctly implements the standard LRU policy, the O(N) linear scan for the minimum timestamp is inefficient, and the lack of frequency tracking limits hit rates on non-recency-based workloads.
+**Program Identifier:** Generation 0 - Patch Name initial_program - Correct Program: True
+
+**Program Name: LFU-DA with Dynamic Aging and LRU Tie-Breaking**
+- **Implementation**: The algorithm implements Least Frequently Used with Dynamic Aging (LFU-DA) by calculating priorities as frequency plus a global aging factor (the priority of the last evicted item), using a linear scan to identify the eviction victim.
+- **Performance**: It achieved a combined score of 0.22, demonstrating strong performance on frequency-stable workloads (up to 0.88 hit rate) but failing completely on scan-heavy traces (0.00 hit rate).
+- **Feedback**: While the dynamic aging factor effectively prevents cache pollution common in standard LFU, the algorithm lacks specific mechanisms to handle scan patterns and the $O(N)$ eviction search is computationally inefficient.
+**Program Identifier:** Generation 1 - Patch Name lfuda_eviction - Correct Program: True
+
+**Program Name: S3-FIFO with Static S-Queue Allocation and Lazy Promotion**
+- **Implementation**: Utilizes two queues (S for new, M for frequent) with a 10% static allocation for S, employing lazy promotion where accessed eviction candidates are moved to M.
+- **Performance**: Achieves a combined score of 0.23, showing strong locality handling (hit rates >0.88) but poor performance on specific scan patterns (hit rates ~0.00).
+- **Feedback**: The implementation correctly separates one-hit wonders, but the fixed 10% S-queue size lacks adaptability for varying workload phases, causing significant drops in hit rate for certain traces.
+**Program Identifier:** Generation 2 - Patch Name s3fifo_v1 - Correct Program: True
+
+**Program Name: Segmented LRU with Fixed Protected Capacity**
+- **Implementation**: This Segmented LRU (SLRU) implementation uses two `OrderedDict` segments, `probationary` and `protected`, promoting items to `protected` on hits with a fixed cap of 80% capacity. Overflow from `protected` demotes items back to `probationary`, and eviction strictly targets the LRU of the `probationary` segment first.
+- **Performance**: It achieved a combined score of 0.23, with high efficiency on select patterns (up to 0.88) but near-zero hit rates on numerous other traces.
+- **Feedback**: The rigid 80% protected limit provides scan resistance but likely starves the probationary segment during high churn, suggesting an adaptive partition size would improve consistency across diverse workloads.
+**Program Identifier:** Generation 3 - Patch Name slru_algorithm - Correct Program: True
+
+**Program Name: LeCaR with Randomized Policy Selection**
+- **Implementation**: Maintains a probability weight to dynamically switch between LRU and LFU eviction, updating the weight via multiplicative updates when re-accessing previously evicted keys tracked in history buffers.
+- **Performance**: The algorithm achieves a low overall score of 0.21, with hit rates varying drastically from near 0% on many traces to 87% on specific stable workloads.
+- **Feedback**: The probabilistic switching mechanism combined with a fixed learning rate appears too unstable for dynamic workloads, often failing to converge on an optimal policy quickly enough.
+**Program Identifier:** Generation 4 - Patch Name lecar_adaptive_eviction - Correct Program: True
+
+**Program Name: LFU-DA with Ghost Frequency History**
+- **Implementation**: The algorithm implements Least Frequently Used with Dynamic Aging (LFU-DA), setting priority as frequency plus an aging factor $L$ (updated to the evicted item's priority), and maintains a "ghost" history to restore frequencies for recently evicted items.
+- **Performance**: It achieved a combined score of 0.23, demonstrating high hit rates on frequency-skewed traces (up to 0.88) but failing near-completely on scan or loop patterns (near 0.0).
+- **Feedback**: While dynamic aging helps adapt to shifting frequency distributions, the algorithm lacks specific scan resistance, causing new items to be evicted immediately against established high-frequency items in scan-heavy workloads.
+**Program Identifier:** Generation 5 - Patch Name lfu_da_ghost - Correct Program: True
+
+**Program Name: Adaptive Replacement Cache (ARC) with Ghost Lists**
+- **Implementation**: Maintains four separate LRU dictionaries (T1/T2 for resident data, B1/B2 for eviction history) and dynamically shifts a partition parameter `p` to balance recency and frequency based on ghost list hits.
+- **Performance**: Achieved a combined score of 0.24, demonstrating high effectiveness on repeating patterns (hit rates >0.8) but varying performance on high-churn or scan-heavy traces.
+- **Feedback**: The implementation correctly applies ARC's sophisticated adaptability logic, successfully optimizing for both recency and frequency, though the overhead of maintaining complex state may impact efficiency on highly volatile workloads.
+**Program Identifier:** Generation 6 - Patch Name implement_arc - Correct Program: True
+
+**Program Name: Adaptive Replacement Cache (ARC) with Trace Reset**
+- **Implementation**: Implements the ARC algorithm using four LRU lists (T1, T2, B1, B2) to dynamically balance recency and frequency by adjusting a partition parameter `p` based on ghost list hits, including a check to reset state for new traces.
+- **Performance**: The algorithm achieves a combined score of 0.24, performing robustly on mixed workloads (e.g., traces 1-10) but showing lower hit rates on pure scans.
+- **Feedback**: The implementation correctly separates eviction decisions from state updates to fit the framework, and the self-tuning capability effectively captures both recent and frequent access patterns without manual tuning.
+**Program Identifier:** Generation 7 - Patch Name implement_arc_algorithm - Correct Program: True
+
+**Program Name: S3-FIFO Eviction with Ghost Cache and Dual Queues**
+- **Implementation**: Maintains a small nursery queue (10%) and a main queue (90%) with a ghost cache to rescue frequently evicted items, using a 1-bit clock scheme for promotion and reinsertion.
+- **Performance**: Combined score of 0.23, showing strong results on high-locality workloads (up to 88% hit rate) but near-zero performance on several specific traces.
+- **Feedback**: The use of ghost caches and the S/M split provides effective scan resistance and frequency tracking, though the static 10% nursery size may lack flexibility for varying working set structures.
+**Program Identifier:** Generation 8 - Patch Name s3fifo - Correct Program: True
+
+**Program Name: Segmented LRU with Fixed 80% Protected Capacity**
+- **Implementation**: Utilizes an ordered dictionary for global LRU tracking and a set to maintain a protected segment (fixed at 80% of cache) where items are promoted upon hits and the segment's LRU is demoted when full.
+- **Performance**: Achieves a combined score of 0.23, performing well on stable frequency traces (up to 0.88 hit rate) but poorly on high-churn or scan-heavy workloads.
+- **Feedback**: The static partitioning effectively isolates the working set for specific traces but lacks the adaptability required to handle diverse access patterns found in the broader dataset.
+**Program Identifier:** Generation 9 - Patch Name slru_eviction - Correct Program: True
+
+# GLOBAL INSIGHTS SCRATCHPAD
+
+The following are global insights about optimization approaches and their effectiveness:
+
+# Successful Algorithmic Patterns
+- **Dynamic Partitioning via Ghost Lists:** The Adaptive Replacement Cache (ARC) implementation (Generation 6, 7, and Current Best) achieves the highest combined score (0.24) by dynamically adjusting the target size `p` of the recency segment (T1) versus the frequency segment (T2) based on hits in ghost lists (B1 and B2). This allows the cache to tune itself to the workload's specific locality type without manual parameter configuration.
+- **Frequency-Recency Hybridization:** Algorithms that maintain distinct segments for recent items and frequent items (ARC, S3-FIFO, SLRU) consistently outperform single-metric policies like pure LRU (0.21) or LFU-DA (0.22). The explicit separation protects frequent items from being flushed by transient scans while still allowing new items a chance to prove their utility.
+- **Deterministic Adaptability:** Unlike the probabilistic switching in LeCaR (Gen 4), the deterministic mathematical updates to the partition size in ARC provided stable and robust performance across a wider range of traces, particularly on frequency-heavy traces like 27 and 28 (hit rates >0.84).
+
+# Ineffective Approaches
+- **Static Segmentation Thresholds:** Programs utilizing fixed partition sizes—such as S3-FIFO with a 10% nursery (Gen 2, 8) or SLRU with an 80% protected segment (Gen 3, 9)—plateaued at a score of 0.23. These fixed ratios fail to maximize hit rates when the working set size deviates significantly from the pre-allocated segment size (e.g., starves the probationary segment during high churn).
+- **Linear Scan Eviction ($O(N)$):** Early implementations like the initial LRU (Gen 0) and LFU-DA (Gen 1) relied on iterating through the entire cache to find the eviction victim. This approach is computationally inefficient and limits the complexity of the eviction logic that can be practically applied, contributing to lower scores (0.21-0.22).
+- **Unstable Reinforcement Learning:** The LeCaR algorithm (Gen 4), which used randomized policy selection and multiplicative weight updates, failed to converge quickly enough on shifting workloads, resulting in a low score (0.21) compared to the more direct adaptation logic of ARC.
+
+# Implementation Insights
+- **External State Persistence:** The Current Best Program (ARC) successfully overcomes the stateless nature of the evaluation framework's `cache_snapshot` by utilizing a global `ARCState` class. This allows the algorithm to persist complex metadata (ghost lists `B1`/`B2` and the adaptive parameter `p`) across eviction calls, which is critical for the algorithm's learning mechanism.
+- **Efficient LRU via Ordered Dictionaries:** The best performing implementation leverages Python's standard `dict` (which preserves insertion order) to model the four LRU lists (T1, T2, B1, B2). This provides $O(1)$ operations for moving items between lists (e.g., `del`, `state.T2[key] = None`) without the overhead and complexity of implementing custom doubly-linked lists.
+- **Ghost List Capacity Management:** The Current Best Program implements explicit trimming of the ghost lists (`while len(state.B1) > c`) in `update_after_evict`. This prevents memory bloat and ensures the adaptation logic relies on relevant recent history rather than stale data.
+
+# Performance Analysis
+- **Adaptability Superiority:** ARC (0.24) outperforms the static S3-FIFO and SLRU variants (0.23) largely due to its performance on mixed workloads (Traces 1-10), where it maintains hit rates between 0.44 and 0.54. Its ability to shift capacity allows it to perform like LRU when recency dominates and like LFU when frequency dominates.
+- **Extreme Pattern Handling:** The best program excels on repeating patterns (Traces 27, 28, 34) with hit rates up to 0.89, matching the theoretical best for frequency-based algorithms. However, like the other top contenders, it still struggles significantly on pure scan patterns (Traces 14-19), yielding near-zero hit rates (0.00-0.02), indicating that even adaptive sizing cannot compensate for a lack of admission control (like a TinyLFU filter) when scans greatly exceed cache size.
+- **Locality vs. Churn:** While Gen 0 (LRU) performed well on locality (0.21), it failed on loops. Gen 1 (LFU-DA) handled loops but failed on scans. ARC bridges this gap, avoiding the complete failures of the simpler algorithms, though the marginal gain (0.01 over SLRU) suggests that further improvements require handling the "scan-heavy" traces where almost all current algorithms are failing.
+
+# META RECOMMENDATIONS
+
+The following are actionable recommendations for the next program generations:
+
+Based on the performance analysis of the ARC implementation (current best) and the global insights, here are 5 actionable recommendations for future program mutations. These recommendations aim to bridge the gap between ARC's adaptability and the need for scan resistance (handling Traces 14-19), while further refining the successful frequency-recency separation.
+
+1.  **Implement an S3-FIFO Style Nursery:**
+    Prepend a small, static FIFO queue (e.g., 10% of capacity) before the adaptive ARC structure. New items enter this "nursery" first; they are only promoted to the main ARC lists (T1/T2) if they are accessed again while in the nursery. If they exit the nursery without a hit, they are evicted directly. This filters out "one-hit wonders" (scans) before they can pollute the adaptive T1/T2 segments or flush valuable ghost entries, directly addressing the near-zero hit rates on scan traces.
+
+2.  **Integrate a Frequency-Based Admission Filter (TinyLFU-lite):**
+    Augment the eviction logic with a lightweight frequency sketch (e.g., a simple Python dictionary that tracks frequency of recent keys, resetting periodically to keep size low). When the cache is full, compare the estimated frequency of the incoming item against the eviction victim (from T1 or T2). Only admit the new item if its frequency is higher; otherwise, drop it. This prevents low-utility items from displacing accumulated high-frequency content during high churn.
+
+3.  **Refine Ghost Feedback with Frequency Weights:**
+    Modify the adaptive update of the parameter `p` to be proportional to the importance of the ghost hit, rather than a fixed increment. Store a "frequency at eviction" counter in the ghost lists (`B1`, `B2`). When a hit occurs in a ghost list, adjust `p` by a magnitude derived from that item's past frequency (e.g., `delta = 1 + log(frequency)`). This allows the algorithm to correct its partition size more aggressively when high-value frequency items are being evicted too soon.
+
+4.  **Adopt LIRS-Style Strict Promotion:**
+    Tighten the criteria for moving items from the recency list (T1) to the frequency list (T2). Instead of promoting an item to T2 on its very first hit in T1 (standard ARC), require a second hit or a specific "inter-reference recency" threshold (similar to LIRS). This ensures that T2 is reserved for items with established high-frequency patterns, preventing "warm" items from diluting the core frequency segment.
+
+5.  **Expand Ghost List Capacity for Long Loops:**
+    The current implementation limits ghost lists (`B1`, `B2`) to the cache capacity `c`. Increase the ghost list capacity (e.g., to `2 * c`) or implement a time-based expiration for ghosts. This allows the algorithm to detect and adapt to looping patterns that are slightly larger than the cache size (which currently result in misses and ghost entry loss), enabling the adaptive logic to "remember" these patterns and resize `p` accordingly.

@@ -1,0 +1,198 @@
+<NAME>
+smarts3fifo_strict_ghost_freq
+</NAME>
+
+<DESCRIPTION>
+Implements a Stricter S3-FIFO policy with Frequency-Aware Ghost Registry.
+1.  **Strict Promotion**: Items from S are promoted to M only if `freq > 1` (accessed at least twice). This filters one-hit wonders and scan noise.
+2.  **Ghost Frequency Tracking**: Instead of binary presence, the ghost registry stores the eviction frequency. On ghost hit, frequency is restored and incremented.
+3.  **Ghost-Gated Admission**: Ghost hits with low frequency (`<= 1`) are re-inserted into S (probation) instead of M, forcing them to prove utility. This solves the "Loop > Cache" thrashing issue (Trace 14).
+4.  **Extended History**: Ghost capacity increased to 4x cache size.
+5.  **Higher Frequency Cap**: Frequency counter cap increased to 7 to better distinguish hot items.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    Selects a victim.
+    Policy:
+    - If S is above target size (10%) or M is empty: Clean S.
+      - S-Victim accessed? -> Promote to M.
+      - Else -> Evict & Ghost.
+    - Else (S is small enough, M has data): Clean M.
+      - M-Victim accessed? -> Reinsert M.
+      - Else ->
+         - If S has room? -> Demote to S.
+         - Else -> Evict directly.
+    '''
+    # 10% capacity target for S
+    capacity = cache_snapshot.capacity
+    s_target = max(int(capacity * 0.1), 1)
+
+    # Cap ghost to N (e.g., 2x capacity)
+    ghost_limit = capacity * 2
+
+    while True:
+        # Check if we need to prioritize S eviction
+        # We process S if it's over budget, OR if M is empty (must keep cache full)
+        force_s = len(s_queue) > s_target or len(m_queue) == 0
+
+        if force_s:
+            if not s_queue:
+                # Fallback if M is empty and S is empty (should not happen in full cache)
+                # But if we just demoted everything?
+                if m_queue:
+                    force_s = False # Go to M logic
+                else:
+                    return next(iter(cache_snapshot.cache)) # Failsafe
+
+            if force_s:
+                candidate, _ = s_queue.popitem(last=False)
+                cnt = freq_map.get(candidate, 0)
+
+                if cnt > 0:
+                    # Accessed in S -> Promote to M
+                    m_queue[candidate] = None
+                    freq_map[candidate] = 0 # Reset frequency on move
+                else:
+                    # Not accessed -> Evict
+                    # Record in ghost
+                    ghost_registry[candidate] = None
+                    if len(ghost_registry) > ghost_limit:
+                        ghost_registry.popitem(last=False)
+                    return candidate
+
+        if not force_s:
+            # Process M
+            if not m_queue:
+                # M empty, go back to S (loop will handle)
+                continue
+
+            candidate, _ = m_queue.popitem(last=False)
+            cnt = freq_map.get(candidate, 0)
+
+            if cnt > 0:
+                # Accessed in M -> Reinsert M (Second Chance)
+                m_queue[candidate] = None
+                freq_map[candidate] = 0
+            else:
+                # Cold in M
+                # Conditional Demotion: Only if S has space
+                if len(s_queue) < s_target:
+                    s_queue[candidate] = None
+                    # frequency remains 0
+                else:
+                    # S is full, don't pollute it. Evict M-victim directly.
+                    return candidate
+
+def update_after_hit(cache_snapshot, obj):
+    '''Increment frequency, cap at 3.'''
+    curr = freq_map.get(obj.key, 0)
+    freq_map[obj.key] = min(curr + 1, 3)
+
+def update_after_insert(cache_snapshot, obj):
+    '''Insert based on Ghost history.'''
+    key = obj.key
+    freq_map[key] = 0 # Reset frequency on new insert
+
+    if key in ghost_registry:
+        # Ghost hit -> Insert to M (skip probation)
+        m_queue[key] = None
+        del ghost_registry[key]
+    else:
+        # New -> Insert to S
+        s_queue[key] = None
+=======
+def evict(cache_snapshot, obj):
+    '''
+    Selects a victim.
+    Policy:
+    - If S is above target size (10%) or M is empty: Clean S.
+      - S-Victim freq > 1? -> Promote to M.
+      - Else -> Evict & Ghost (store freq).
+    - Else (S is small enough, M has data): Clean M.
+      - M-Victim accessed? -> Reinsert M.
+      - Else -> Demote to S (if room) or Evict.
+    '''
+    # 10% capacity target for S
+    capacity = cache_snapshot.capacity
+    s_target = max(int(capacity * 0.1), 1)
+
+    # Cap ghost to 4x capacity for better history
+    ghost_limit = capacity * 4
+
+    while True:
+        force_s = len(s_queue) > s_target or len(m_queue) == 0
+
+        if force_s:
+            if not s_queue:
+                if m_queue:
+                    force_s = False
+                else:
+                    return next(iter(cache_snapshot.cache))
+
+            if force_s:
+                candidate, _ = s_queue.popitem(last=False)
+                cnt = freq_map.get(candidate, 0)
+
+                # Strict promotion: require > 1 hit (at least 2 accesses)
+                if cnt > 1:
+                    m_queue[candidate] = None
+                    freq_map[candidate] = 0 # Reset frequency on move
+                else:
+                    # Evict and store frequency in ghost
+                    ghost_registry[candidate] = cnt
+                    if len(ghost_registry) > ghost_limit:
+                        ghost_registry.popitem(last=False)
+                    return candidate
+
+        if not force_s:
+            if not m_queue:
+                continue
+
+            candidate, _ = m_queue.popitem(last=False)
+            cnt = freq_map.get(candidate, 0)
+
+            if cnt > 0:
+                # Accessed in M -> Reinsert M
+                m_queue[candidate] = None
+                freq_map[candidate] = 0
+            else:
+                # Cold in M
+                if len(s_queue) < s_target:
+                    s_queue[candidate] = None
+                else:
+                    return candidate
+
+def update_after_hit(cache_snapshot, obj):
+    '''Increment frequency, cap at 7.'''
+    curr = freq_map.get(obj.key, 0)
+    freq_map[obj.key] = min(curr + 1, 7)
+
+def update_after_insert(cache_snapshot, obj):
+    '''Insert based on Ghost history and frequency.'''
+    key = obj.key
+
+    if key in ghost_registry:
+        # Ghost hit - Restore frequency and increment
+        past_freq = ghost_registry[key]
+        del ghost_registry[key]
+
+        # Increment to count this access
+        new_freq = past_freq + 1
+        freq_map[key] = min(new_freq, 7)
+
+        if new_freq > 1:
+            # Promote to Main if accessed > 1 time total
+            m_queue[key] = None
+            freq_map[key] = 0 # Reset for M lifecycle
+        else:
+            # Not enough hits yet, put in S with updated freq
+            s_queue[key] = None
+    else:
+        # New -> Insert to S
+        s_queue[key] = None
+        freq_map[key] = 0
+>>>>>>> REPLACE
+</DIFF>

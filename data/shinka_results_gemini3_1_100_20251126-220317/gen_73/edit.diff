@@ -1,0 +1,228 @@
+--- a/original.py
++++ b/original.py
+@@ -1,206 +1,218 @@
+ # EVOLVE-BLOCK-START
+ """
+ W-TinyLFU with Doorkeeper and SLRU
+ Implements Window-TinyLFU eviction policy.
+ - Window Cache (1%): LRU policy for new items.
+ - Main Cache (99%): SLRU (Segmented LRU) with Probation (20%) and Protected (80%).
+ - TinyLFU Admission: Adopts a Doorkeeper to filter rare items and a Frequency Sketch (Map) to guide eviction.
+ - Aging: Halves frequencies periodically to adapt to changing workloads.
+ """
+ import random
+ from collections import OrderedDict
+ 
+ class TinyLFUState:
+     def __init__(self, capacity):
+         self.capacity = capacity
+         # Cache Segments
+         self.window = OrderedDict()
+         self.probation = OrderedDict()
+         self.protected = OrderedDict()
+ 
+         # Metadata
+         self.freq = {}
+         self.doorkeeper = set()
+         self.probation_hits = {} # Track hits for probation items
+         self.access_count = 0
+ 
+         # Configuration
+         # 1% Window, 99% Main (split 80/20 Protected/Probation)
+         self.window_size = max(1, int(capacity * 0.01))
+         self.protected_size = max(1, int(capacity * 0.79))
+ 
+         # Aging and Constraints
+         # Age every 10x capacity to handle phase changes
+         self.aging_interval = capacity * 10
+         self.max_freq = 15
+         self.doorkeeper_limit = max(1000, int(capacity * 2))
+ 
+     def get_freq(self, key):
+         return self.freq.get(key, 0)
+ 
+     def record_access(self, key):
+         self.access_count += 1
+ 
+         # Doorkeeper & Frequency Logic
+         if key in self.freq:
+             if self.freq[key] < self.max_freq:
+                 self.freq[key] += 1
+         elif key in self.doorkeeper:
+             self.doorkeeper.remove(key)
+             self.freq[key] = 1 # Promoted from Doorkeeper to Frequency Map
+         else:
+             self.doorkeeper.add(key)
+ 
+         if len(self.doorkeeper) > self.doorkeeper_limit:
+             self.doorkeeper.clear()
+ 
+         if self.access_count % self.aging_interval == 0:
+             self.age()
+ 
+     def age(self):
+         # Halve frequencies
+         rem = []
+         for k in self.freq:
+             self.freq[k] //= 2
+             if self.freq[k] == 0:
+                 rem.append(k)
+         for k in rem:
+             del self.freq[k]
+ 
+ _states = {}
+ 
+ def get_state(cache_snapshot):
+     cid = id(cache_snapshot.cache)
+     if cid not in _states:
+         _states[cid] = TinyLFUState(cache_snapshot.capacity)
+     return _states[cid]
+ 
+ def evict(cache_snapshot, obj):
+     """
+     Determine eviction victim.
+     If Window is full, duel Window LRU vs Main Probation LRU.
+     Otherwise, evict from Main to make room for Window growth.
+     """
+     state = get_state(cache_snapshot)
+ 
+     # Consistency Check (Reset if cache was cleared externally)
+     if not cache_snapshot.cache and (state.window or state.probation):
+         state.window.clear()
+         state.probation.clear()
+         state.protected.clear()
+         state.freq.clear()
+         state.doorkeeper.clear()
+         state.probation_hits.clear()
+ 
+     # If Window is full (or overfull), we must duel or evict from Window
+     if len(state.window) >= state.window_size:
+         w_victim_key = next(iter(state.window))
+ 
+         # If Main is empty, Window victim must go
+         if not state.probation and not state.protected:
+             return w_victim_key
+ 
+         # Identify Main victim (Probation LRU preferred, else Protected LRU)
++        is_probation_victim = False
+         if state.probation:
+             m_victim_key = next(iter(state.probation))
++            is_probation_victim = True
+         else:
+             m_victim_key = next(iter(state.protected))
+ 
+         # TinyLFU Duel
+         freq_w = state.get_freq(w_victim_key)
+         freq_m = state.get_freq(m_victim_key)
+ 
+-        # Bias towards Main: only evict Main if Window item is significantly better
+-        if freq_w > freq_m + 1:
+-            return m_victim_key
+-        else:
+-            return w_victim_key
++        # Segment-Aware Duel
++        if is_probation_victim:
++            # For Probation: Evict Main if Window is at least as good (ties favor Window/Admission)
++            if freq_w >= freq_m:
++                return m_victim_key
++            else:
++                return w_victim_key
++        else:
++            # For Protected: Evict Main only if Window is strictly better (ties favor Main/Retention)
++            if freq_w > freq_m:
++                return m_victim_key
++            else:
++                return w_victim_key
+     else:
+         # Window not full: Prefer evicting from Main to grow Window
+         if state.probation:
+             return next(iter(state.probation))
+         elif state.protected:
+             return next(iter(state.protected))
+         elif state.window:
+             return next(iter(state.window))
+         else:
+             # Fallback
+             return next(iter(cache_snapshot.cache))
+ 
+ def update_after_hit(cache_snapshot, obj):
+     state = get_state(cache_snapshot)
+     key = obj.key
+     state.record_access(key)
+ 
+     if key in state.window:
+         state.window.move_to_end(key)
+ 
+     elif key in state.probation:
+         # Promote to Protected if it has proved itself (2 hits in probation)
+-        if key in state.probation_hits:
++        # OR if it has high historical frequency
++        if key in state.probation_hits or state.get_freq(key) >= 5:
+             del state.probation[key]
+-            del state.probation_hits[key]
++            if key in state.probation_hits:
++                del state.probation_hits[key]
+             state.protected[key] = True
+ 
+             # Handle Protected Overflow: Move LRU to Probation
+             if len(state.protected) > state.protected_size:
+                 victim, _ = state.protected.popitem(last=False)
+                 state.probation[victim] = True
+                 # Grant second chance credit to demoted items
+                 state.probation_hits[victim] = True
+                 state.probation.move_to_end(victim)
+         else:
+             state.probation_hits[key] = True
+             state.probation.move_to_end(key)
+ 
+     elif key in state.protected:
+         state.protected.move_to_end(key)
+ 
+ def update_after_insert(cache_snapshot, obj):
+     state = get_state(cache_snapshot)
+     key = obj.key
+     state.record_access(key)
+ 
+     # New items always enter Window
+     state.window[key] = True
+ 
+     # Balance segments if Window grew too large due to Main eviction
+     # (i.e. we evicted Main to make room, so Window grew by 1. Move old window item to Main)
+     if len(state.window) > state.window_size:
+         victim, _ = state.window.popitem(last=False)
+         state.probation[victim] = True
+         state.probation.move_to_end(victim)
+ 
+ def update_after_evict(cache_snapshot, obj, evicted_obj):
+     state = get_state(cache_snapshot)
+     key = evicted_obj.key
+ 
+     if key in state.window:
+         del state.window[key]
+     elif key in state.probation:
+         del state.probation[key]
+         if key in state.probation_hits:
+             del state.probation_hits[key]
+     elif key in state.protected:
+         del state.protected[key]
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

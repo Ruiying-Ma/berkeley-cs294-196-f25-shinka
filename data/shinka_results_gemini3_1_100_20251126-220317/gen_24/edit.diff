@@ -1,0 +1,292 @@
+--- a/original.py
++++ b/original.py
+@@ -1,150 +1,188 @@
+ # EVOLVE-BLOCK-START
+ """
+-S3-FIFO Eviction Algorithm
+-Uses a Small (S) queue for new items and a Main (M) queue for frequent items.
+-Items in S are evicted early (scan resistance) unless accessed or previously in Ghost (G).
+-Items in M are given second chances upon access.
++WTinyLFU-PP (Window TinyLFU Pure Python)
++Implements W-TinyLFU with a Doorkeeper and Frequency Sketch using native dicts.
++Segments: Window (1%), Probation, Protected.
++Admission Policy: Window LRU vs Probation LRU based on frequency.
++Scan/Loop Resistant via strict frequency admission.
+ """
++import collections
+ 
+-class S3FIFOState:
+-    def __init__(self, cache_id):
++class WTinyLFUState:
++    def __init__(self, cache_id, capacity):
+         self.cache_id = cache_id
+-        self.small = dict()   # Small FIFO queue (approx 10%)
+-        self.main = dict()    # Main FIFO queue (approx 90%)
+-        self.ghost = dict()   # Ghost FIFO queue
+-        self.accessed = dict() # Track access bits
+-        self.capacity = 0
++        self.capacity = capacity
++        
++        # Configuration: 1% Window, 99% Main (80% Protected, 20% Probation)
++        # Using max(1, ...) to ensure at least one slot for window
++        self.w_cap = max(1, int(capacity * 0.01)) 
++        self.main_cap = capacity - self.w_cap
++        self.p_cap = int(self.main_cap * 0.8)
++        
++        # Cache Segments
++        self.window = collections.OrderedDict()    # FIFO for new items
++        self.probation = collections.OrderedDict() # LRU for probation
++        self.protected = collections.OrderedDict() # LRU for protected
++        
++        # Frequency Sketch (approximate with dict + doorkeeper)
++        self.freq = {}
++        self.door = set()
++        
++        # Aging
++        self.samples = 0
++        self.sample_size = capacity * 10
+ 
+ _state = None
+ 
+ def get_state(cache_snapshot):
+     global _state
+     current_id = id(cache_snapshot.cache)
+-    if _state is None or _state.cache_id != current_id:
+-        _state = S3FIFOState(current_id)
+-
+-    # Sync check
+-    state_count = len(_state.small) + len(_state.main)
+-    cache_count = len(cache_snapshot.cache)
+-    if abs(state_count - cache_count) > 5:
+-        _state = S3FIFOState(current_id)
+-        # Heuristic recovery: put all in Main
++    c = cache_snapshot.capacity
++    if _state is None or _state.cache_id != current_id or _state.capacity != c:
++        _state = WTinyLFUState(current_id, c)
++    
++    # Sync: Rebuild segments if state loses sync (e.g., missed updates)
++    total_tracked = len(_state.window) + len(_state.probation) + len(_state.protected)
++    if abs(total_tracked - len(cache_snapshot.cache)) > 10:
++        _state = WTinyLFUState(current_id, c)
++        # Recovery Heuristic: Fill Window first, then Probation
+         for k in cache_snapshot.cache:
+-            _state.main[k] = None
+-            _state.accessed[k] = False
+-
+-    _state.capacity = cache_snapshot.capacity
++            if len(_state.window) < _state.w_cap:
++                _state.window[k] = None
++            else:
++                _state.probation[k] = None
++    
+     return _state
+ 
++def count_freq(state, key):
++    # Estimate frequency: Base sketch + Doorkeeper bonus
++    base = state.freq.get(key, 0)
++    if key in state.door:
++        return base + 1
++    return base
++
++def record_access(state, key):
++    # Update Doorkeeper and Frequency Sketch
++    state.samples += 1
++    if key not in state.door:
++        state.door.add(key)
++    else:
++        state.freq[key] = state.freq.get(key, 0) + 1
++    
++    # Periodic Aging (Reset)
++    if state.samples >= state.sample_size:
++        state.samples = 0
++        state.door.clear()
++        # Halve frequencies and prune
++        # Using list to avoid runtime error during iteration
++        for k in list(state.freq.keys()):
++            state.freq[k] //= 2
++            if state.freq[k] == 0:
++                del state.freq[k]
++
+ def evict(cache_snapshot, obj):
+-    '''
+-    S3-FIFO Eviction Logic
+-    '''
+     state = get_state(cache_snapshot)
+-    target_small = max(1, int(state.capacity * 0.1))
+-
+-    # Loop to find victim, handling lazy promotions/reinsertions
+-    loops = 0
+-    max_loops = len(cache_snapshot.cache) * 3 + 20 # Safety limit
+-
+-    while loops < max_loops:
+-        loops += 1
+-
+-        # Determine which queue to operate on
+-        if len(state.small) > target_small or not state.main:
+-            # Check Small queue
+-            if not state.small:
+-                # Fallback
+-                if state.main: return next(iter(state.main))
+-                return None
+-
+-            candidate = next(iter(state.small))
+-            if state.accessed.get(candidate, False):
+-                # Second chance: promote to Main
+-                del state.small[candidate]
+-                state.main[candidate] = None
+-                state.accessed[candidate] = False
+-            else:
+-                return candidate
++    
++    # Identify candidates
++    cand_w = next(iter(state.window)) if state.window else None
++    cand_m = next(iter(state.probation)) if state.probation else None
++    
++    # Admission Policy
++    # If Window is full (or over full), we must evict from Window or Duel
++    if len(state.window) >= state.w_cap:
++        if not cand_m:
++            # If Probation is empty, try to evict from Protected (demote) or Window
++            if state.protected:
++                 # Simplify: Evict Window if Main is effectively empty of candidates
++                 return cand_w
++            return cand_w
++        
++        # Duel: Window Victim vs Probation Victim
++        fw = count_freq(state, cand_w)
++        fm = count_freq(state, cand_m)
++        
++        if fw > fm:
++            # Window wins: Evict Probation candidate, Promote Window cand to Probation
++            del state.window[cand_w]
++            state.probation[cand_w] = None # Move to MRU/Tail of Probation
++            return cand_m
+         else:
+-            # Check Main queue
+-            if not state.main:
+-                if state.small: return next(iter(state.small))
+-                return None
+-
+-            candidate = next(iter(state.main))
+-            if state.accessed.get(candidate, False):
+-                # Second chance: reinsert to Main
+-                del state.main[candidate]
+-                state.main[candidate] = None
+-                state.accessed[candidate] = False
+-            else:
+-                return candidate
+-
+-    # Emergency fallback
+-    if cache_snapshot.cache:
+-        return next(iter(cache_snapshot.cache))
+-    return None
++            # Window loses: Evict Window candidate
++            return cand_w
++            
++    else:
++        # Window is not full. Prefer evicting from Main to allow Window to grow.
++        if cand_m:
++            return cand_m
++        elif state.protected:
++             # If Probation is empty but Protected isn't, evict from Protected
++             return next(iter(state.protected))
++        else:
++             # Main is empty, must evict from Window
++             return cand_w
++             
++    # Fallback (should not be reached if cache is full)
++    return next(iter(cache_snapshot.cache))
+ 
+ def update_after_hit(cache_snapshot, obj):
+-    '''
+-    Hit: Set accessed bit. Lazy promotion happens at eviction time.
+-    '''
+     state = get_state(cache_snapshot)
+-    state.accessed[obj.key] = True
++    key = obj.key
++    record_access(state, key)
++    
++    if key in state.window:
++        # Hits in Window do not promote immediately (W-TinyLFU)
++        pass
++    elif key in state.probation:
++        # Promote Probation -> Protected
++        del state.probation[key]
++        state.protected[key] = None
++        # Enforce Protected Capacity
++        if len(state.protected) > state.p_cap:
++            demoted = next(iter(state.protected))
++            del state.protected[demoted]
++            state.probation[demoted] = None # Demote to Probation MRU
++            
++    elif key in state.protected:
++        # Move to MRU
++        del state.protected[key]
++        state.protected[key] = None
+ 
+ def update_after_insert(cache_snapshot, obj):
+-    '''
+-    Insert: Add to Small, or Main if in Ghost.
+-    '''
+     state = get_state(cache_snapshot)
+     key = obj.key
+-    state.accessed[key] = False
+-
+-    if key in state.ghost:
+-        state.main[key] = None
+-        del state.ghost[key]
+-    else:
+-        state.small[key] = None
++    record_access(state, key)
++    # New items always enter Window
++    state.window[key] = None
+ 
+ def update_after_evict(cache_snapshot, obj, evicted_obj):
+-    '''
+-    Evict: Clean up queues and update Ghost if evicted from Small.
+-    '''
+     state = get_state(cache_snapshot)
+     key = evicted_obj.key
+-
+-    if key in state.small:
+-        del state.small[key]
+-        state.ghost[key] = None # Evicted from S -> G
+-    elif key in state.main:
+-        del state.main[key]
+-        # Evicted from M -> Gone
+-
+-    if key in state.accessed:
+-        del state.accessed[key]
+-
+-    # Bound Ghost size
+-    while len(state.ghost) > state.capacity:
+-        del state.ghost[next(iter(state.ghost))]
++    
++    # Clean up segments
++    if key in state.window:
++        del state.window[key]
++    elif key in state.probation:
++        del state.probation[key]
++    elif key in state.protected:
++        del state.protected[key]
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

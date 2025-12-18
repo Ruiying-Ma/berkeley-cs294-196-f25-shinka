@@ -1,0 +1,239 @@
+--- a/original.py
++++ b/original.py
+@@ -1,111 +1,159 @@
+ # EVOLVE-BLOCK-START
+-"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
++"""
++Dynamic S3-FIFO (DynS3FIFO)
++An enhanced S3-FIFO algorithm with dynamic partition sizing (ARC-like adaptation).
++Features:
++1. Two queues: Small (S) and Main (M).
++2. Ghost registries for both queues to track evicted items.
++3. Dynamic S-queue sizing based on ghost hits (marginal utility).
++4. Strict promotion: S -> M only on eviction + access bit.
++5. Large ghost history (2x capacity) to catch larger loops.
++"""
+ 
+-m_key_timestamp = dict()
+-m_protected_keys = set()
++from collections import OrderedDict
++
++# Global State
++small_q = OrderedDict()       # Probationary queue (FIFO)
++main_q = OrderedDict()        # Protected queue (FIFO)
++ghost_s = OrderedDict()       # Ghost S (History of S evictions)
++ghost_m = OrderedDict()       # Ghost M (History of M evictions)
++accessed_bits = set()         # Track hits
++s_dist = 0.1                  # Target fraction for S queue
++last_access_count = 0         # For detecting trace changes
++
++def check_reset(cache_snapshot):
++    """Detects new trace and resets globals."""
++    global small_q, main_q, ghost_s, ghost_m, accessed_bits, s_dist, last_access_count
++    
++    current_acc = cache_snapshot.access_count
++    # Heuristic: access count reset/drop OR cache empty with residual state
++    if current_acc < last_access_count or (len(cache_snapshot.cache) <= 1 and len(small_q) > 1):
++        small_q.clear()
++        main_q.clear()
++        ghost_s.clear()
++        ghost_m.clear()
++        accessed_bits.clear()
++        s_dist = 0.1
++        last_access_count = 0
++    
++    last_access_count = current_acc
+ 
+ def evict(cache_snapshot, obj):
+     '''
+-    This function defines how the algorithm chooses the eviction victim.
+-    - Args:
+-        - `cache_snapshot`: A snapshot of the current cache state.
+-        - `obj`: The new object that needs to be inserted into the cache.
+-    - Return:
+-        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
++    Selects a victim using Dynamic S3-FIFO.
++    Lazy migration: Moves items between S/M or to Ghost during eviction scan.
+     '''
+-    global m_protected_keys
++    global s_dist
++    
++    capacity = cache_snapshot.capacity
++    s_target = max(1, int(capacity * s_dist))
++    ghost_limit = max(capacity, int(2 * capacity))
++    
++    # Iterate until a victim is found (Scan resistant loop)
++    while True:
++        # Determine which queue to evict from
++        # Prioritize evicting from S if it's over target, or if M is empty
++        evict_s = (len(small_q) > s_target) or (len(main_q) == 0)
++        
++        if evict_s:
++            if not small_q:
++                # Should not happen if logic matches cache state, fallback to M
++                evict_s = False
++            else:
++                key, _ = small_q.popitem(last=False) # Head of FIFO
++                
++                if key in accessed_bits:
++                    # Second Chance: Promote to M
++                    accessed_bits.discard(key)
++                    main_q[key] = None
++                    # We moved item S->M, but cache is still full. Loop continues.
++                else:
++                    # Victim found
++                    ghost_s[key] = None
++                    if len(ghost_s) > ghost_limit:
++                        ghost_s.popitem(last=False)
++                    return key
+ 
+-    # Identify keys in the cache and split into protected and probationary
+-    probationary_keys = []
+-    protected_keys_in_cache = []
+-
+-    # We iterate over the cache to ensure we only consider currently cached objects
+-    for key in cache_snapshot.cache:
+-        if key in m_protected_keys:
+-            protected_keys_in_cache.append(key)
+-        else:
+-            probationary_keys.append(key)
+-
+-    # SLRU Logic: Protected segment has a capacity limit (e.g., 80% of total capacity)
+-    protected_capacity = int(cache_snapshot.capacity * 0.8)
+-
+-    # If protected segment is too full, demote the LRU protected item to probationary
+-    if len(protected_keys_in_cache) > protected_capacity:
+-        # Find LRU in protected items
+-        victim_prot = min(protected_keys_in_cache, key=lambda k: m_key_timestamp.get(k, 0))
+-        # Demote: remove from protected set and treat as probationary for this eviction decision
+-        m_protected_keys.remove(victim_prot)
+-        probationary_keys.append(victim_prot)
+-
+-    # Evict the LRU item from the probationary segment
+-    if probationary_keys:
+-        candid_obj_key = min(probationary_keys, key=lambda k: m_key_timestamp.get(k, 0))
+-    else:
+-        # Fallback if probationary is empty (e.g. strict capacity or strange state)
+-        candid_obj_key = min(cache_snapshot.cache.keys(), key=lambda k: m_key_timestamp.get(k, 0))
+-
+-    return candid_obj_key
++        if not evict_s:
++            if not main_q:
++                # Emergency fallback
++                return next(iter(cache_snapshot.cache))
++            
++            key, _ = main_q.popitem(last=False) # Head of FIFO
++            
++            if key in accessed_bits:
++                # Second Chance: Reinsert to M Tail
++                accessed_bits.discard(key)
++                main_q[key] = None
++            else:
++                # Victim found
++                ghost_m[key] = None
++                if len(ghost_m) > ghost_limit:
++                    ghost_m.popitem(last=False)
++                return key
+ 
+ def update_after_hit(cache_snapshot, obj):
+-    '''
+-    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+-    - Args:
+-        - `cache_snapshot`: A snapshot of the current cache state.
+-        - `obj`: The object accessed during the cache hit.
+-    - Return: `None`
+-    '''
+-    global m_key_timestamp, m_protected_keys
+-    m_key_timestamp[obj.key] = cache_snapshot.access_count
+-    # Promote to protected on hit
+-    m_protected_keys.add(obj.key)
++    check_reset(cache_snapshot)
++    accessed_bits.add(obj.key)
+ 
+ def update_after_insert(cache_snapshot, obj):
+-    '''
+-    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+-    - Args:
+-        - `cache_snapshot`: A snapshot of the current cache state.
+-        - `obj`: The object that was just inserted into the cache.
+-    - Return: `None`
+-    '''
+-    global m_key_timestamp, m_protected_keys
+-    m_key_timestamp[obj.key] = cache_snapshot.access_count
+-    # New items start as probationary (ensure not in protected set)
+-    if obj.key in m_protected_keys:
+-        m_protected_keys.remove(obj.key)
++    check_reset(cache_snapshot)
++    
++    global s_dist
++    key = obj.key
++    capacity = cache_snapshot.capacity
++    
++    # Adaptive sizing delta
++    delta = 1.0 / capacity if capacity > 0 else 0.01
++    
++    if key in ghost_s:
++        # Hit in Ghost S: S was too small. Increase S target.
++        s_dist = min(0.9, s_dist + delta)
++        # Rescue: promote to M
++        main_q[key] = None
++        del ghost_s[key]
++        accessed_bits.discard(key) # Reset bit on rescue
++        
++    elif key in ghost_m:
++        # Hit in Ghost M: M was too small. Decrease S target (Grow M).
++        s_dist = max(0.01, s_dist - delta)
++        # Rescue: promote to M
++        main_q[key] = None
++        del ghost_m[key]
++        accessed_bits.discard(key)
++        
++    else:
++        # New insert: Insert into S
++        small_q[key] = None
++        accessed_bits.discard(key)
+ 
+ def update_after_evict(cache_snapshot, obj, evicted_obj):
+-    '''
+-    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+-    - Args:
+-        - `cache_snapshot`: A snapshot of the current cache state.
+-        - `obj`: The object to be inserted into the cache.
+-        - `evicted_obj`: The object that was just evicted from the cache.
+-    - Return: `None`
+-    '''
+-    global m_key_timestamp, m_protected_keys
+-    if evicted_obj.key in m_key_timestamp:
+-        m_key_timestamp.pop(evicted_obj.key)
+-    if evicted_obj.key in m_protected_keys:
+-        m_protected_keys.remove(evicted_obj.key)
+-
++    # Ensure internal state matches cache state
++    # (Victim was already popped in evict, but just in case of mismatch)
++    key = evicted_obj.key
++    accessed_bits.discard(key)
++    if key in small_q:
++        del small_q[key]
++    if key in main_q:
++        del main_q[key]
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

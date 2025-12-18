@@ -1,0 +1,161 @@
+<NAME>
+s3_fifo_ghost_extended_probabilistic
+</NAME>
+
+<DESCRIPTION>
+I am proposing an improved S3-FIFO algorithm with three key enhancements inspired by the recommendations and previous analysis:
+1.  **Extended Ghost Registry (3x Capacity)**: I increase the ghost queue limit to 3 times the cache capacity. This is crucial for detecting and handling large looping patterns (like Trace 14) that exceed the cache size but fit within this extended history.
+2.  **Comprehensive Ghost Tracking**: I modify `update_after_evict` to track *all* evictions (both from Small and Main) in the ghost registry. Standard S3-FIFO only tracks Small evictions. Tracking Main evictions allows the algorithm to recall items that were promoted to Main, evicted, and then accessed again (common in large loops), promoting them back to Main immediately.
+3.  **Gradual Demotion & Probabilistic Survival**: In the `evict` function, I implement gradual frequency demotion (`freq - 1`) for Main items instead of resetting to 0, allowing popular items to survive longer. I also re-introduce a 1% probabilistic survival chance for `freq=0` items in Main to break synchronization in strict looping patterns, allowing a random subset of the working set to be retained and hit.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO Eviction Policy:
+    - Keeps a small FIFO queue (S) for new items and a large FIFO queue (M) for popular items.
+    - Uses a Ghost queue (G) to track evicted items from S.
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+
+    capacity = cache_snapshot.capacity
+    # Target size for Small queue (10% of capacity)
+    s_capacity = max(1, int(capacity * 0.1))
+
+    # Lazy cleanup of ghost
+    while len(s3_ghost) > capacity:
+        s3_ghost.pop(next(iter(s3_ghost)))
+
+    while True:
+        # Decision: Evict from Small or Main?
+        # If Small is larger than target, evict from Small.
+        # Also if Main is empty, we must evict from Small.
+        if len(s3_small) >= s_capacity or not s3_main:
+            if not s3_small:
+                # Should not happen if cache is full and Main is empty
+                return None
+
+            candidate = next(iter(s3_small))
+            freq = s3_freq.get(candidate, 0)
+
+            if freq > 0:
+                # Second Chance: Move to Main
+                s3_small.pop(candidate)
+                s3_main[candidate] = None
+                s3_freq[candidate] = 0
+                continue
+            else:
+                # Victim found in Small
+                return candidate
+
+        else:
+            # Evict from Main
+            candidate = next(iter(s3_main))
+            freq = s3_freq.get(candidate, 0)
+
+            if freq > 0:
+                # Second Chance: Reinsert to Main tail
+                s3_main.pop(candidate)
+                s3_main[candidate] = None
+                s3_freq[candidate] = 0
+                continue
+            else:
+                # Victim found in Main
+                return candidate
+=======
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO Eviction Policy with Extended Ghost and Probabilistic Features:
+    - Ghost: Extended to 3x capacity to track history of both Small and Main evictions.
+    - Main: Uses gradual demotion (freq-1) to retain popular items longer.
+    - Probabilistic Survival: 1% chance for Main items to survive eviction, aiding in loop resistance.
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+
+    capacity = cache_snapshot.capacity
+    s_capacity = max(1, int(capacity * 0.1))
+
+    # Lazy cleanup of ghost - Extended to 3x
+    while len(s3_ghost) > 3 * capacity:
+        s3_ghost.pop(next(iter(s3_ghost)))
+
+    while True:
+        # Decision: Evict from Small or Main?
+        if len(s3_small) >= s_capacity or not s3_main:
+            if not s3_small:
+                return None
+
+            candidate = next(iter(s3_small))
+            freq = s3_freq.get(candidate, 0)
+
+            if freq > 0:
+                # Promotion: Move to Main
+                s3_small.pop(candidate)
+                s3_main[candidate] = None
+                s3_freq[candidate] = 0
+                continue
+            else:
+                # Victim found in Small
+                return candidate
+
+        else:
+            # Evict from Main
+            candidate = next(iter(s3_main))
+            freq = s3_freq.get(candidate, 0)
+
+            if freq > 0:
+                # Second Chance: Reinsert to Main tail with demotion
+                s3_main.pop(candidate)
+                s3_main[candidate] = None
+                s3_freq[candidate] = freq - 1
+                continue
+
+            # Probabilistic Survival (1% chance)
+            if (cache_snapshot.access_count ^ hash(candidate)) % 100 == 0:
+                s3_main.pop(candidate)
+                s3_main[candidate] = None
+                continue
+
+            # Victim found in Main
+            return candidate
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    S3-FIFO Update on Evict:
+    - Remove from queues. If evicted from Small, add to Ghost.
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+    key = evicted_obj.key
+
+    if key in s3_small:
+        s3_small.pop(key)
+        s3_ghost[key] = None
+    elif key in s3_main:
+        s3_main.pop(key)
+
+    if key in s3_freq:
+        s3_freq.pop(key)
+=======
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    S3-FIFO Update on Evict:
+    - Remove from queues.
+    - Add to Ghost for BOTH Small and Main evictions to capture full history.
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+    key = evicted_obj.key
+
+    if key in s3_small:
+        s3_small.pop(key)
+    elif key in s3_main:
+        s3_main.pop(key)
+
+    # Add to ghost to track recency/utility beyond cache size
+    s3_ghost[key] = None
+
+    if key in s3_freq:
+        s3_freq.pop(key)
+>>>>>>> REPLACE
+</DIFF>

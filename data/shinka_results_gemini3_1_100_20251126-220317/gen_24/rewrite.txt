@@ -1,0 +1,168 @@
+# EVOLVE-BLOCK-START
+"""
+WTinyLFU-PP (Window TinyLFU Pure Python)
+Implements W-TinyLFU with a Doorkeeper and Frequency Sketch using native dicts.
+Segments: Window (1%), Probation, Protected.
+Admission Policy: Window LRU vs Probation LRU based on frequency.
+Scan/Loop Resistant via strict frequency admission.
+"""
+import collections
+
+class WTinyLFUState:
+    def __init__(self, cache_id, capacity):
+        self.cache_id = cache_id
+        self.capacity = capacity
+        
+        # Configuration: 1% Window, 99% Main (80% Protected, 20% Probation)
+        # Using max(1, ...) to ensure at least one slot for window
+        self.w_cap = max(1, int(capacity * 0.01)) 
+        self.main_cap = capacity - self.w_cap
+        self.p_cap = int(self.main_cap * 0.8)
+        
+        # Cache Segments
+        self.window = collections.OrderedDict()    # FIFO for new items
+        self.probation = collections.OrderedDict() # LRU for probation
+        self.protected = collections.OrderedDict() # LRU for protected
+        
+        # Frequency Sketch (approximate with dict + doorkeeper)
+        self.freq = {}
+        self.door = set()
+        
+        # Aging
+        self.samples = 0
+        self.sample_size = capacity * 10
+
+_state = None
+
+def get_state(cache_snapshot):
+    global _state
+    current_id = id(cache_snapshot.cache)
+    c = cache_snapshot.capacity
+    if _state is None or _state.cache_id != current_id or _state.capacity != c:
+        _state = WTinyLFUState(current_id, c)
+    
+    # Sync: Rebuild segments if state loses sync (e.g., missed updates)
+    total_tracked = len(_state.window) + len(_state.probation) + len(_state.protected)
+    if abs(total_tracked - len(cache_snapshot.cache)) > 10:
+        _state = WTinyLFUState(current_id, c)
+        # Recovery Heuristic: Fill Window first, then Probation
+        for k in cache_snapshot.cache:
+            if len(_state.window) < _state.w_cap:
+                _state.window[k] = None
+            else:
+                _state.probation[k] = None
+    
+    return _state
+
+def count_freq(state, key):
+    # Estimate frequency: Base sketch + Doorkeeper bonus
+    base = state.freq.get(key, 0)
+    if key in state.door:
+        return base + 1
+    return base
+
+def record_access(state, key):
+    # Update Doorkeeper and Frequency Sketch
+    state.samples += 1
+    if key not in state.door:
+        state.door.add(key)
+    else:
+        state.freq[key] = state.freq.get(key, 0) + 1
+    
+    # Periodic Aging (Reset)
+    if state.samples >= state.sample_size:
+        state.samples = 0
+        state.door.clear()
+        # Halve frequencies and prune
+        # Using list to avoid runtime error during iteration
+        for k in list(state.freq.keys()):
+            state.freq[k] //= 2
+            if state.freq[k] == 0:
+                del state.freq[k]
+
+def evict(cache_snapshot, obj):
+    state = get_state(cache_snapshot)
+    
+    # Identify candidates
+    cand_w = next(iter(state.window)) if state.window else None
+    cand_m = next(iter(state.probation)) if state.probation else None
+    
+    # Admission Policy
+    # If Window is full (or over full), we must evict from Window or Duel
+    if len(state.window) >= state.w_cap:
+        if not cand_m:
+            # If Probation is empty, try to evict from Protected (demote) or Window
+            if state.protected:
+                 # Simplify: Evict Window if Main is effectively empty of candidates
+                 return cand_w
+            return cand_w
+        
+        # Duel: Window Victim vs Probation Victim
+        fw = count_freq(state, cand_w)
+        fm = count_freq(state, cand_m)
+        
+        if fw > fm:
+            # Window wins: Evict Probation candidate, Promote Window cand to Probation
+            del state.window[cand_w]
+            state.probation[cand_w] = None # Move to MRU/Tail of Probation
+            return cand_m
+        else:
+            # Window loses: Evict Window candidate
+            return cand_w
+            
+    else:
+        # Window is not full. Prefer evicting from Main to allow Window to grow.
+        if cand_m:
+            return cand_m
+        elif state.protected:
+             # If Probation is empty but Protected isn't, evict from Protected
+             return next(iter(state.protected))
+        else:
+             # Main is empty, must evict from Window
+             return cand_w
+             
+    # Fallback (should not be reached if cache is full)
+    return next(iter(cache_snapshot.cache))
+
+def update_after_hit(cache_snapshot, obj):
+    state = get_state(cache_snapshot)
+    key = obj.key
+    record_access(state, key)
+    
+    if key in state.window:
+        # Hits in Window do not promote immediately (W-TinyLFU)
+        pass
+    elif key in state.probation:
+        # Promote Probation -> Protected
+        del state.probation[key]
+        state.protected[key] = None
+        # Enforce Protected Capacity
+        if len(state.protected) > state.p_cap:
+            demoted = next(iter(state.protected))
+            del state.protected[demoted]
+            state.probation[demoted] = None # Demote to Probation MRU
+            
+    elif key in state.protected:
+        # Move to MRU
+        del state.protected[key]
+        state.protected[key] = None
+
+def update_after_insert(cache_snapshot, obj):
+    state = get_state(cache_snapshot)
+    key = obj.key
+    record_access(state, key)
+    # New items always enter Window
+    state.window[key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    state = get_state(cache_snapshot)
+    key = evicted_obj.key
+    
+    # Clean up segments
+    if key in state.window:
+        del state.window[key]
+    elif key in state.probation:
+        del state.probation[key]
+    elif key in state.protected:
+        del state.protected[key]
+# EVOLVE-BLOCK-END

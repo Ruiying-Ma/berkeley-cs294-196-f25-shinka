@@ -1,0 +1,129 @@
+<NAME>
+optimize_parameters_and_duel
+</NAME>
+
+<DESCRIPTION>
+1.  **Relax Duel Bias**: Change the duel condition from `fw > fm + 1` to `fw > fm`. This removes the excessive protection of the Main cache, allowing new items with higher or equal potential (if we consider strict inequality as just higher) to enter more easily.
+2.  **Increase Window Size**: Increase the Window size from 1% to 5% of capacity. A 1% window is often too small to capture short-term locality in some workloads, causing premature eviction of potential candidates.
+3.  **Aggressive Doorkeeper Reset**: Reset the Doorkeeper when it exceeds `capacity` (instead of `2 * capacity`) to ensure the filter remains sparse and effective, reducing false positives in frequency estimation.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Doorkeeper Management
+    # Reset Doorkeeper when it grows too large to maintain filter effectiveness
+    if len(state['doorkeeper']) > capacity * 2:
+        state['doorkeeper'].clear()
+
+    # Frequency Update
+=======
+    # Doorkeeper Management
+    # Reset Doorkeeper when it grows too large to maintain filter effectiveness
+    if len(state['doorkeeper']) > capacity:
+        state['doorkeeper'].clear()
+
+    # Frequency Update
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    _check_reset(cache_snapshot)
+    state = algo_state
+    capacity = cache_snapshot.capacity
+    w_cap = max(1, int(capacity * 0.01))
+
+    # Identify Candidates (LRU is at the beginning of OrderedDict)
+    cand_w_key = next(iter(state['window'])) if state['window'] else None
+    cand_m_key = None
+    if state['probation']:
+        cand_m_key = next(iter(state['probation']))
+    elif state['protected']:
+        cand_m_key = next(iter(state['protected']))
+
+    # Fail-safe
+    if cand_w_key is None and cand_m_key is None:
+        return None
+    if cand_w_key is None:
+        return cand_m_key
+    if cand_m_key is None:
+        return cand_w_key
+
+    fw = _get_freq(cand_w_key)
+    fm = _get_freq(cand_m_key)
+
+    # 1. Window Growing Phase
+    # Ideally, we evict Main to let Window grow.
+    # Exception: If Main victim is valuable (fm > fw), sacrifice Window instead.
+    if state['w_size'] < w_cap:
+        if fm > fw:
+            return cand_w_key
+        return cand_m_key
+
+    # 2. Window Full - Duel
+    # Bias towards Main: Evict Window unless Window candidate is strictly better + bias.
+    # This protects established Main items from churn.
+    if fw > fm + 1:
+        return cand_m_key
+    else:
+        return cand_w_key
+=======
+def evict(cache_snapshot, obj):
+    _check_reset(cache_snapshot)
+    state = algo_state
+    capacity = cache_snapshot.capacity
+    w_cap = max(1, int(capacity * 0.05))
+
+    # Identify Candidates (LRU is at the beginning of OrderedDict)
+    cand_w_key = next(iter(state['window'])) if state['window'] else None
+    cand_m_key = None
+    if state['probation']:
+        cand_m_key = next(iter(state['probation']))
+    elif state['protected']:
+        cand_m_key = next(iter(state['protected']))
+
+    # Fail-safe
+    if cand_w_key is None and cand_m_key is None:
+        return None
+    if cand_w_key is None:
+        return cand_m_key
+    if cand_m_key is None:
+        return cand_w_key
+
+    fw = _get_freq(cand_w_key)
+    fm = _get_freq(cand_m_key)
+
+    # 1. Window Growing Phase
+    # Ideally, we evict Main to let Window grow.
+    # Exception: If Main victim is valuable (fm > fw), sacrifice Window instead.
+    if state['w_size'] < w_cap:
+        if fm > fw:
+            return cand_w_key
+        return cand_m_key
+
+    # 2. Window Full - Duel
+    # Relaxed Bias: Evict Main if Window candidate is strictly better.
+    # If equal, we stick with Main (evict Window) to resist scan churn.
+    if fw > fm:
+        return cand_m_key
+    else:
+        return cand_w_key
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # 3. Handle Window Overflow -> Move to Probation
+    w_cap = max(1, int(capacity * 0.01))
+    while state['w_size'] > w_cap and state['window']:
+        k, v = state['window'].popitem(last=False) # Pop LRU
+        state['w_size'] -= v
+        state['probation'][k] = v
+        state['prob_size'] += v
+        state['probation'].move_to_end(k) # MRU
+=======
+    # 3. Handle Window Overflow -> Move to Probation
+    w_cap = max(1, int(capacity * 0.05))
+    while state['w_size'] > w_cap and state['window']:
+        k, v = state['window'].popitem(last=False) # Pop LRU
+        state['w_size'] -= v
+        state['probation'][k] = v
+        state['prob_size'] += v
+        state['probation'].move_to_end(k) # MRU
+>>>>>>> REPLACE
+</DIFF>

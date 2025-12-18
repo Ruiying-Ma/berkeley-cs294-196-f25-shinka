@@ -1,0 +1,233 @@
+<NAME>
+wtinylfu_bias_fix_aging
+</NAME>
+
+<DESCRIPTION>
+1. Reduce `aging_interval` to 5x capacity to allow the frequency sketch to adapt faster to workload changes.
+2. In `age_frequencies`, clear the `demoted` set. This prevents items from retaining "demotion protection" indefinitely if they become ghosts (zombies) in the cache. They get protection for at most one aging interval.
+3. In `evict`, remove the default incumbency bias (set to 0). This allows new items (freq 1) to displace "dead" Main items (freq 0). Previously, a bias of 1 meant new items could never displace 0-frequency items, preventing the cache from learning new hot items when the Main cache was filled with cold items. Demoted items still retain a strong bias (+4) for protection.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+class WTinyLFUState:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        # 1% Window, but at least 1 slot
+        self.window_limit = max(1, int(capacity * 0.01))
+        self.main_limit = capacity - self.window_limit
+        # SLRU split: 80% Protected
+        self.protected_limit = int(self.main_limit * 0.8)
+
+        # Segments
+        self.window = OrderedDict()
+        self.probation = OrderedDict()
+        self.protected = OrderedDict()
+        self.demoted = set() # Set of keys demoted from Protected
+
+        # Frequency Sketch
+        self.freq = {}
+        self.doorkeeper = set()
+        self.access_counter = 0
+
+        # Parameters
+        self.max_freq = 15
+        self.aging_interval = capacity * 10
+        self.doorkeeper_limit = capacity * 2
+
+    def get_freq(self, key):
+        val = self.freq.get(key, 0)
+        if key in self.doorkeeper:
+            val += 1
+        return val
+
+    def record_access(self, key):
+        self.access_counter += 1
+
+        # Doorkeeper / Frequency logic
+        if key not in self.doorkeeper:
+            self.doorkeeper.add(key)
+        else:
+            curr = self.freq.get(key, 0)
+            if curr < self.max_freq:
+                self.freq[key] = curr + 1
+
+        # Aging
+        if self.access_counter >= self.aging_interval:
+            self.age_frequencies()
+            self.access_counter = 0
+
+        # Doorkeeper Reset
+        if len(self.doorkeeper) > self.doorkeeper_limit:
+            self.doorkeeper.clear()
+
+    def age_frequencies(self):
+        # Halving
+        removals = []
+        for k, v in self.freq.items():
+            new_v = v // 2
+            if new_v == 0:
+                removals.append(k)
+            else:
+                self.freq[k] = new_v
+        for k in removals:
+            del self.freq[k]
+
+    def maintain_slru_invariant(self):
+        while len(self.protected) > self.protected_limit:
+            k, _ = self.protected.popitem(last=False)
+            self.probation[k] = None
+            self.demoted.add(k)
+=======
+class WTinyLFUState:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        # 1% Window, but at least 1 slot
+        self.window_limit = max(1, int(capacity * 0.01))
+        self.main_limit = capacity - self.window_limit
+        # SLRU split: 80% Protected
+        self.protected_limit = int(self.main_limit * 0.8)
+
+        # Segments
+        self.window = OrderedDict()
+        self.probation = OrderedDict()
+        self.protected = OrderedDict()
+        self.demoted = set() # Set of keys demoted from Protected
+
+        # Frequency Sketch
+        self.freq = {}
+        self.doorkeeper = set()
+        self.access_counter = 0
+
+        # Parameters
+        self.max_freq = 15
+        self.aging_interval = capacity * 5
+        self.doorkeeper_limit = capacity * 2
+
+    def get_freq(self, key):
+        val = self.freq.get(key, 0)
+        if key in self.doorkeeper:
+            val += 1
+        return val
+
+    def record_access(self, key):
+        self.access_counter += 1
+
+        # Doorkeeper / Frequency logic
+        if key not in self.doorkeeper:
+            self.doorkeeper.add(key)
+        else:
+            curr = self.freq.get(key, 0)
+            if curr < self.max_freq:
+                self.freq[key] = curr + 1
+
+        # Aging
+        if self.access_counter >= self.aging_interval:
+            self.age_frequencies()
+            self.access_counter = 0
+
+        # Doorkeeper Reset
+        if len(self.doorkeeper) > self.doorkeeper_limit:
+            self.doorkeeper.clear()
+
+    def age_frequencies(self):
+        # Halving
+        removals = []
+        self.demoted.clear()
+        for k, v in self.freq.items():
+            new_v = v // 2
+            if new_v == 0:
+                removals.append(k)
+            else:
+                self.freq[k] = new_v
+        for k in removals:
+            del self.freq[k]
+
+    def maintain_slru_invariant(self):
+        while len(self.protected) > self.protected_limit:
+            k, _ = self.protected.popitem(last=False)
+            self.probation[k] = None
+            self.demoted.add(k)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    state = get_state(cache_snapshot)
+
+    # Identify candidates
+    candidate_w = next(iter(state.window)) if state.window else None
+    candidate_p = next(iter(state.probation)) if state.probation else None
+
+    # If probation is empty, borrow from protected (should differ to maintain invariant, but need a victim)
+    if not candidate_p and state.protected:
+        candidate_p = next(iter(state.protected))
+
+    # 1. Protect Window growth if it's small (evict Main to make room)
+    if len(state.window) < state.window_limit:
+        if candidate_p:
+            return candidate_p
+        return candidate_w or next(iter(cache_snapshot.cache))
+
+    # 2. Duel: Window LRU vs Main (Probation) LRU
+    if candidate_w and candidate_p:
+        freq_w = state.get_freq(candidate_w)
+        freq_p = state.get_freq(candidate_p)
+
+        # Calculate Bias
+        # Standard bias: 1 (Incumbency)
+        # Demotion bias: +4 (If victim was recently protected)
+        bias = 1
+        if candidate_p in state.demoted:
+            bias = 5
+
+        # Window must strictly beat Main + bias to displace it
+        if freq_w > freq_p + bias:
+            return candidate_p
+        else:
+            return candidate_w
+
+    # Fallbacks
+    if candidate_w: return candidate_w
+    if candidate_p: return candidate_p
+    return next(iter(cache_snapshot.cache))
+=======
+def evict(cache_snapshot, obj):
+    state = get_state(cache_snapshot)
+
+    # Identify candidates
+    candidate_w = next(iter(state.window)) if state.window else None
+    candidate_p = next(iter(state.probation)) if state.probation else None
+
+    # If probation is empty, borrow from protected (should differ to maintain invariant, but need a victim)
+    if not candidate_p and state.protected:
+        candidate_p = next(iter(state.protected))
+
+    # 1. Protect Window growth if it's small (evict Main to make room)
+    if len(state.window) < state.window_limit:
+        if candidate_p:
+            return candidate_p
+        return candidate_w or next(iter(cache_snapshot.cache))
+
+    # 2. Duel: Window LRU vs Main (Probation) LRU
+    if candidate_w and candidate_p:
+        freq_w = state.get_freq(candidate_w)
+        freq_p = state.get_freq(candidate_p)
+
+        # Bias
+        # Standard bias: 0 (Allow new items to displace dead Main items)
+        # Demotion bias: +4 (Protect demoted items temporarily)
+        bias = 0
+        if candidate_p in state.demoted:
+            bias = 4
+
+        # Window must strictly beat Main + bias to displace it
+        if freq_w > freq_p + bias:
+            return candidate_p
+        else:
+            return candidate_w
+
+    # Fallbacks
+    if candidate_w: return candidate_w
+    if candidate_p: return candidate_p
+    return next(iter(cache_snapshot.cache))
+>>>>>>> REPLACE
+</DIFF>

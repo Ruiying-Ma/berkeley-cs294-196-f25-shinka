@@ -1,0 +1,371 @@
+# EVOLVE-BLOCK-START
+"""LeCaR-TinyLFU with EMA scan detector and regret-driven mixing.
+
+Public API:
+- evict(cache_snapshot, obj) -> key
+- update_after_hit(cache_snapshot, obj)
+- update_after_insert(cache_snapshot, obj)
+- update_after_evict(cache_snapshot, obj, evicted_obj)
+"""
+
+from collections import OrderedDict
+
+
+class _CmSketch:
+    """
+    Count-Min Sketch with conservative updates and adaptive aging (TinyLFU).
+    - Conservative increment: increment only counters equal to the current min to reduce noise.
+    - Periodically halves counters to age out stale history.
+    """
+    __slots__ = ("d", "w", "tables", "mask", "ops", "age_period", "seeds")
+
+    def __init__(self, width_power=12, d=3):
+        self.d = int(max(1, d))
+        w = 1 << int(max(8, width_power))  # at least 256
+        self.w = w
+        self.mask = w - 1
+        self.tables = [[0] * w for _ in range(self.d)]
+        self.ops = 0
+        self.age_period = max(1024, w)
+        self.seeds = (0x9e3779b1, 0x85ebca77, 0xc2b2ae3d, 0x27d4eb2f)
+
+    def _hash(self, key_hash: int, i: int) -> int:
+        h = key_hash ^ self.seeds[i % len(self.seeds)]
+        h ^= (h >> 33) & 0xFFFFFFFFFFFFFFFF
+        h *= 0xff51afd7ed558ccd
+        h &= 0xFFFFFFFFFFFFFFFF
+        h ^= (h >> 33)
+        h *= 0xc4ceb9fe1a85ec53
+        h &= 0xFFFFFFFFFFFFFFFF
+        h ^= (h >> 33)
+        return h & self.mask
+
+    def _maybe_age(self):
+        self.ops += 1
+        if self.ops % self.age_period == 0:
+            for t in self.tables:
+                for i in range(self.w):
+                    t[i] >>= 1
+
+    def increment(self, key: str, amount: int = 1):
+        # Conservative update: increment only counters at the current minimum
+        h = hash(key)
+        idxs = [self._hash(h, i) for i in range(self.d)]
+        vals = [self.tables[i][idxs[i]] for i in range(self.d)]
+        mn = min(vals) if vals else 0
+        for i in range(self.d):
+            if self.tables[i][idxs[i]] == mn:
+                v = self.tables[i][idxs[i]] + amount
+                if v > 255:
+                    v = 255
+                self.tables[i][idxs[i]] = v
+        self._maybe_age()
+
+    def estimate(self, key: str) -> int:
+        h = hash(key)
+        est = 1 << 30
+        for i in range(self.d):
+            idx = self._hash(h, i)
+            v = self.tables[i][idx]
+            if v < est:
+                est = v
+        return est
+
+
+class _LeCaRTinyLFU:
+    """
+    Deterministic LeCaR-style hybrid:
+    - recency: single global LRU stack of resident keys.
+    - sketch: TinyLFU for global popularity estimates.
+    - weights: learn to mix between LRU and LFU via regret from ghost hits.
+    - ghosts: recent evictions (key -> (time, 'LRU' or 'LFU')) to assign regret.
+    - ema_miss: scan/phase guard to bias toward LFU under high miss rates.
+    - Eviction: choose between LRU tail and LFU (min-estimate from LRU tail window).
+    """
+
+    __slots__ = (
+        "recency", "capacity", "sketch",
+        "_sample_k", "_tail_mult",
+        "wlru", "wlfu", "eta",
+        "ghosts", "ghost_ttl",
+        "ema_miss", "ema_alpha",
+        "last_choice_policy",
+        "_last_seen_access"
+    )
+
+    def __init__(self):
+        self.recency = OrderedDict()
+        self.capacity = None
+        self.sketch = _CmSketch(width_power=12, d=3)
+        self._sample_k = 6
+        self._tail_mult = 4  # examine up to 4k keys from the LRU tail
+        # Multiplicative-weights parameters
+        self.wlru = 0.5
+        self.wlfu = 0.5
+        self.eta = 0.12  # learning rate
+        # Ghosts and regret horizon
+        self.ghosts = {}      # key -> (time, 'LRU'|'LFU')
+        self.ghost_ttl = 0
+        # EMA miss tracking
+        self.ema_miss = 0.0
+        self.ema_alpha = 0.05
+        self.last_choice_policy = "LRU"
+        self._last_seen_access = -1
+
+    # ---------- internal helpers ----------
+
+    def _ensure_capacity(self, cache_snapshot):
+        cap = max(int(cache_snapshot.capacity), 1)
+        if self.capacity is None or self.capacity != cap:
+            self.recency.clear()
+            self.capacity = cap
+            # adapt sampling to capacity
+            self._sample_k = max(4, min(12, (cap // 8) or 4))
+            try:
+                self.sketch.age_period = max(512, min(16384, cap * 8))
+            except Exception:
+                pass
+            self.ghosts.clear()
+            self.ghost_ttl = max(2 * cap, 64)
+            self.wlru, self.wlfu = 0.5, 0.5
+            self.ema_miss = 0.0
+        # reset on new trace
+        if cache_snapshot.access_count <= 1 or self._last_seen_access > cache_snapshot.access_count:
+            self.recency.clear()
+            self.ghosts.clear()
+            self.wlru, self.wlfu = 0.5, 0.5
+            self.ema_miss = 0.0
+        self._last_seen_access = cache_snapshot.access_count
+
+    def _self_heal(self, cache_snapshot):
+        # Sync recency with actual cache contents
+        cache_keys = set(cache_snapshot.cache.keys())
+        # remove phantoms
+        for k in list(self.recency.keys()):
+            if k not in cache_keys:
+                self.recency.pop(k, None)
+        # add missing (append near MRU to avoid immediate eviction)
+        for k in cache_keys:
+            if k not in self.recency:
+                self.recency[k] = None
+
+    def _lru(self):
+        return next(iter(self.recency)) if self.recency else None
+
+    def _touch(self, key: str):
+        self.recency[key] = None
+        self.recency.move_to_end(key)
+
+    def _sample_tail_min_freq(self):
+        """
+        Return the key with minimum TinyLFU estimate among a deterministic slice
+        of the LRU tail: consider up to tail_len = min(n, 4k) oldest keys.
+        """
+        n = len(self.recency)
+        if n == 0:
+            return None
+        k = min(self._sample_k, n)
+        tail_len = min(n, self._tail_mult * k)
+        # deterministic: scan the oldest tail_len and choose min-estimate
+        it = iter(self.recency.keys())
+        best_key, best_est = None, None
+        for i in range(tail_len):
+            try:
+                key = next(it)
+            except StopIteration:
+                break
+            est = self.sketch.estimate(key)
+            if best_est is None or est < best_est:
+                best_key, best_est = key, est
+        return best_key if best_key is not None else self._lru()
+
+    def _normalize_weights(self):
+        s = self.wlru + self.wlfu
+        if s <= 0:
+            self.wlru, self.wlfu = 0.5, 0.5
+            return
+        self.wlru /= s
+        self.wlfu /= s
+        # clamp to avoid degeneracy
+        self.wlru = max(1e-4, min(0.9999, self.wlru))
+        self.wlfu = max(1e-4, min(0.9999, self.wlfu))
+
+    def _apply_regret(self, now: int, key: str):
+        info = self.ghosts.pop(key, None)
+        if not info:
+            return
+        t_evict, pol = info
+        if (now - t_evict) > self.ghost_ttl:
+            return
+        # Penalize the evicting policy, reward the other
+        if pol == 'LRU':
+            self.wlru *= (1.0 - self.eta)
+            self.wlfu *= (1.0 + self.eta)
+        else:
+            self.wlfu *= (1.0 - self.eta)
+            self.wlru *= (1.0 + self.eta)
+        self._normalize_weights()
+
+    def _prune_ghosts(self, now: int):
+        if not self.ghosts:
+            return
+        # drop over-sized ghost history
+        if len(self.ghosts) > (self.capacity * 4):
+            # remove oldest by timestamp
+            # build list sorted by time and drop oldest overflow
+            items = sorted(self.ghosts.items(), key=lambda kv: kv[1][0])
+            to_drop = len(self.ghosts) - (self.capacity * 4)
+            for i in range(to_drop):
+                self.ghosts.pop(items[i][0], None)
+        # drop stale by TTL
+        for k, (t, _) in list(self.ghosts.items()):
+            if (now - t) > self.ghost_ttl:
+                self.ghosts.pop(k, None)
+
+    # ---------- policy decisions ----------
+
+    def choose_victim(self, cache_snapshot, new_obj) -> str:
+        self._ensure_capacity(cache_snapshot)
+        self._self_heal(cache_snapshot)
+
+        now = cache_snapshot.access_count
+
+        # Candidates
+        cand_lru = self._lru()
+        cand_lfu = self._sample_tail_min_freq()
+
+        # Scan/phase bias: prefer LFU when EMA miss is high
+        wlru, wlfu = self.wlru, self.wlfu
+        if self.ema_miss > 0.8:
+            wlru *= 0.6
+            wlfu *= 1.4
+
+        # Choose policy deterministically by higher (biased) weight
+        chosen_policy = 'LFU' if wlfu >= wlru else 'LRU'
+
+        # If chosen candidate is missing, fall back to the other
+        if chosen_policy == 'LRU':
+            victim = cand_lru if cand_lru is not None else cand_lfu
+        else:
+            victim = cand_lfu if cand_lfu is not None else cand_lru
+
+        if victim is None:
+            # fallback: any key from cache
+            victim = next(iter(cache_snapshot.cache))
+
+        self.last_choice_policy = chosen_policy
+        return victim
+
+    def on_hit(self, cache_snapshot, obj):
+        self._ensure_capacity(cache_snapshot)
+        self._self_heal(cache_snapshot)
+
+        now = cache_snapshot.access_count
+        key = obj.key
+
+        # EMA miss update (hit -> 0)
+        self.ema_miss = (1.0 - self.ema_alpha) * self.ema_miss + self.ema_alpha * 0.0
+
+        # Frequency update and recency touch
+        self.sketch.increment(key, 1)
+        if key in self.recency:
+            self._touch(key)
+        else:
+            # desync: add and touch
+            self._touch(key)
+
+        # Ghost entry for a resident is stale
+        self.ghosts.pop(key, None)
+        self._prune_ghosts(now)
+
+    def on_insert(self, cache_snapshot, obj):
+        self._ensure_capacity(cache_snapshot)
+        self._self_heal(cache_snapshot)
+
+        now = cache_snapshot.access_count
+        key = obj.key
+
+        # EMA miss update (miss -> 1)
+        self.ema_miss = (1.0 - self.ema_alpha) * self.ema_miss + self.ema_alpha * 1.0
+
+        # Frequency update
+        self.sketch.increment(key, 1)
+
+        # Apply regret if this miss references a recently evicted key
+        self._apply_regret(now, key)
+
+        # Insert at MRU
+        # Ensure not already tracked inconsistently
+        self.recency.pop(key, None)
+        self._touch(key)
+
+        self._prune_ghosts(now)
+
+    def on_evict(self, cache_snapshot, obj, evicted_obj):
+        self._ensure_capacity(cache_snapshot)
+        self._self_heal(cache_snapshot)
+
+        now = cache_snapshot.access_count
+        k = evicted_obj.key
+
+        # Remove from recency
+        self.recency.pop(k, None)
+        # Record as ghost with the policy used to pick victim
+        pol = self.last_choice_policy if self.last_choice_policy in ('LRU', 'LFU') else 'LRU'
+        self.ghosts[k] = (now, pol)
+
+        self._prune_ghosts(now)
+
+
+# Single policy instance reused across calls
+_policy = _LeCaRTinyLFU()
+
+
+def evict(cache_snapshot, obj):
+    """
+    Choose eviction victim key for the incoming obj.
+    """
+    return _policy.choose_victim(cache_snapshot, obj)
+
+
+def update_after_hit(cache_snapshot, obj):
+    """
+    Update policy state after a cache hit on obj.
+    """
+    _policy.on_hit(cache_snapshot, obj)
+
+
+def update_after_insert(cache_snapshot, obj):
+    """
+    Update policy state after a new obj is inserted into the cache.
+    """
+    _policy.on_insert(cache_snapshot, obj)
+
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    """
+    Update policy state after evicting evicted_obj to make room for obj.
+    """
+    _policy.on_evict(cache_snapshot, obj, evicted_obj)
+
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

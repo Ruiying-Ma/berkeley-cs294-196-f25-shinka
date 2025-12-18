@@ -1,0 +1,167 @@
+# EVOLVE-BLOCK-START
+"""Cache eviction algorithm for optimizing hit rates using W-TinyLFU with improved admission and management"""
+from collections import OrderedDict
+
+# W-TinyLFU State
+algo_state = {
+    'window': OrderedDict(),    # Window Cache (LRU)
+    'probation': OrderedDict(), # Main Cache - Probation (SLRU)
+    'protected': OrderedDict(), # Main Cache - Protected (SLRU)
+    'freq': {},                 # Frequency Counter (4-bit equivalent)
+    'doorkeeper': set(),        # Doorkeeper filter
+    'freq_count': 0,            # Counter for aging
+    'max_time': 0               # Reset detection
+}
+
+def _check_reset(current_time):
+    # Reset state if time traveled backwards (new trace or reset)
+    if current_time < algo_state['max_time']:
+        algo_state['window'].clear()
+        algo_state['probation'].clear()
+        algo_state['protected'].clear()
+        algo_state['freq'].clear()
+        algo_state['doorkeeper'].clear()
+        algo_state['freq_count'] = 0
+        algo_state['max_time'] = 0
+    algo_state['max_time'] = current_time
+
+def _update_freq(key, capacity):
+    freq = algo_state['freq']
+    dk = algo_state['doorkeeper']
+    
+    # Update frequency with saturation at 15
+    if key in freq:
+        freq[key] = min(freq[key] + 1, 15)
+    elif key in dk:
+        freq[key] = 1
+        dk.remove(key)
+    else:
+        dk.add(key)
+    
+    # Doorkeeper reset based on size to maintain filter effectiveness
+    if len(dk) > capacity * 2:
+        dk.clear()
+
+    # Aging process
+    algo_state['freq_count'] += 1
+    if algo_state['freq_count'] >= capacity * 5:
+        to_remove = []
+        for k in freq:
+            freq[k] //= 2
+            if freq[k] == 0: to_remove.append(k)
+        for k in to_remove: del freq[k]
+        algo_state['freq_count'] = 0
+
+def evict(cache_snapshot, obj):
+    window = algo_state['window']
+    probation = algo_state['probation']
+    protected = algo_state['protected']
+    freq = algo_state['freq']
+
+    capacity = cache_snapshot.capacity
+    # 1% Window size
+    w_cap = max(1, int(capacity * 0.01)) 
+
+    candidate_w = next(iter(window)) if window else None
+    
+    # Main candidate: Probation LRU, else Protected LRU
+    candidate_m = None
+    victim_is_probation = False
+    
+    if probation:
+        candidate_m = next(iter(probation))
+        victim_is_probation = True
+    elif protected:
+        candidate_m = next(iter(protected))
+        victim_is_probation = False
+
+    victim = None
+
+    # Admission/Eviction Logic
+    # 1. If Window is below capacity, we prioritize evicting from Main to allow Window to grow
+    if len(window) < w_cap and candidate_m:
+        victim = candidate_m
+    elif not candidate_m:
+        victim = candidate_w
+    elif not candidate_w:
+        victim = candidate_m
+    else:
+        # 2. Window is full. Duel: Window LRU vs Main LRU
+        fw = freq.get(candidate_w, 0)
+        fm = freq.get(candidate_m, 0)
+
+        if victim_is_probation:
+            # If Main victim is Probation (unproven), bias towards Window (New) on ties
+            if fw >= fm:
+                victim = candidate_m
+            else:
+                victim = candidate_w
+        else:
+            # If Main victim is Protected (proven), bias towards Main on ties
+            if fw > fm:
+                victim = candidate_m
+            else:
+                victim = candidate_w
+
+    return victim
+
+def update_after_hit(cache_snapshot, obj):
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+    _update_freq(key, cache_snapshot.capacity)
+    
+    window = algo_state['window']
+    probation = algo_state['probation']
+    protected = algo_state['protected']
+
+    if key in window:
+        window.move_to_end(key)
+    elif key in protected:
+        protected.move_to_end(key)
+    elif key in probation:
+        # Promote from Probation to Protected
+        del probation[key]
+        protected[key] = None
+        
+        # SLRU Protected Capacity Management (80% of Main)
+        w_cap = max(1, int(cache_snapshot.capacity * 0.01))
+        main_cap = cache_snapshot.capacity - w_cap
+        p_cap = int(main_cap * 0.8)
+        
+        while len(protected) > p_cap:
+            # Demote Protected LRU to Probation MRU
+            k, _ = protected.popitem(last=False)
+            probation[k] = None
+            probation.move_to_end(k)
+
+def update_after_insert(cache_snapshot, obj):
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+    _update_freq(key, cache_snapshot.capacity)
+    
+    # Insert new items into Window MRU
+    algo_state['window'][key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    v_key = evicted_obj.key
+    window = algo_state['window']
+    probation = algo_state['probation']
+    protected = algo_state['protected']
+
+    if v_key in window:
+        del window[v_key]
+    elif v_key in probation:
+        del probation[v_key]
+    elif v_key in protected:
+        del protected[v_key]
+
+    # Post-Eviction Rebalance
+    # If we evicted Main, Window effectively grew (new item added).
+    # If Window exceeds capacity, migrate Window LRU to Probation MRU.
+    w_cap = max(1, int(cache_snapshot.capacity * 0.01))
+    
+    while len(window) > w_cap:
+        k, _ = window.popitem(last=False)
+        probation[k] = None
+        probation.move_to_end(k)
+# EVOLVE-BLOCK-END

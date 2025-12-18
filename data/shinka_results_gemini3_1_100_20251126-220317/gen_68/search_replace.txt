@@ -1,0 +1,179 @@
+To improve the cache eviction algorithm, I will focus on refining the W-TinyLFU implementation based on established heuristics and the specific recommendations. The key changes are:
+
+1.  **Doorkeeper Management**: Transition `doorkeeper` from a `set` to an `OrderedDict` to implement a Finite History approach (sliding window) instead of clearing it periodically. This prevents "amnesia" where the filter forgets recently seen items just because the aging timer triggered. I will set the history capacity to `10x` the cache capacity.
+2.  **Incumbency Bias**: Introduce a bias in the eviction duel to favor the incumbent (Main Cache candidate). The challenger (Window candidate) must have a strictly higher frequency (margin of 1) to displace the incumbent. This reduces churn and improves stability for working sets.
+3.  **Extended Aging**: Increase the frequency aging interval from `5x` to `10x` capacity to allow frequency counts to accumulate over a longer horizon, which is beneficial for distinguishing stable working sets from transient heavy hitters.
+
+Here are the edits:
+
+<NAME>
+init_doorkeeper_ordered_dict
+</NAME>
+
+<DESCRIPTION>
+Change doorkeeper from set to OrderedDict to allow LRU-based size management instead of full clear during aging. This helps in maintaining history for longer periods without infinite growth or amnesia.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+algo_state = {
+    'window': OrderedDict(),    # Window Cache (SLRU or LRU)
+    'probation': OrderedDict(), # Main Cache - Probation (SLRU)
+    'protected': OrderedDict(), # Main Cache - Protected (SLRU)
+    'freq': {},                 # Frequency Counter
+    'doorkeeper': set(),        # Doorkeeper filter
+    'freq_count': 0,            # Total increments for reset
+    'max_time': 0
+}
+=======
+algo_state = {
+    'window': OrderedDict(),    # Window Cache (SLRU or LRU)
+    'probation': OrderedDict(), # Main Cache - Probation (SLRU)
+    'protected': OrderedDict(), # Main Cache - Protected (SLRU)
+    'freq': {},                 # Frequency Counter
+    'doorkeeper': OrderedDict(),# Doorkeeper filter (OrderedDict)
+    'freq_count': 0,            # Total increments for reset
+    'max_time': 0
+}
+>>>>>>> REPLACE
+</DIFF>
+
+<NAME>
+evict_bias_incumbent
+</NAME>
+
+<DESCRIPTION>
+Introduce a bias in the eviction duel to favor the incumbent (Main Cache candidate). The challenger (Window candidate) must have a strictly higher frequency (by margin of 1) to displace the incumbent. This reduces cache churn and improves hit rates for stable working sets.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Tie-breaker: Prefer Main (Incumbent) -> Evict Window
+        # This provides scan and loop resistance
+        if fw > fm:
+            victim = candidate_m
+        else:
+            victim = candidate_w
+
+    return victim
+=======
+        # Tie-breaker: Prefer Main (Incumbent) -> Evict Window
+        # We require the challenger (Window) to be strictly better by a margin
+        if fw > fm + 1:
+            victim = candidate_m
+        else:
+            victim = candidate_w
+
+    return victim
+>>>>>>> REPLACE
+</DIFF>
+
+<NAME>
+update_hit_decouple_dk
+</NAME>
+
+<DESCRIPTION>
+Decouple Doorkeeper reset from frequency aging. Instead of clearing the doorkeeper every aging interval, we limit its size to 10x capacity using a sliding window (FIFO/LRU via OrderedDict). Also increase frequency aging interval to 10x capacity to preserve frequency info longer.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Frequency with Doorkeeper and Cap
+    if key in freq:
+        freq[key] = min(freq[key] + 1, 15)
+    elif key in dk:
+        freq[key] = 1
+        dk.remove(key)
+    else:
+        dk.add(key)
+
+    algo_state['freq_count'] += 1
+    # Accelerated Aging (5x capacity instead of 10x)
+    if algo_state['freq_count'] >= cache_snapshot.capacity * 5:
+        to_remove = []
+        dk.clear()
+        for k in freq:
+            freq[k] //= 2
+            if freq[k] == 0: to_remove.append(k)
+        for k in to_remove: del freq[k]
+        algo_state['freq_count'] = 0
+=======
+    # Frequency with Doorkeeper and Cap
+    if key in freq:
+        freq[key] = min(freq[key] + 1, 15)
+    elif key in dk:
+        freq[key] = 1
+        del dk[key]
+    else:
+        dk[key] = None
+        # Enforce Doorkeeper Limit (10x capacity)
+        if len(dk) > cache_snapshot.capacity * 10:
+            dk.popitem(last=False)
+
+    algo_state['freq_count'] += 1
+    # Aging (10x capacity)
+    if algo_state['freq_count'] >= cache_snapshot.capacity * 10:
+        to_remove = []
+        # Doorkeeper is NOT cleared here, it manages its own size
+        for k in freq:
+            freq[k] //= 2
+            if freq[k] == 0: to_remove.append(k)
+        for k in to_remove: del freq[k]
+        algo_state['freq_count'] = 0
+>>>>>>> REPLACE
+</DIFF>
+
+<NAME>
+update_insert_decouple_dk
+</NAME>
+
+<DESCRIPTION>
+Apply the same logic as in update_after_hit to update_after_insert: manage Doorkeeper size explicitly and extend aging interval.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Frequency with Doorkeeper and Cap
+    if key in freq:
+        freq[key] = min(freq[key] + 1, 15)
+    elif key in dk:
+        freq[key] = 1
+        dk.remove(key)
+    else:
+        dk.add(key)
+
+    algo_state['freq_count'] += 1
+    # Accelerated Aging
+    if algo_state['freq_count'] >= cache_snapshot.capacity * 5:
+        to_remove = []
+        dk.clear()
+        for k in freq:
+            freq[k] //= 2
+            if freq[k] == 0: to_remove.append(k)
+        for k in to_remove: del freq[k]
+        algo_state['freq_count'] = 0
+=======
+    # Frequency with Doorkeeper and Cap
+    if key in freq:
+        freq[key] = min(freq[key] + 1, 15)
+    elif key in dk:
+        freq[key] = 1
+        del dk[key]
+    else:
+        dk[key] = None
+        # Enforce Doorkeeper Limit
+        if len(dk) > cache_snapshot.capacity * 10:
+            dk.popitem(last=False)
+
+    algo_state['freq_count'] += 1
+    # Aging (10x capacity)
+    if algo_state['freq_count'] >= cache_snapshot.capacity * 10:
+        to_remove = []
+        # Doorkeeper is NOT cleared here
+        for k in freq:
+            freq[k] //= 2
+            if freq[k] == 0: to_remove.append(k)
+        for k in to_remove: del freq[k]
+        algo_state['freq_count'] = 0
+>>>>>>> REPLACE
+</DIFF>

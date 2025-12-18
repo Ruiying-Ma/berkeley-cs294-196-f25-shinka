@@ -1,0 +1,113 @@
+# EVOLVE-BLOCK-START
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+
+# Metadata
+# - m_key_timestamp: last access time for each cached key
+# - m_key_segment: 'p' = protected (frequent), 'b' = probation (recent/unproven)
+m_key_timestamp = dict()
+m_key_segment = dict()
+
+def _protected_limit(cache_snapshot):
+    """Target size for the protected segment (80% of capacity, at least 1)."""
+    try:
+        cap = int(cache_snapshot.capacity)
+    except Exception:
+        cap = max(1, len(cache_snapshot.cache))
+    return max(1, int(0.8 * cap))
+
+def _demote_if_needed(cache_snapshot):
+    """Ensure protected segment does not exceed its quota by demoting its LRU."""
+    prot_limit = _protected_limit(cache_snapshot)
+    prot_keys = [k for k in cache_snapshot.cache if m_key_segment.get(k) == 'p']
+    if len(prot_keys) <= prot_limit:
+        return
+    # Demote LRU from protected to probation
+    lru_key = min(prot_keys, key=lambda k: m_key_timestamp.get(k, float('inf')))
+    m_key_segment[lru_key] = 'b'
+
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    # Prefer evicting from probation (items not yet proven frequent)
+    probation_keys = [k for k in cache_snapshot.cache if m_key_segment.get(k, 'b') == 'b']
+    if probation_keys:
+        victim = min(probation_keys, key=lambda k: m_key_timestamp.get(k, float('inf')))
+        return victim
+    # Fallback: evict global LRU
+    all_keys = list(cache_snapshot.cache.keys())
+    victim = min(all_keys, key=lambda k: m_key_timestamp.get(k, float('inf')))
+    return victim
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_key_timestamp, m_key_segment
+    # Refresh recency
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+    # Promote to protected on first post-admission hit
+    if m_key_segment.get(obj.key, 'b') == 'b':
+        m_key_segment[obj.key] = 'p'
+    # Enforce protected quota
+    _demote_if_needed(cache_snapshot)
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp, m_key_segment
+    # New entries start in probation
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+    m_key_segment[obj.key] = 'b'
+    # Keep protected within quota as cache grows
+    _demote_if_needed(cache_snapshot)
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp, m_key_segment
+    # Clean up all metadata for the evicted object
+    m_key_timestamp.pop(evicted_obj.key, None)
+    m_key_segment.pop(evicted_obj.key, None)
+
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

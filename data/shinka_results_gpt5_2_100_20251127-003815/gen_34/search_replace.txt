@@ -1,0 +1,245 @@
+<NAME>
+tinyf_arc_admission_compare_and_fast_promotion
+</NAME>
+
+<DESCRIPTION>
+I introduce a TinyLFU-style admission comparison into the eviction policy and make promotions on hits more responsive. Specifically:
+
+1) Admission by comparison in evict: When the cache is full and we must evict, we check the estimated frequency of the incoming key (from the TinyLFU sketch) against a candidate from the probation segment. If the incoming key is hotter than that probation candidate, we preferentially evict from the protected segment instead (choosing a low-frequency protected candidate). This emulates W-TinyLFU’s idea of admitting hot newcomers by sacrificing less-valuable residents, improving warm-up on phase shifts and hot-item bursts.
+
+2) Unconditional promotion on probation hit: Upon hitting an item in probation, promote it to protected unconditionally (classic SLRU behavior). This captures temporal locality more quickly, particularly benefiting workloads with short reuse distances that were previously throttled by a frequency threshold.
+
+3) Direct-to-protected admission for very hot inserts: On insert, if the TinyLFU estimate for the new key is high (≥4 after the doorkeeper increment), place it directly into protected MRU; otherwise, keep it in probation. This accelerates inclusion of very hot items without extensive probation churn, while the protected size limit and demotion maintain balance.
+
+Together, these changes preserve the stability of the segmented LRU while better aligning eviction/admission decisions with frequency estimates, reducing misses on mixed workloads and during quick phase changes, and preventing scan pollution by still favoring evictions out of probation for cold newcomers.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    _reset_if_new_run(cache_snapshot)
+    _prune_metadata(cache_snapshot)
+    _ensure_sketch(cache_snapshot)
+    _seed_from_cache(cache_snapshot)
+
+    # Prefer evicting from probation; fall back to protected when necessary.
+    if m_probation:
+        victim = _eviction_sample(cache_snapshot, m_probation, sample_k=8)
+        if victim is not None:
+            return victim
+    if m_protected:
+        victim = _eviction_sample(cache_snapshot, m_protected, sample_k=8)
+        if victim is not None:
+            return victim
+    # Fallback: choose any key from the cache
+    for k in cache_snapshot.cache.keys():
+        return k
+    return None
+=======
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    _reset_if_new_run(cache_snapshot)
+    _prune_metadata(cache_snapshot)
+    _ensure_sketch(cache_snapshot)
+    _seed_from_cache(cache_snapshot)
+
+    # TinyLFU-style admission by comparison:
+    # If the incoming object appears hotter than the probation candidate,
+    # evict from protected instead; otherwise evict from probation.
+    f_new = _sketch_est(cache_snapshot, obj.key)
+
+    if m_probation:
+        cand_p = _eviction_sample(cache_snapshot, m_probation, sample_k=8)
+        if cand_p is not None:
+            f_p = _sketch_est(cache_snapshot, cand_p)
+            # If new is not hotter (<=), evict from probation (window).
+            if f_new <= f_p or not m_protected:
+                return cand_p
+            # New seems hotter: sacrifice a weak protected entry to admit the hot newcomer.
+            cand_m2 = _eviction_sample(cache_snapshot, m_protected, sample_k=8)
+            if cand_m2 is not None:
+                return cand_m2
+            # Fallback if protected empty due to races
+            return cand_p
+
+    if m_protected:
+        victim = _eviction_sample(cache_snapshot, m_protected, sample_k=8)
+        if victim is not None:
+            return victim
+
+    # Fallback: choose any key from the cache
+    for k in cache_snapshot.cache.keys():
+        return k
+    return None
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_miss_streak
+    _reset_if_new_run(cache_snapshot)
+    _prune_metadata(cache_snapshot)
+    _ensure_sketch(cache_snapshot)
+
+    k = obj.key
+    m_miss_streak = 0
+    # Learn frequency
+    _sketch_add(cache_snapshot, k, 1)
+
+    if k in m_protected:
+        # Refresh recency in protected
+        m_protected.move_to_end(k, last=True)
+    elif k in m_probation:
+        # Promote only if sufficiently frequent; else refresh in probation
+        if _sketch_est(cache_snapshot, k) >= 2:
+            m_probation.pop(k, None)
+            m_protected[k] = None
+        else:
+            m_probation.move_to_end(k, last=True)
+    else:
+        # Metadata miss but cache hit: re-admit conservatively
+        if _sketch_est(cache_snapshot, k) >= 2:
+            m_protected[k] = None
+        else:
+            m_probation[k] = None
+
+    # Keep protected near its target by demoting oldest if needed
+    target = _protected_target_size(cache_snapshot)
+    while len(m_protected) > target:
+        demote_k, _ = m_protected.popitem(last=False)  # LRU of protected
+        m_probation[demote_k] = None
+=======
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_miss_streak
+    _reset_if_new_run(cache_snapshot)
+    _prune_metadata(cache_snapshot)
+    _ensure_sketch(cache_snapshot)
+
+    k = obj.key
+    m_miss_streak = 0
+    # Learn frequency
+    _sketch_add(cache_snapshot, k, 1)
+
+    if k in m_protected:
+        # Refresh recency in protected
+        m_protected.move_to_end(k, last=True)
+    elif k in m_probation:
+        # SLRU-style: promote on first hit to capture short-term reuse
+        m_probation.pop(k, None)
+        m_protected[k] = None
+    else:
+        # Metadata miss but cache hit: re-admit based on frequency
+        if _sketch_est(cache_snapshot, k) >= 3:
+            m_protected[k] = None
+        else:
+            m_probation[k] = None
+
+    # Keep protected near its target by demoting oldest if needed
+    target = _protected_target_size(cache_snapshot)
+    while len(m_protected) > target:
+        demote_k, _ = m_protected.popitem(last=False)  # LRU of protected
+        m_probation[demote_k] = None
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_miss_streak
+    _reset_if_new_run(cache_snapshot)
+    _prune_metadata(cache_snapshot)
+    _ensure_sketch(cache_snapshot)
+
+    k = obj.key
+    m_miss_streak += 1
+
+    # New items enter probation (doorkeeper credit to sketch)
+    _sketch_add(cache_snapshot, k, 1)
+    m_protected.pop(k, None)
+    m_probation.pop(k, None)
+    m_probation[k] = None
+
+    # Ensure protected doesn't exceed its target (shouldn't change on insert,
+    # but keep the invariant in case of out-of-band changes)
+    target = _protected_target_size(cache_snapshot)
+    while len(m_protected) > target:
+        demote_k, _ = m_protected.popitem(last=False)
+        m_probation[demote_k] = None
+=======
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_miss_streak
+    _reset_if_new_run(cache_snapshot)
+    _prune_metadata(cache_snapshot)
+    _ensure_sketch(cache_snapshot)
+
+    k = obj.key
+    m_miss_streak += 1
+
+    # Doorkeeper credit to sketch to bootstrap frequency
+    _sketch_add(cache_snapshot, k, 1)
+
+    # Clear any stale placements
+    m_protected.pop(k, None)
+    m_probation.pop(k, None)
+
+    # Hot-item bypass: directly admit very hot items to protected
+    if _sketch_est(cache_snapshot, k) >= 4:
+        m_protected[k] = None
+    else:
+        # Default: enter probation (window)
+        m_probation[k] = None
+
+    # Ensure protected stays within its adaptive target by demoting oldest if needed
+    target = _protected_target_size(cache_snapshot)
+    while len(m_protected) > target:
+        demote_k, _ = m_protected.popitem(last=False)
+        m_probation[demote_k] = None
+>>>>>>> REPLACE
+
+</DIFF>

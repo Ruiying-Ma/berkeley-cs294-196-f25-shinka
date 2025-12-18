@@ -1,0 +1,661 @@
+--- a/original.py
++++ b/original.py
+@@ -1,343 +1,358 @@
+ # EVOLVE-BLOCK-START
+ """Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+ 
+ from collections import OrderedDict
+ 
+-# LRU timestamp map kept for compatibility and as a tie-breaker
++# External timestamp map kept for compatibility and tie-breaking
+ m_key_timestamp = dict()
+ 
+-# Adaptive Replacement Cache (ARC) metadata
+-arc_T1 = OrderedDict()  # recent, resident
+-arc_T2 = OrderedDict()  # frequent, resident
+-arc_B1 = OrderedDict()  # ghost of T1
+-arc_B2 = OrderedDict()  # ghost of T2
+-arc_p = 0               # target size of T1
+-arc_capacity = None     # will be initialized from cache_snapshot
+-
+-# Scan and adaptation trackers
+-last_ghost_hit_access = -1  # last access_count when B1/B2 was hit
+-cold_streak = 0             # consecutive brand-new insertions
+-scan_guard_until = -1       # time until which we bias REPLACE to protect T2
+-
+-
+-def _ensure_capacity(cache_snapshot):
+-    global arc_capacity, arc_p
+-    if arc_capacity is None:
+-        arc_capacity = max(int(cache_snapshot.capacity), 1)
+-    # Clamp p to [0, C]
+-    arc_p = max(0, min(arc_p, arc_capacity))
+-
+-
+-def _decay_p_if_idle(cache_snapshot):
+-    # Gentle decay of p toward 0 when no ghost hits have happened recently.
+-    # Helps recover from scans/uniform phases without oscillation.
+-    global arc_p
+-    cap = arc_capacity if arc_capacity is not None else 1
+-    idle = 0 if last_ghost_hit_access < 0 else (cache_snapshot.access_count - last_ghost_hit_access)
+-    if idle > 0 and cap > 0:
+-        # Proportional decay bounded by cap/8 per call
+-        step = max(1, idle // max(1, cap // 4))
+-        arc_p = max(0, arc_p - min(max(1, cap // 8), step))
+-        # Extra clamp during extended cold streaks
+-        if cold_streak >= max(1, cap // 2):
+-            arc_p = max(0, arc_p - min(max(1, cap // 4), cold_streak // max(1, cap // 8)))
+-
+-
+-def _move_to_mru(od, key):
+-    # Push key to MRU position of an OrderedDict
+-    if key in od:
+-        od.pop(key, None)
+-    od[key] = True
+-
+-
+-def _pop_lru(od):
+-    if od:
+-        k, _ = od.popitem(last=False)
+-        return k
+-    return None
+-
+-
+-def _trim_ghosts():
+-    # Keep ghosts total size within capacity, prefer trimming the side that exceeds
+-    # its per-side target: target_B1 ≈ p, target_B2 ≈ C - p
+-    cap = arc_capacity if arc_capacity is not None else 1
+-    # Clamp p to [0, C]
+-    global arc_p
+-    arc_p = max(0, min(arc_p, cap))
+-    total = len(arc_B1) + len(arc_B2)
+-    while total > cap:
+-        target_B1 = min(cap, max(0, arc_p))
+-        target_B2 = max(0, cap - target_B1)
+-        excess_B1 = max(0, len(arc_B1) - target_B1)
+-        excess_B2 = max(0, len(arc_B2) - target_B2)
+-        if excess_B1 >= excess_B2 and arc_B1:
+-            _pop_lru(arc_B1)
+-        elif arc_B2:
+-            _pop_lru(arc_B2)
++
++class ARCManager:
++    def __init__(self):
++        # ARC metadata
++        self.T1 = OrderedDict()  # recent, resident
++        self.T2 = OrderedDict()  # frequent, resident
++        self.B1 = OrderedDict()  # ghost of T1
++        self.B2 = OrderedDict()  # ghost of T2
++        self.p = 0               # target size of T1
++        self.C = None            # capacity (in objects)
++        # Adaptation and scan handling
++        self.last_ghost_hit_access = -1
++        self.cold_streak = 0
++        self.scan_guard_until = -1
++        self.bias_armed = False        # for one-shot demotion bias during scan guard
++        self.last_replaced_from = None # 'T1' or 'T2'
++
++    # -------------- Utilities --------------
++
++    def _ensure_capacity(self, cache_snapshot):
++        if self.C is None:
++            self.C = max(int(cache_snapshot.capacity), 1)
++        self.p = max(0, min(self.p, self.C))
++
++    def _move_to_mru(self, od, k):
++        if k in od:
++            od.pop(k, None)
++        od[k] = True
++
++    def _pop_lru(self, od):
++        if od:
++            k, _ = od.popitem(last=False)
++            return k
++        return None
++
++    def _trim_ghosts(self):
++        # Keep |B1| + |B2| <= C with hysteresis toward targets (p and C-p)
++        if self.C is None:
++            return
++        total = len(self.B1) + len(self.B2)
++        h = max(1, self.C // 32)  # hysteresis slack
++        while total > self.C:
++            tgt_B1 = min(self.C, max(0, self.p))
++            tgt_B2 = max(0, self.C - tgt_B1)
++            # Prefer trimming side exceeding target + h
++            if len(self.B1) > tgt_B1 + h and self.B1:
++                self._pop_lru(self.B1)
++            elif len(self.B2) > tgt_B2 + h and self.B2:
++                self._pop_lru(self.B2)
++            else:
++                # If both within slack, trim the larger side
++                if len(self.B1) >= len(self.B2) and self.B1:
++                    self._pop_lru(self.B1)
++                elif self.B2:
++                    self._pop_lru(self.B2)
++                else:
++                    break
++            total = len(self.B1) + len(self.B2)
++
++    def _resync(self, cache_snapshot):
++        # Keep residents aligned with actual cache content; ghosts disjoint
++        cache_keys = set(cache_snapshot.cache.keys())
++        for k in list(self.T1.keys()):
++            if k not in cache_keys:
++                self.T1.pop(k, None)
++        for k in list(self.T2.keys()):
++            if k not in cache_keys:
++                self.T2.pop(k, None)
++        # Any cached but untracked -> assume recent (T1)
++        for k in cache_keys:
++            if k not in self.T1 and k not in self.T2:
++                self.T1[k] = True
++        # Ghosts must be disjoint from residents
++        for k in list(self.B1.keys()):
++            if k in cache_keys or k in self.T1 or k in self.T2:
++                self.B1.pop(k, None)
++        for k in list(self.B2.keys()):
++            if k in cache_keys or k in self.T1 or k in self.T2:
++                self.B2.pop(k, None)
++        self._trim_ghosts()
++
++    def _idle_decay_p(self, cache_snapshot):
++        # Gentle decay: if a long idle since last ghost hit, slowly reduce p toward 0
++        if self.last_ghost_hit_access >= 0 and self.C:
++            idle = cache_snapshot.access_count - self.last_ghost_hit_access
++            if idle > self.C and self.p > 0:
++                self.p = max(0, self.p - 1)
++
++    # -------------- Core policy --------------
++
++    def _effective_p(self, cache_snapshot):
++        # Compute effective p with scan guard and one-shot demotion bias when applicable
++        eff_p = self.p
++        now = cache_snapshot.access_count
++        if now <= self.scan_guard_until:
++            window = min(8, max(1, self.C // 16))
++            # Gentle drop scaled by cold streak beyond half capacity
++            step_unit = max(1, self.C // 16)
++            extra = max(0, (self.cold_streak - max(1, self.C // 2)) // step_unit)
++            drop = min(step_unit, 1 + extra)
++            eff_p = max(0, eff_p - drop)
++            # Time-bounded demotion bias (one-shot) if frequency hints absent
++            if self.bias_armed and len(self.B2) == 0 and len(self.T2) > len(self.T1):
++                eff_p = 0
++                # consume the bias for this REPLACE
++                self.bias_armed = False
++        return eff_p
++
++    def _arc_replace_from_t1(self, obj, eff_p):
++        # Canonical ARC decision using effective p and B2 hint
++        x_in_B2 = (obj.key in self.B2)
++        t1_sz = len(self.T1)
++        return (t1_sz >= 1) and (t1_sz > eff_p or (x_in_B2 and t1_sz == eff_p))
++
++    def evict(self, cache_snapshot, obj):
++        self._ensure_capacity(cache_snapshot)
++        self._resync(cache_snapshot)
++        self._idle_decay_p(cache_snapshot)
++
++        # Canonical p update only on ghost hits, using ceil and capped steps
++        if obj.key in self.B1 or obj.key in self.B2:
++            if obj.key in self.B1:
++                # step_up = ceil(|B2| / max(1, |B1|)), cap by C//8
++                num, den = len(self.B2), max(1, len(self.B1))
++                step_up = (num + den - 1) // den
++                self.p = min(self.C, self.p + min(step_up, max(1, self.C // 8)))
++            else:
++                # step_down = ceil(|B1| / max(1, |B2|)), cap by C//8 (C//4 on long cold streaks)
++                num, den = len(self.B1), max(1, len(self.B2))
++                step_down = (num + den - 1) // den
++                cap_step = max(1, self.C // 4) if self.cold_streak >= max(1, self.C // 2) else max(1, self.C // 8)
++                dec = min(step_down, cap_step, self.p)
++                self.p = max(0, self.p - dec)
++            # record ghost-hit time and reset scan indicators
++            self.last_ghost_hit_access = cache_snapshot.access_count
++            self.cold_streak = 0
++            self.scan_guard_until = -1
++            self.bias_armed = False
++
++        eff_p = self._effective_p(cache_snapshot)
++        from_t1 = self._arc_replace_from_t1(obj, eff_p)
++
++        # Primary ARC REPLACE
++        if from_t1 and self.T1:
++            self.last_replaced_from = 'T1'
++            return next(iter(self.T1))
++        if (not from_t1) and self.T2:
++            self.last_replaced_from = 'T2'
++            return next(iter(self.T2))
++
++        # If preferred empty, try the other
++        if self.T1:
++            self.last_replaced_from = 'T1'
++            return next(iter(self.T1))
++        if self.T2:
++            self.last_replaced_from = 'T2'
++            return next(iter(self.T2))
++
++        # Resync and retry once
++        self._resync(cache_snapshot)
++        from_t1 = self._arc_replace_from_t1(obj, eff_p)
++        if from_t1 and self.T1:
++            self.last_replaced_from = 'T1'
++            return next(iter(self.T1))
++        if (not from_t1) and self.T2:
++            self.last_replaced_from = 'T2'
++            return next(iter(self.T2))
++
++        # Deterministic shallow fallback with unified peek budget
++        d = min(8, max(1, self.C // 16))
++
++        # Prefer: T1 LRU not in B2 (avoid evicting likely frequent)
++        cnt = 0
++        for k in self.T1.keys():
++            if k not in self.B2:
++                self.last_replaced_from = 'T1'
++                return k
++            cnt += 1
++            if cnt >= d:
++                break
++
++        # Next: T2 LRU present in B1 (recency-only on T2)
++        cnt = 0
++        for k in self.T2.keys():
++            if k in self.B1:
++                self.last_replaced_from = 'T2'
++                return k
++            cnt += 1
++            if cnt >= d:
++                break
++
++        # Timestamp tie-breaker over T1, else arbitrary
++        if self.T1 and m_key_timestamp:
++            best = None
++            best_ts = float('inf')
++            for k in self.T1.keys():
++                ts = m_key_timestamp.get(k, float('inf'))
++                if ts < best_ts:
++                    best_ts = ts
++                    best = k
++            if best is not None:
++                self.last_replaced_from = 'T1'
++                return best
++
++        # As a last resort, evict any cache key while trying to infer source
++        if cache_snapshot.cache:
++            for k in cache_snapshot.cache.keys():
++                if k in self.T1:
++                    self.last_replaced_from = 'T1'
++                    return k
++                if k in self.T2:
++                    self.last_replaced_from = 'T2'
++                    return k
++            # unknown membership
++            self.last_replaced_from = 'T1'
++            return next(iter(cache_snapshot.cache.keys()))
++        self.last_replaced_from = None
++        return None
++
++    def update_after_hit(self, cache_snapshot, obj):
++        self._ensure_capacity(cache_snapshot)
++        # Hit transitions: move to T2 MRU
++        k = obj.key
++        if k in self.T1:
++            self.T1.pop(k, None)
++            self._move_to_mru(self.T2, k)
+         else:
+-            # If both within target but total still exceeds, trim the larger
+-            if len(arc_B1) >= len(arc_B2) and arc_B1:
+-                _pop_lru(arc_B1)
+-            elif arc_B2:
+-                _pop_lru(arc_B2)
++            self._move_to_mru(self.T2, k)
++        # Residents must be removed from ghosts
++        self.B1.pop(k, None)
++        self.B2.pop(k, None)
++        # Timestamp and scan reset on reuse
++        m_key_timestamp[k] = cache_snapshot.access_count
++        self.cold_streak = 0
++        self.scan_guard_until = -1
++        self.bias_armed = False
++
++    def update_after_insert(self, cache_snapshot, obj):
++        self._ensure_capacity(cache_snapshot)
++        k = obj.key
++        # Admission: ghosts -> T2, brand-new -> T1
++        if k in self.B1 or k in self.B2:
++            # reuse detected: place in T2
++            self.B1.pop(k, None)
++            self.B2.pop(k, None)
++            self._move_to_mru(self.T2, k)
++            self.last_ghost_hit_access = cache_snapshot.access_count
++            # reset scan guard/bias on reuse
++            self.cold_streak = 0
++            self.scan_guard_until = -1
++            self.bias_armed = False
++        else:
++            # brand new -> T1
++            self._move_to_mru(self.T1, k)
++            self.cold_streak += 1
++            # Start a short guard during potential scans/repeated cold phases
++            if self.cold_streak >= max(1, self.C // 2):
++                self.scan_guard_until = cache_snapshot.access_count + min(8, max(1, self.C // 16))
++                self.bias_armed = True
++        # maintain disjoint ghosts and timestamps
++        self.B1.pop(k, None)
++        self.B2.pop(k, None)
++        m_key_timestamp[k] = cache_snapshot.access_count
++        self._trim_ghosts()
++
++    def update_after_evict(self, cache_snapshot, obj, evicted_obj):
++        self._ensure_capacity(cache_snapshot)
++        k = evicted_obj.key
++        # Place victim into appropriate ghost using the remembered REPLACE source
++        placed = False
++        if self.last_replaced_from == 'T1':
++            # Ensure it's removed from residents then move to B1
++            self.T1.pop(k, None)
++            self.B2.pop(k, None)
++            self._move_to_mru(self.B1, k)
++            placed = True
++        elif self.last_replaced_from == 'T2':
++            self.T2.pop(k, None)
++            self.B1.pop(k, None)
++            self._move_to_mru(self.B2, k)
++            placed = True
++        else:
++            # Fallback to observed membership
++            if k in self.T1:
++                self.T1.pop(k, None)
++                self.B2.pop(k, None)
++                self._move_to_mru(self.B1, k)
++                placed = True
++            elif k in self.T2:
++                self.T2.pop(k, None)
++                self.B1.pop(k, None)
++                self._move_to_mru(self.B2, k)
++                placed = True
++
++        if not placed:
++            # Unknown: prefer consistency with existing ghost if any; otherwise B1
++            if k in self.B2:
++                self.B1.pop(k, None)
++                self._move_to_mru(self.B2, k)
+             else:
+-                break
+-        total = len(arc_B1) + len(arc_B2)
+-
+-
+-def _resync(cache_snapshot):
+-    # Ensure resident metadata tracks actual cache content and keep ghosts disjoint
+-    cache_keys = set(cache_snapshot.cache.keys())
+-    for k in list(arc_T1.keys()):
+-        if k not in cache_keys:
+-            arc_T1.pop(k, None)
+-    for k in list(arc_T2.keys()):
+-        if k not in cache_keys:
+-            arc_T2.pop(k, None)
+-    # Add any cached keys we missed to T1 as recent
+-    for k in cache_keys:
+-        if k not in arc_T1 and k not in arc_T2:
+-            arc_T1[k] = True
+-    # Ghosts must not contain residents
+-    for k in list(arc_B1.keys()):
+-        if k in cache_keys or k in arc_T1 or k in arc_T2:
+-            arc_B1.pop(k, None)
+-    for k in list(arc_B2.keys()):
+-        if k in cache_keys or k in arc_T1 or k in arc_T2:
+-            arc_B2.pop(k, None)
+-    _trim_ghosts()
++                self.B2.pop(k, None)
++                self._move_to_mru(self.B1, k)
++
++        # Clean up timestamp to contain growth
++        m_key_timestamp.pop(k, None)
++        self._trim_ghosts()
++        # Reset remembered source for next eviction
++        self.last_replaced_from = None
++
++
++# Single global manager instance
++_arc = ARCManager()
+ 
+ 
+ def evict(cache_snapshot, obj):
+-    '''
+-    This function defines how the algorithm chooses the eviction victim.
+-    - Args:
+-        - `cache_snapshot`: A snapshot of the current cache state.
+-        - `obj`: The new object that needs to be inserted into the cache.
+-    - Return:
+-        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+-    '''
+-    global arc_p, last_ghost_hit_access, cold_streak
+-    _ensure_capacity(cache_snapshot)
+-    _resync(cache_snapshot)
+-    _decay_p_if_idle(cache_snapshot)
+-
+-    cap = arc_capacity if arc_capacity is not None else 1
+-
+-    # Consolidate ghost-driven p updates here to avoid double-stepping
+-    if obj.key in arc_B1 or obj.key in arc_B2:
+-        if obj.key in arc_B1:
+-            # Increase p toward recency
+-            num = len(arc_B2)
+-            den = max(1, len(arc_B1))
+-            delta = (num + den - 1) // den  # ceil
+-            arc_p = min(cap, arc_p + min(delta, max(1, cap // 8)))
+-        else:
+-            # Decrease p toward frequency, with stronger step under long cold streaks
+-            num = len(arc_B1)
+-            den = max(1, len(arc_B2))
+-            delta = (num + den - 1) // den  # ceil
+-            step_bound = max(1, cap // 4) if cold_streak >= max(1, cap // 2) else max(1, cap // 8)
+-            dec = min(delta, step_bound, arc_p)
+-            arc_p = max(0, arc_p - dec)
+-        # Record ghost-hit time and reset scan indicators
+-        last_ghost_hit_access = cache_snapshot.access_count
+-        cold_streak = 0
+-
+-    # Apply scan guard bias window if active for new insertions
+-    effective_p = arc_p
+-    if cache_snapshot.access_count <= scan_guard_until:
+-        effective_p = max(0, arc_p - max(1, cap // 8))
+-
+-    # Canonical ARC REPLACE decision with effective p
+-    x_in_B2 = obj.key in arc_B2
+-    t1_sz = len(arc_T1)
+-    from_t1 = (t1_sz >= 1 and (t1_sz > effective_p or (x_in_B2 and t1_sz == effective_p)))
+-
+-    # Primary choice
+-    if from_t1 and arc_T1:
+-        return next(iter(arc_T1))
+-    if (not from_t1) and arc_T2:
+-        return next(iter(arc_T2))
+-
+-    # Try the other list if preferred is empty
+-    if arc_T1:
+-        return next(iter(arc_T1))
+-    if arc_T2:
+-        return next(iter(arc_T2))
+-
+-    # Resync and retry once if both were empty
+-    _resync(cache_snapshot)
+-    t1_sz = len(arc_T1)
+-    from_t1 = (t1_sz >= 1 and (t1_sz > effective_p or (x_in_B2 and t1_sz == effective_p)))
+-    if from_t1 and arc_T1:
+-        return next(iter(arc_T1))
+-    if (not from_t1) and arc_T2:
+-        return next(iter(arc_T2))
+-
+-    # Deterministic ghost-informed fallback
+-    # (a) T1 LRU not in B2 (avoid evicting likely frequent)
+-    for k in arc_T1.keys():
+-        if k not in arc_B2:
+-            return k
+-    # (b) T2 LRU that appears in B1 (recency-only on T2 not proven frequent)
+-    for k in arc_T2.keys():
+-        if k in arc_B1:
+-            return k
+-    # (c) Depth-limited peek for a non-B2 key
+-    depth = max(1, min(8, cap // 16))
+-    cnt = 0
+-    for k in arc_T1.keys():
+-        if k not in arc_B2:
+-            return k
+-        cnt += 1
+-        if cnt >= depth:
+-            break
+-    cnt = 0
+-    for k in arc_T2.keys():
+-        if k in arc_B1:
+-            return k
+-        cnt += 1
+-        if cnt >= depth:
+-            break
+-    # (d) Timestamp tie-breaker restricted to T1, else any
+-    if arc_T1 and m_key_timestamp:
+-        min_ts = float('inf')
+-        best = None
+-        for k in arc_T1.keys():
+-            ts = m_key_timestamp.get(k, float('inf'))
+-            if ts < min_ts:
+-                min_ts = ts
+-                best = k
+-        if best is not None:
+-            return best
+-    if cache_snapshot.cache:
+-        return next(iter(cache_snapshot.cache.keys()))
+-    return None
++    return _arc.evict(cache_snapshot, obj)
+ 
+ 
+ def update_after_hit(cache_snapshot, obj):
+-    '''
+-    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+-    - Args:
+-        - `cache_snapshot`: A snapshot of the current cache state.
+-        - `obj`: The object accessed during the cache hit.
+-    - Return: `None`
+-    '''
+-    global m_key_timestamp, cold_streak, scan_guard_until
+-    _ensure_capacity(cache_snapshot)
+-    _decay_p_if_idle(cache_snapshot)
+-    # ARC: on hit, move to T2 MRU
+-    key = obj.key
+-    if key in arc_T1:
+-        arc_T1.pop(key, None)
+-        _move_to_mru(arc_T2, key)
+-    else:
+-        # If already in T2, refresh; if not present due to drift, place in T2
+-        if key in arc_T2:
+-            _move_to_mru(arc_T2, key)
+-        else:
+-            _move_to_mru(arc_T2, key)
+-    # Keep ghosts disjoint with residents
+-    arc_B1.pop(key, None)
+-    arc_B2.pop(key, None)
+-    # Update timestamp and reset scan indicators
+-    m_key_timestamp[key] = cache_snapshot.access_count
+-    cold_streak = 0
+-    scan_guard_until = -1
++    _arc.update_after_hit(cache_snapshot, obj)
+ 
+ 
+ def update_after_insert(cache_snapshot, obj):
+-    '''
+-    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+-    - Args:
+-        - `cache_snapshot`: A snapshot of the current cache state.
+-        - `obj`: The object that was just inserted into the cache.
+-    - Return: `None`
+-    '''
+-    global m_key_timestamp, last_ghost_hit_access, cold_streak, scan_guard_until
+-    _ensure_capacity(cache_snapshot)
+-    _decay_p_if_idle(cache_snapshot)
+-    key = obj.key
+-    cap = arc_capacity if arc_capacity is not None else 1
+-
+-    # ARC admission policy without p updates (handled in evict)
+-    if key in arc_B1:
+-        arc_B1.pop(key, None)
+-        _move_to_mru(arc_T2, key)
+-        last_ghost_hit_access = cache_snapshot.access_count
+-        cold_streak = 0
+-    elif key in arc_B2:
+-        arc_B2.pop(key, None)
+-        _move_to_mru(arc_T2, key)
+-        last_ghost_hit_access = cache_snapshot.access_count
+-        cold_streak = 0
+-    else:
+-        # Brand new: insert into T1 (recent) and consider scan guard
+-        _move_to_mru(arc_T1, key)
+-        cold_streak += 1
+-        if cold_streak >= max(1, cap // 2):
+-            scan_guard_until = cache_snapshot.access_count + max(1, cap // 8)
+-
+-    # Ensure ghosts disjoint and trimmed
+-    arc_B1.pop(key, None)
+-    arc_B2.pop(key, None)
+-    _trim_ghosts()
+-    # Timestamp for tie-breaker
+-    m_key_timestamp[key] = cache_snapshot.access_count
++    _arc.update_after_insert(cache_snapshot, obj)
+ 
+ 
+ def update_after_evict(cache_snapshot, obj, evicted_obj):
+-    '''
+-    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+-    - Args:
+-        - `cache_snapshot`: A snapshot of the current cache state.
+-        - `obj`: The object to be inserted into the cache.
+-        - `evicted_obj`: The object that was just evicted from the cache.
+-    - Return: `None`
+-    '''
+-    global m_key_timestamp
+-    _ensure_capacity(cache_snapshot)
+-    k = evicted_obj.key
+-    # Move evicted resident to corresponding ghost list, keep ghosts disjoint
+-    if k in arc_T1:
+-        arc_T1.pop(k, None)
+-        arc_B2.pop(k, None)
+-        _move_to_mru(arc_B1, k)
+-    elif k in arc_T2:
+-        arc_T2.pop(k, None)
+-        arc_B1.pop(k, None)
+-        _move_to_mru(arc_B2, k)
+-    else:
+-        # Unknown membership: prefer consistency with existing ghost presence
+-        if k in arc_B2:
+-            arc_B1.pop(k, None)
+-            _move_to_mru(arc_B2, k)
+-        else:
+-            arc_B2.pop(k, None)
+-            _move_to_mru(arc_B1, k)
+-    # Remove timestamp entry for evicted item to avoid growth
+-    m_key_timestamp.pop(k, None)
+-    _trim_ghosts()
++    _arc.update_after_evict(cache_snapshot, obj, evicted_obj)
+ 
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

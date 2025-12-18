@@ -1,0 +1,109 @@
+<NAME>
+optimize_tinylfu_params_and_logic
+</NAME>
+
+<DESCRIPTION>
+This edit implements several optimizations derived from analyzing performance bottlenecks:
+1.  **Incumbency-Biased Eviction**: Modified the `evict` function to bias the TinyLFU duel in favor of the Main cache victim. The condition `freq_w > freq_m + 1` requires the Window victim to have a frequency at least 2 counts higher than the Main victim to displace it, reducing churn of established items.
+2.  **Decouple Doorkeeper Reset**: Changed Doorkeeper clearing logic. Instead of clearing it every aging interval, it is now cleared when its size exceeds `2 * capacity`. This improves scan resistance and prevents the filter from having "amnesia" purely based on time.
+3.  **Optimize TinyLFU Parameters**: Reduced `max_freq` from 60 to 15 to allow the frequency sketch to adapt faster to workload phase changes. Increased `aging_interval` from `5 * capacity` to `10 * capacity` to retain history longer for stable working sets.
+4.  **Second Chance for Demotions**: In `update_after_hit`, items demoted from Protected to Probation now receive `probation_hits` credit. This acts as a "second chance," allowing valuable items to return to the Protected segment with a single additional hit.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Aging and Constraints
+        # Age every 5x capacity to handle phase changes
+        self.aging_interval = capacity * 5
+        self.max_freq = 60
+
+    def get_freq(self, key):
+=======
+        # Aging and Constraints
+        # Age every 10x capacity to handle phase changes
+        self.aging_interval = capacity * 10
+        self.max_freq = 15
+        self.doorkeeper_limit = max(1000, int(capacity * 2))
+
+    def get_freq(self, key):
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        elif key in self.doorkeeper:
+            self.doorkeeper.remove(key)
+            self.freq[key] = 1 # Promoted from Doorkeeper to Frequency Map
+        else:
+            self.doorkeeper.add(key)
+
+        if self.access_count % self.aging_interval == 0:
+            self.age()
+
+    def age(self):
+        # Halve frequencies
+        rem = []
+        for k in self.freq:
+            self.freq[k] //= 2
+            if self.freq[k] == 0:
+                rem.append(k)
+        for k in rem:
+            del self.freq[k]
+        self.doorkeeper.clear()
+=======
+        elif key in self.doorkeeper:
+            self.doorkeeper.remove(key)
+            self.freq[key] = 1 # Promoted from Doorkeeper to Frequency Map
+        else:
+            self.doorkeeper.add(key)
+
+        if len(self.doorkeeper) > self.doorkeeper_limit:
+            self.doorkeeper.clear()
+
+        if self.access_count % self.aging_interval == 0:
+            self.age()
+
+    def age(self):
+        # Halve frequencies
+        rem = []
+        for k in self.freq:
+            self.freq[k] //= 2
+            if self.freq[k] == 0:
+                rem.append(k)
+        for k in rem:
+            del self.freq[k]
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        # TinyLFU Duel
+        freq_w = state.get_freq(w_victim_key)
+        freq_m = state.get_freq(m_victim_key)
+
+        if freq_w > freq_m:
+            return m_victim_key
+        else:
+            return w_victim_key
+=======
+        # TinyLFU Duel
+        freq_w = state.get_freq(w_victim_key)
+        freq_m = state.get_freq(m_victim_key)
+
+        # Bias towards Main: only evict Main if Window item is significantly better
+        if freq_w > freq_m + 1:
+            return m_victim_key
+        else:
+            return w_victim_key
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+            # Handle Protected Overflow: Move LRU to Probation
+            if len(state.protected) > state.protected_size:
+                victim, _ = state.protected.popitem(last=False)
+                state.probation[victim] = True
+                state.probation.move_to_end(victim)
+                # Note: Demoted item enters probation without 'probation_hits' credit
+=======
+            # Handle Protected Overflow: Move LRU to Probation
+            if len(state.protected) > state.protected_size:
+                victim, _ = state.protected.popitem(last=False)
+                state.probation[victim] = True
+                # Grant second chance credit to demoted items
+                state.probation_hits[victim] = True
+                state.probation.move_to_end(victim)
+>>>>>>> REPLACE
+</DIFF>

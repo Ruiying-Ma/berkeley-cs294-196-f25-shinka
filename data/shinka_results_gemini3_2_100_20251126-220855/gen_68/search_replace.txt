@@ -1,0 +1,109 @@
+<NAME>
+large_ghost_and_decay
+</NAME>
+
+<DESCRIPTION>
+1. Increase Ghost Registry capacity to 3x Cache Capacity to better capture large loops (addressing Trace 14).
+2. Implement Frequency Decay (halving) when restoring items from Ghost to prevent old heavy hitters from dominating without proving recent value.
+3. Update `update_after_hit` to track frequency for items in Main as well, enabling frequency-based decisions there.
+4. Implement "Second Chance" eviction for Main queue: items with `freq >= 2` get a second chance (moved to MRU, freq halved) instead of eviction. This protects the working set.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    if not s3_config:
+        cap = cache_snapshot.capacity
+        # Small queue size target (10%)
+        s3_config['small_target'] = max(1, int(cap * 0.1))
+        # Aging interval (once per capacity accesses)
+        s3_config['aging_interval'] = cap
+=======
+    if not s3_config:
+        cap = cache_snapshot.capacity
+        # Small queue size target (10%)
+        s3_config['small_target'] = max(1, int(cap * 0.1))
+        # Aging interval (once per capacity accesses)
+        s3_config['aging_interval'] = cap
+        # Ghost registry size target (3x capacity)
+        s3_config['ghost_target'] = cap * 3
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # 2. If Small is safe, evict from Main (LRU)
+    if s3_main:
+        return next(iter(s3_main))
+=======
+    # 2. If Small is safe, evict from Main (LRU with Second Chance)
+    if s3_main:
+        # Check up to 4 candidates
+        for _ in range(4):
+            victim_key = next(iter(s3_main))
+            freq = s3_freq.get(victim_key, 0)
+
+            # Second Chance: if freq is high relative to others
+            if freq >= 2:
+                s3_main.move_to_end(victim_key) # Move to MRU
+                s3_freq[victim_key] >>= 1       # Decay frequency
+            else:
+                return victim_key
+
+        # Fallback
+        return next(iter(s3_main))
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def update_after_hit(cache_snapshot, obj):
+    '''
+    On Hit:
+    - Main: Move to MRU (Strict LRU).
+    - Small: Increment freq (Lazy promotion).
+    '''
+    _reset_state(cache_snapshot)
+    key = obj.key
+
+    if key in s3_main:
+        s3_main.move_to_end(key)
+    elif key in s3_small:
+        s3_freq[key] = s3_freq.get(key, 0) + 1
+=======
+def update_after_hit(cache_snapshot, obj):
+    '''
+    On Hit:
+    - Main: Move to MRU (Strict LRU).
+    - Small: Increment freq (Lazy promotion).
+    '''
+    _reset_state(cache_snapshot)
+    key = obj.key
+
+    # Update frequency for all hits to support frequency-based eviction policies
+    s3_freq[key] = s3_freq.get(key, 0) + 1
+
+    if key in s3_main:
+        s3_main.move_to_end(key)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    if key in s3_ghost:
+        # Restore frequency
+        restored_freq = s3_ghost.pop(key)
+        s3_freq[key] = restored_freq
+        # Promote to Main immediately
+        s3_main[key] = 1
+        s3_main.move_to_end(key)
+=======
+    if key in s3_ghost:
+        # Restore frequency with decay
+        restored_freq = s3_ghost.pop(key)
+        s3_freq[key] = max(0, restored_freq // 2)
+        # Promote to Main immediately
+        s3_main[key] = 1
+        s3_main.move_to_end(key)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Maintain Ghost size
+    if len(s3_ghost) > capacity:
+        s3_ghost.popitem(last=False) # Remove oldest ghost
+=======
+    # Maintain Ghost size
+    ghost_target = s3_config.get('ghost_target', capacity)
+    if len(s3_ghost) > ghost_target:
+        s3_ghost.popitem(last=False) # Remove oldest ghost
+>>>>>>> REPLACE
+</DIFF>

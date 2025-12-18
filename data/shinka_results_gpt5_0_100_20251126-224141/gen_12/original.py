@@ -1,0 +1,213 @@
+# EVOLVE-BLOCK-START
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+
+# Hybrid ARC-inspired Segmented LRU:
+# - m_key_timestamp: last access time (for LRU ordering within segments)
+# - m_tier: 'A1' (probation; seen once) or 'Am' (protected; seen >=2 times)
+# - m_freq: simple hit count (tie-breaker and light frequency signal)
+# - ghost_a1_ts / ghost_am_ts: ghost history of evicted keys with last-seen time
+# - m_a1_target_count: adaptive target size (in items) for A1 (ARC-like "p")
+m_key_timestamp = dict()
+m_tier = dict()
+m_freq = dict()
+ghost_a1_ts = dict()
+ghost_am_ts = dict()
+m_a1_target_count = None  # adaptive target for number of items in A1
+
+
+def _trim_ghosts(current_cache_size: int):
+    """Keep ghost lists bounded; remove oldest entries first."""
+    # Bound to at most 2x current cache size (but at least 100 to keep some history)
+    bound = max(2 * max(current_cache_size, 1), 100)
+
+    def trim(d):
+        if len(d) <= bound:
+            return
+        # Remove oldest until under bound
+        # Sorting small dicts is acceptable given cache sizes here
+        excess = len(d) - bound
+        for k, _ in sorted(d.items(), key=lambda kv: kv[1])[:excess]:
+            d.pop(k, None)
+
+    trim(ghost_a1_ts)
+    trim(ghost_am_ts)
+
+
+def _current_a1_am_keys(cache_snapshot):
+    keys = list(cache_snapshot.cache.keys())
+    a1 = [k for k in keys if m_tier.get(k, 'A1') == 'A1']
+    am = [k for k in keys if m_tier.get(k) == 'Am']
+    # Any not in m_tier default to A1
+    missing = [k for k in keys if k not in m_tier]
+    if missing:
+        a1.extend(missing)
+    return a1, am, keys
+
+
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    global m_key_timestamp, m_tier, m_freq, m_a1_target_count
+    a1_keys, am_keys, all_keys = _current_a1_am_keys(cache_snapshot)
+    if not all_keys:
+        return None
+
+    total = len(all_keys)
+    # Initialize target if not set; start with ~1/3 in A1
+    if m_a1_target_count is None:
+        m_a1_target_count = max(1, total // 3)
+
+    # Effective target for this decision: adjust on-the-fly based on ghost hint for incoming obj
+    effective_target = m_a1_target_count
+    if obj is not None:
+        if obj.key in ghost_a1_ts:
+            effective_target = min(max(1, effective_target + 1), max(total - 1, 1))
+        elif obj.key in ghost_am_ts:
+            effective_target = max(1, min(effective_target - 1, max(total - 1, 1)))
+
+    # Clamp target to sensible range
+    effective_target = max(1, min(effective_target, max(total - 1, 1)))
+
+    # ARC-like replacement: if A1 is larger than target, evict from A1, else from Am
+    if a1_keys and (len(a1_keys) > effective_target or not am_keys):
+        pick_from = a1_keys
+    elif am_keys:
+        pick_from = am_keys
+    else:
+        pick_from = all_keys
+
+    # Choose LRU within chosen segment; tie-break by lowest frequency
+    def ts(k): return m_key_timestamp.get(k, -1)
+    min_ts = min(ts(k) for k in pick_from)
+    ts_candidates = [k for k in pick_from if ts(k) == min_ts]
+    if len(ts_candidates) > 1:
+        min_f = min(m_freq.get(k, 1) for k in ts_candidates)
+        freq_candidates = [k for k in ts_candidates if m_freq.get(k, 1) == min_f]
+        candid_obj_key = freq_candidates[0]
+    else:
+        candid_obj_key = ts_candidates[0]
+    return candid_obj_key
+
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_key_timestamp, m_tier, m_freq
+    # Update recency and frequency
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+    m_freq[obj.key] = m_freq.get(obj.key, 0) + 1
+
+    # Promote to protected on first hit
+    if m_tier.get(obj.key) != 'Am':
+        m_tier[obj.key] = 'Am'
+
+    # Remove from ghosts if it reappears
+    ghost_a1_ts.pop(obj.key, None)
+    ghost_am_ts.pop(obj.key, None)
+
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp, m_tier, m_freq, m_a1_target_count
+    # Set recency
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+
+    # If this key exists in ghosts, adapt target and insert into protected
+    in_b1 = obj.key in ghost_a1_ts
+    in_b2 = obj.key in ghost_am_ts
+
+    # Initialize target using current cache size if never set
+    total = len(getattr(cache_snapshot, 'cache', {}))
+    if m_a1_target_count is None:
+        m_a1_target_count = max(1, total // 3)
+
+    if in_b1 or in_b2:
+        # ARC adaptation of target p
+        if in_b1:
+            m_a1_target_count = min(m_a1_target_count + 1, max(total - 1, 1))
+        if in_b2:
+            m_a1_target_count = max(1, min(m_a1_target_count - 1, max(total - 1, 1)))
+
+        # Insert into protected as it has demonstrated reuse
+        m_tier[obj.key] = 'Am'
+        m_freq[obj.key] = max(m_freq.get(obj.key, 0) + 1, 2)  # ensure >=2
+        # Clear from ghosts since it's now resident
+        ghost_a1_ts.pop(obj.key, None)
+        ghost_am_ts.pop(obj.key, None)
+    else:
+        # Fresh object: start in probation
+        m_tier[obj.key] = 'A1'
+        # Initialize frequency to 1
+        m_freq[obj.key] = m_freq.get(obj.key, 0) + 1 if obj.key in m_freq else 1
+
+    # Trim ghost history to bounded size
+    _trim_ghosts(len(cache_snapshot.cache))
+
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp, m_tier, m_freq
+    # Record ghost of evicted key based on its segment at eviction time
+    evicted_key = evicted_obj.key
+    evicted_tier = m_tier.get(evicted_key, 'A1')
+
+    # Insert into ghost lists with current time
+    if evicted_tier == 'Am':
+        ghost_am_ts[evicted_key] = cache_snapshot.access_count
+        # If it was protected, we may want to keep its frequency notionally higher on future re-entry
+    else:
+        ghost_a1_ts[evicted_key] = cache_snapshot.access_count
+
+    # Clean up all metadata for the evicted key
+    m_key_timestamp.pop(evicted_key, None)
+    m_tier.pop(evicted_key, None)
+    m_freq.pop(evicted_key, None)
+
+    # Trim ghosts regularly
+    _trim_ghosts(len(cache_snapshot.cache))
+
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

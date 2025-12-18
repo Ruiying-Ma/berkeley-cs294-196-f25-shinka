@@ -1,0 +1,580 @@
+<NAME>
+slru_tinylfu_ghost_adaptive
+</NAME>
+
+<DESCRIPTION>
+I propose strengthening the SLRU policy with three targeted improvements inspired by ARC and W-TinyLFU principles:
+
+1) Stronger scan resistance during eviction: When scan mode is detected, always evict from probation if available, preserving protected items. Additionally, when the incoming object has a recent protected-ghost hit, force eviction from probation to prevent flushing hot items, and when it has a recent probation-ghost hit with protected dominating size, evict from protected to rebalance.
+
+2) Time-bounded two-touch promotion under poor locality: Outside scan mode, when the observed hit rate is low or uniqueness is high in the current window, require a second touch within one epoch before promotion from probation to protected. This reduces pollution from one-off accesses while still allowing timely promotion of genuinely warm items.
+
+3) Ghost-driven protected fraction tuning and admission: On insert, if the key is in the protected ghost, place it into protected and increase the protected fraction. Symmetrically, if in the probation ghost, decrease the protected fraction. Also, if the key’s decayed frequency score is high, admit to protected to retain frequent objects. During evict, add a symmetric adjustment: if we evict from protected but the incoming object is no hotter than the victim, decrease the protected fraction slightly.
+
+These changes keep the design simple, align with adaptive caching best practices, and should lower miss rates across mixed workloads by improving scan handling, admission control, and segment balancing.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    # Keep metadata consistent and properly segmented before choosing a victim
+    _maybe_age(cache_snapshot)
+    _sync_metadata(cache_snapshot)
+    _rebalance(cache_snapshot)
+
+    # Track key for scan detection unique density
+    try:
+        _epoch_unique.add(obj.key)
+    except Exception:
+        pass
+
+    # Clean up stale entries (if any)
+    for k in list(_probation.keys()):
+        if k not in cache_snapshot.cache:
+            _probation.pop(k, None)
+            _key_seg.pop(k, None)
+    for k in list(_protected.keys()):
+        if k not in cache_snapshot.cache:
+            _protected.pop(k, None)
+            _key_seg.pop(k, None)
+
+    # If metadata is empty, fallback
+    if not cache_snapshot.cache:
+        return None
+
+    # Adaptive sampling sizes
+    prob_sample = _BASE_PROB_SAMPLE
+    prot_sample = _BASE_PROT_SAMPLE
+    if _scan_mode:
+        prob_sample += 1
+        prot_sample = max(1, prot_sample - 1)
+    if len(_probation) > len(_protected) + 2:
+        prob_sample += 1
+
+    # Build candidate tuples from both segments' LRU sides
+    candidates = []
+    # Probation candidates
+    pkeys = _sample_lru_keys(_probation, prob_sample)
+    for idx, pk in enumerate(pkeys):
+        if pk in cache_snapshot.cache:
+            candidates.append(_victim_tuple(pk, 'prob', idx))
+    # Protected candidates
+    tkeys = _sample_lru_keys(_protected, prot_sample)
+    for idx, tk in enumerate(tkeys):
+        if tk in cache_snapshot.cache:
+            candidates.append(_victim_tuple(tk, 'prot', idx))
+
+    if not candidates:
+        # Fallback: pick any key from cache if metadata got desynced
+        return next(iter(cache_snapshot.cache.keys()))
+
+    # Choose coldest by (score, segment preference, recency)
+    best = min(candidates)
+    candid_obj_key = best[3]
+    victim_from_protected = (_key_seg.get(candid_obj_key) == 'prot')
+
+    # Adaptive tuning: if we are forced to evict from protected, reduce its target fraction slightly
+    if victim_from_protected:
+        _decrease_protected()
+
+    return candid_obj_key
+=======
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    # Keep metadata consistent and properly segmented before choosing a victim
+    _maybe_age(cache_snapshot)
+    _sync_metadata(cache_snapshot)
+    _rebalance(cache_snapshot)
+
+    # Track key for scan detection unique density
+    try:
+        _epoch_unique.add(obj.key)
+    except Exception:
+        pass
+
+    # Clean up stale entries (if any)
+    for k in list(_probation.keys()):
+        if k not in cache_snapshot.cache:
+            _probation.pop(k, None)
+            _key_seg.pop(k, None)
+    for k in list(_protected.keys()):
+        if k not in cache_snapshot.cache:
+            _protected.pop(k, None)
+            _key_seg.pop(k, None)
+
+    # If metadata is empty, fallback
+    if not cache_snapshot.cache:
+        return None
+
+    # Ghost-driven overrides
+    g_prot_epoch = _ghost_protected.get(obj.key)
+    g_prob_epoch = _ghost_probation.get(obj.key)
+    recent_prot_ghost = (g_prot_epoch is not None) and (_epoch - g_prot_epoch <= 2)
+    recent_prob_ghost = (g_prob_epoch is not None) and (_epoch - g_prob_epoch <= 2)
+
+    # Strong scan handling: prefer evicting from probation during scans
+    if _scan_mode and _probation:
+        # Evict LRU of probation to preserve protected segment during scans
+        try:
+            k, _ = next(iter(_probation.items()))
+            return k
+        except StopIteration:
+            pass
+
+    # If incoming was recently in protected ghost, free from probation to re-protect quickly
+    if recent_prot_ghost and _probation:
+        try:
+            k, _ = next(iter(_probation.items()))
+            return k
+        except StopIteration:
+            pass
+
+    # If incoming was recently in probation ghost and protected dominates, free from protected
+    if recent_prob_ghost and _protected and (len(_protected) > len(_probation)):
+        try:
+            k, _ = next(iter(_protected.items()))
+            return k
+        except StopIteration:
+            pass
+
+    # Adaptive sampling sizes
+    prob_sample = _BASE_PROB_SAMPLE
+    prot_sample = _BASE_PROT_SAMPLE
+    if _scan_mode:
+        prob_sample += 1
+        prot_sample = max(1, prot_sample - 1)
+    if len(_probation) > len(_protected) + 2:
+        prob_sample += 1
+
+    # Build candidate tuples from both segments' LRU sides
+    candidates = []
+    # Probation candidates
+    pkeys = _sample_lru_keys(_probation, prob_sample)
+    for idx, pk in enumerate(pkeys):
+        if pk in cache_snapshot.cache:
+            candidates.append(_victim_tuple(pk, 'prob', idx))
+    # Protected candidates
+    tkeys = _sample_lru_keys(_protected, prot_sample)
+    for idx, tk in enumerate(tkeys):
+        if tk in cache_snapshot.cache:
+            candidates.append(_victim_tuple(tk, 'prot', idx))
+
+    if not candidates:
+        # Fallback: pick any key from cache if metadata got desynced
+        return next(iter(cache_snapshot.cache.keys()))
+
+    # Choose coldest by (score, segment preference, recency)
+    best = min(candidates)
+    candid_obj_key = best[3]
+    victim_from_protected = (_key_seg.get(candid_obj_key) == 'prot')
+
+    # Adaptive tuning: if we are forced to evict from protected, reduce its target fraction slightly
+    if victim_from_protected:
+        _decrease_protected()
+
+    return candid_obj_key
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    _maybe_age(cache_snapshot)
+    _sync_metadata(cache_snapshot)
+
+    k = obj.key
+    _inc(k)
+    try:
+        _epoch_unique.add(k)
+    except Exception:
+        pass
+
+    seg = _key_seg.get(k)
+
+    if seg == 'prob':
+        if _scan_mode:
+            # Two-touch gating under scans: first hit refreshes probation,
+            # second hit within a short epoch window promotes to protected.
+            last = _touched_once.get(k)
+            if last is not None and (_epoch - last) <= 1:
+                _touched_once.pop(k, None)
+                _probation.pop(k, None)
+                _protected[k] = None  # MRU
+                _key_seg[k] = 'prot'
+            else:
+                _touched_once[k] = _epoch
+                # Refresh to MRU of probation
+                if k in _probation:
+                    _probation.move_to_end(k, last=True)
+                else:
+                    _probation[k] = None
+                # Avoid immediate expansion of protected during scans
+        else:
+            # Promote to protected on first hit
+            _probation.pop(k, None)
+            _protected[k] = None  # inserted at MRU
+            _key_seg[k] = 'prot'
+            _increase_protected()  # hits in probation signal benefit from a larger protected segment
+    elif seg == 'prot':
+        # Refresh recency in protected
+        if k in _protected:
+            _protected.move_to_end(k, last=True)
+        else:
+            # If somehow missing from the structure, reinsert into protected
+            _protected[k] = None
+            _key_seg[k] = 'prot'
+        # Clear any stale two-touch marker
+        _touched_once.pop(k, None)
+    else:
+        # Unknown key (shouldn't happen on hit).
+        # In scan mode, keep in probation with refresh; otherwise, promote.
+        if _scan_mode:
+            _probation[k] = None
+            _key_seg[k] = 'prob'
+            _probation.move_to_end(k, last=True)
+        else:
+            _probation[k] = None
+            _key_seg[k] = 'prob'
+            _probation.pop(k, None)
+            _protected[k] = None
+            _key_seg[k] = 'prot'
+            _increase_protected()
+
+    _rebalance(cache_snapshot)
+=======
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    _maybe_age(cache_snapshot)
+    _sync_metadata(cache_snapshot)
+
+    k = obj.key
+    _inc(k)
+    try:
+        _epoch_unique.add(k)
+    except Exception:
+        pass
+
+    seg = _key_seg.get(k)
+
+    # Determine if locality is poor: low hit rate or high uniqueness in window
+    window = max(1, _DECAY_WINDOW)
+    try:
+        current_hit_rate = cache_snapshot.hit_count / max(1.0, float(cache_snapshot.access_count))
+    except Exception:
+        current_hit_rate = 0.0
+    unique_density = min(1.0, len(_epoch_unique) / float(window))
+    use_two_touch = _scan_mode or (current_hit_rate < 0.25) or (unique_density > 0.6)
+
+    if seg == 'prob':
+        if use_two_touch:
+            # Time-bounded two-touch gating: second touch within one epoch promotes
+            last = _touched_once.get(k)
+            if last is not None and (_epoch - last) <= 1:
+                _touched_once.pop(k, None)
+                _probation.pop(k, None)
+                _protected[k] = None  # MRU
+                _key_seg[k] = 'prot'
+            else:
+                _touched_once[k] = _epoch
+                # Refresh to MRU of probation
+                if k in _probation:
+                    _probation.move_to_end(k, last=True)
+                else:
+                    _probation[k] = None
+        else:
+            # Promote to protected on first hit when locality is decent
+            _probation.pop(k, None)
+            _protected[k] = None  # inserted at MRU
+            _key_seg[k] = 'prot'
+            _increase_protected()  # hits in probation signal benefit from a larger protected segment
+    elif seg == 'prot':
+        # Refresh recency in protected
+        if k in _protected:
+            _protected.move_to_end(k, last=True)
+        else:
+            # If somehow missing from the structure, reinsert into protected
+            _protected[k] = None
+            _key_seg[k] = 'prot'
+        # Clear any stale two-touch marker
+        _touched_once.pop(k, None)
+    else:
+        # Unknown key (shouldn't happen on hit).
+        # In poor locality, keep in probation with refresh; otherwise, promote.
+        if use_two_touch:
+            _probation[k] = None
+            _key_seg[k] = 'prob'
+            _probation.move_to_end(k, last=True)
+        else:
+            _probation[k] = None
+            _key_seg[k] = 'prob'
+            _probation.pop(k, None)
+            _protected[k] = None
+            _key_seg[k] = 'prot'
+            _increase_protected()
+
+    _rebalance(cache_snapshot)
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    _maybe_age(cache_snapshot)
+    _sync_metadata(cache_snapshot)
+    k = obj.key
+    _inc(k)
+    try:
+        _epoch_unique.add(k)
+    except Exception:
+        pass
+
+    # Decide segment placement using ghost history (segment-aware)
+    g_prot_epoch = _ghost_protected.get(k)
+    g_prob_epoch = _ghost_probation.get(k)
+    recent_prot_ghost = (g_prot_epoch is not None) and (_epoch - g_prot_epoch <= 2)
+    recent_prob_ghost = (g_prob_epoch is not None) and (_epoch - g_prob_epoch <= 2)
+
+    # Reset any existing placement
+    if _key_seg.get(k) == 'prot':
+        _protected.pop(k, None)
+    else:
+        _probation.pop(k, None)
+
+    if _scan_mode:
+        # Scan resistance: insert at probation LRU to minimize pollution,
+        # require two-touch before promotion via update_after_hit.
+        _probation[k] = None
+        _probation.move_to_end(k, last=False)  # LRU side
+        _key_seg[k] = 'prob'
+    else:
+        if recent_prot_ghost:
+            # Re-admit into protected due to recent protected ghost hit
+            _protected[k] = None
+            _key_seg[k] = 'prot'
+            _increase_protected()
+        else:
+            # Default admission into probation
+            _probation[k] = None
+            _key_seg[k] = 'prob'
+            if recent_prob_ghost:
+                # Slight boost for recently evicted probation ghost to accelerate useful re-references
+                _probation.move_to_end(k, last=True)  # ensure MRU
+                _inc(k)
+
+    _rebalance(cache_snapshot)
+=======
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    _maybe_age(cache_snapshot)
+    _sync_metadata(cache_snapshot)
+    k = obj.key
+    _inc(k)
+    try:
+        _epoch_unique.add(k)
+    except Exception:
+        pass
+
+    # Decide segment placement using ghost history (segment-aware)
+    g_prot_epoch = _ghost_protected.get(k)
+    g_prob_epoch = _ghost_probation.get(k)
+    recent_prot_ghost = (g_prot_epoch is not None) and (_epoch - g_prot_epoch <= 2)
+    recent_prob_ghost = (g_prob_epoch is not None) and (_epoch - g_prob_epoch <= 2)
+
+    # Reset any existing placement
+    if _key_seg.get(k) == 'prot':
+        _protected.pop(k, None)
+    else:
+        _probation.pop(k, None)
+
+    # Adjust protected fraction based on ghost admissions (ARC-like tuning)
+    if recent_prot_ghost:
+        _increase_protected()
+    elif recent_prob_ghost:
+        _decrease_protected()
+
+    # Locality signal from current window
+    window = max(1, _DECAY_WINDOW)
+    try:
+        current_hit_rate = cache_snapshot.hit_count / max(1.0, float(cache_snapshot.access_count))
+    except Exception:
+        current_hit_rate = 0.0
+    unique_density = min(1.0, len(_epoch_unique) / float(window))
+    high_uniqueness = unique_density > 0.6
+    poor_locality = current_hit_rate < 0.25 or high_uniqueness
+
+    s = _score(k)
+
+    if _scan_mode:
+        # Scan resistance: insert at probation LRU to minimize pollution,
+        # require two-touch before promotion via update_after_hit.
+        _probation[k] = None
+        _probation.move_to_end(k, last=False)  # LRU side
+        _key_seg[k] = 'prob'
+    else:
+        if recent_prot_ghost or s >= 2:
+            # Re-admit into protected due to recent protected ghost hit or strong frequency
+            _protected[k] = None
+            _key_seg[k] = 'prot'
+            _increase_protected()
+        else:
+            # Default admission into probation
+            _probation[k] = None
+            _key_seg[k] = 'prob'
+            if recent_prob_ghost:
+                # Slight boost for recently evicted probation ghost to accelerate useful re-references
+                _probation.move_to_end(k, last=True)  # ensure MRU
+                _inc(k)
+            elif poor_locality and s == 0:
+                # Bias towards LRU position when locality is poor and item is cold
+                _probation.move_to_end(k, last=False)
+            else:
+                # Keep MRU position
+                _probation.move_to_end(k, last=True)
+
+    _rebalance(cache_snapshot)
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    _maybe_age(cache_snapshot)
+    # Record into ghost according to the segment it was evicted from
+    k = evicted_obj.key
+    seg = _key_seg.get(k, None)
+    # Store last victim score for potential future enhancements
+    global _last_victim_score
+    _last_victim_score = _score(k)
+
+    if seg == 'prob':
+        _ghost_probation[k] = _epoch
+        _probation.pop(k, None)
+    elif seg == 'prot':
+        _ghost_protected[k] = _epoch
+        _protected.pop(k, None)
+
+    # Clean any stale two-touch markers
+    _touched_once.pop(k, None)
+
+    _key_seg.pop(k, None)
+
+    # Trim ghost histories to bounded size
+    limit = max(1, _GHOST_LIMIT_MULT * max(cache_snapshot.capacity, 1))
+    while len(_ghost_probation) > limit:
+        _ghost_probation.popitem(last=False)
+    while len(_ghost_protected) > limit:
+        _ghost_protected.popitem(last=False)
+
+    # Adaptive protected tuning: if we evicted from probation but the incoming object is hotter,
+    # increase protected to preserve hot items better.
+    try:
+        if seg == 'prob' and _score(obj.key) > _last_victim_score:
+            _increase_protected()
+    except Exception:
+        pass
+
+    # After an eviction, ensure protected segment still respects target (it might shrink due to target change)
+    _rebalance(cache_snapshot)
+=======
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    _maybe_age(cache_snapshot)
+    # Record into ghost according to the segment it was evicted from
+    k = evicted_obj.key
+    seg = _key_seg.get(k, None)
+    # Store last victim score for potential future enhancements
+    global _last_victim_score
+    _last_victim_score = _score(k)
+
+    if seg == 'prob':
+        _ghost_probation[k] = _epoch
+        _probation.pop(k, None)
+    elif seg == 'prot':
+        _ghost_protected[k] = _epoch
+        _protected.pop(k, None)
+
+    # Clean any stale two-touch markers
+    _touched_once.pop(k, None)
+
+    _key_seg.pop(k, None)
+
+    # Trim ghost histories to bounded size
+    limit = max(1, _GHOST_LIMIT_MULT * max(cache_snapshot.capacity, 1))
+    while len(_ghost_probation) > limit:
+        _ghost_probation.popitem(last=False)
+    while len(_ghost_protected) > limit:
+        _ghost_protected.popitem(last=False)
+
+    # Adaptive protected tuning:
+    try:
+        new_score = _score(obj.key)
+        if seg == 'prob' and new_score > _last_victim_score:
+            # Incoming appears hotter than evicted probation item: expand protected a bit
+            _increase_protected()
+        elif seg == 'prot' and new_score <= _last_victim_score:
+            # Evicted from protected for an item no hotter: shrink protected slightly
+            _decrease_protected()
+    except Exception:
+        pass
+
+    # After an eviction, ensure protected segment still respects target (it might shrink due to target change)
+    _rebalance(cache_snapshot)
+>>>>>>> REPLACE
+
+</DIFF>

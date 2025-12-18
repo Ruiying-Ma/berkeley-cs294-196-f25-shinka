@@ -1,0 +1,238 @@
+--- a/original.py
++++ b/original.py
+@@ -1,154 +1,138 @@
+ # EVOLVE-BLOCK-START
+ """Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+ from collections import OrderedDict
+ 
+-# ARC Global State
+-m_t1 = OrderedDict() # T1: Recent cache entries
+-m_t2 = OrderedDict() # T2: Frequent cache entries
+-m_b1 = OrderedDict() # B1: Ghost entries evicted from T1
+-m_b2 = OrderedDict() # B2: Ghost entries evicted from T2
+-m_p = 0              # Target size for T1
++# S3-FIFO Global State
++s3_small = OrderedDict() # S: Small FIFO queue for new insertions
++s3_main = OrderedDict()  # M: Main FIFO queue for frequent items
++s3_ghost = OrderedDict() # G: Ghost FIFO queue for history
++s3_freq = {}             # Frequency counter (small bits)
+ m_last_access_count = -1
+ 
+ def _check_reset(cache_snapshot):
+-    """Resets global state if a new trace is detected based on access count rollback."""
+-    global m_t1, m_t2, m_b1, m_b2, m_p, m_last_access_count
++    """Resets global state if a new trace is detected."""
++    global s3_small, s3_main, s3_ghost, s3_freq, m_last_access_count
+     if cache_snapshot.access_count < m_last_access_count:
+-        m_t1.clear()
+-        m_t2.clear()
+-        m_b1.clear()
+-        m_b2.clear()
+-        m_p = 0
++        s3_small.clear()
++        s3_main.clear()
++        s3_ghost.clear()
++        s3_freq.clear()
+     m_last_access_count = cache_snapshot.access_count
+ 
+ def evict(cache_snapshot, obj):
+     '''
+-    ARC Eviction Policy:
+-    Selects a victim from T1 or T2 based on the target size 'p'.
+-    Adjusts 'p' if the incoming object was observed in ghost lists B1/B2.
++    S3-FIFO Eviction Policy.
++    - S (Small) buffers new items. M (Main) holds frequent items.
++    - Scans S then M. Items with hits are promoted/reinserted.
++    - Victim is chosen from tail of S or M that has no hits.
+     '''
+     _check_reset(cache_snapshot)
+-    global m_p
++    capacity = cache_snapshot.capacity
++    target_s_size = max(1, int(capacity * 0.1))
+ 
+-    key = obj.key
+-    capacity = cache_snapshot.capacity
++    # Loop until a victim is found. 
++    # Logic: "Lazy promotion" happens during eviction scan.
++    while True:
++        # 1. Check Small Queue
++        # Evict from S if it's larger than target size, or if M is empty (must evict from S)
++        if len(s3_small) > target_s_size or len(s3_main) == 0:
++            if s3_small:
++                candidate_key = next(iter(s3_small))
++                freq = s3_freq.get(candidate_key, 0)
++                
++                if freq > 0:
++                    # Hit in S: Move to M (Tail)
++                    s3_small.popitem(last=False)
++                    s3_main[candidate_key] = 1
++                    s3_freq[candidate_key] = 0 # Reset frequency
++                else:
++                    # No Hit in S: Evict
++                    return candidate_key
++            else:
++                # Should not be reached if len(s3_main) == 0 checks passed
++                if not s3_main: return None
+ 
+-    # 1. Adapt p (target size of T1) based on hits in ghost lists
+-    if key in m_b1:
+-        delta = 1
+-        if len(m_b1) > 0 and len(m_b2) > 0:
+-            delta = max(1, len(m_b2) / len(m_b1))
+-        m_p = min(capacity, m_p + delta)
+-    elif key in m_b2:
+-        delta = 1
+-        if len(m_b1) > 0 and len(m_b2) > 0:
+-            delta = max(1, len(m_b1) / len(m_b2))
+-        m_p = max(0, m_p - delta)
+-
+-    # 2. Select victim
+-    evict_t1 = False
+-    if len(m_t1) > 0:
+-        if len(m_t1) > m_p:
+-            evict_t1 = True
+-        elif key in m_b2 and len(m_t1) == int(m_p):
+-            evict_t1 = True
+-
+-    # If T2 is empty, we must evict from T1 (if possible)
+-    if len(m_t2) == 0:
+-        evict_t1 = True
+-
+-    if evict_t1 and m_t1:
+-        # Evict LRU from T1
+-        return next(iter(m_t1))
+-    else:
+-        # Evict LRU from T2
+-        # Fallback to T1 if T2 is empty (shouldn't happen here if logic holds)
+-        return next(iter(m_t2)) if m_t2 else next(iter(m_t1))
++        # 2. Check Main Queue
++        # If we didn't evict from S (because S is small), check M
++        if s3_main:
++            candidate_key = next(iter(s3_main))
++            freq = s3_freq.get(candidate_key, 0)
++            
++            if freq > 0:
++                # Hit in M: Reinsert to M (Tail)
++                s3_main.popitem(last=False)
++                s3_main[candidate_key] = 1
++                s3_freq[candidate_key] = 0 # Reset frequency
++            else:
++                # No Hit in M: Evict
++                return candidate_key
+ 
+ def update_after_hit(cache_snapshot, obj):
+     '''
+-    On Cache Hit:
+-    - If in T1, move to T2 (MRU).
+-    - If in T2, move to MRU of T2.
++    On Hit: Increment frequency counter (capped).
+     '''
+     _check_reset(cache_snapshot)
+     key = obj.key
+-
+-    if key in m_t1:
+-        del m_t1[key]
+-        m_t2[key] = 1
+-        m_t2.move_to_end(key)
+-    elif key in m_t2:
+-        m_t2.move_to_end(key)
+-    else:
+-        # Should be in cache, but if missing from metadata, add to T2
+-        m_t2[key] = 1
+-        m_t2.move_to_end(key)
++    s3_freq[key] = min(3, s3_freq.get(key, 0) + 1)
+ 
+ def update_after_insert(cache_snapshot, obj):
+     '''
+-    On Cache Insert (Miss):
+-    - If previously in ghost B1/B2, promote to T2.
+-    - Otherwise, insert into T1.
++    On Insert:
++    - If in Ghost (G), insert to Main (M).
++    - Else, insert to Small (S).
+     '''
+     _check_reset(cache_snapshot)
+     key = obj.key
+-
+-    if key in m_b1:
+-        del m_b1[key]
+-        m_t2[key] = 1
+-        m_t2.move_to_end(key)
+-    elif key in m_b2:
+-        del m_b2[key]
+-        m_t2[key] = 1
+-        m_t2.move_to_end(key)
++    
++    if key in s3_ghost:
++        # Recall from Ghost
++        del s3_ghost[key]
++        s3_main[key] = 1
++        s3_freq[key] = 0
+     else:
+-        # Totally new item
+-        m_t1[key] = 1
+-        m_t1.move_to_end(key)
++        # New Insert
++        s3_small[key] = 1
++        s3_freq[key] = 0
+ 
+ def update_after_evict(cache_snapshot, obj, evicted_obj):
+     '''
+-    On Eviction:
+-    - Move evicted key from T1/T2 to B1/B2.
+-    - Maintain capacity of ghost lists.
++    On Evict: Remove from queues and manage Ghost.
+     '''
+     key = evicted_obj.key
+-    capacity = cache_snapshot.capacity
++    
++    if key in s3_small:
++        del s3_small[key]
++        # Evicted from S -> Add to G
++        s3_ghost[key] = 1
++    elif key in s3_main:
++        del s3_main[key]
++        # Evicted from M -> Discard (Standard S3-FIFO)
++    
++    if key in s3_freq:
++        del s3_freq[key]
+ 
+-    if key in m_t1:
+-        del m_t1[key]
+-        m_b1[key] = 1
+-        m_b1.move_to_end(key)
+-    elif key in m_t2:
+-        del m_t2[key]
+-        m_b2[key] = 1
+-        m_b2.move_to_end(key)
+-
+-    # Restrict size of ghost lists to capacity (simplification of ARC)
+-    if len(m_b1) > capacity:
+-        m_b1.popitem(last=False)
+-    if len(m_b2) > capacity:
+-        m_b2.popitem(last=False)
++    # Limit Ghost size
++    if len(s3_ghost) > cache_snapshot.capacity:
++        s3_ghost.popitem(last=False)
+ 
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

@@ -1,0 +1,135 @@
+<NAME>
+competitive_admission_hot_bypass
+</NAME>
+
+<DESCRIPTION>
+I introduce two targeted improvements to reduce cache pollution and improve miss rate:
+
+1) Competitive admission on window overflow: Instead of always moving the window’s LRU into M1, we compare its TinyLFU estimate (and tie-break with the decayed LRFU score) against a sampled cold candidate from M1. We only admit the window LRU into M1 if it is at least as hot. Otherwise, we drop it from the policy. This prevents one-timers and scan items from polluting the main segments, a known weakness of pure W→M1 moves.
+
+2) Hot-item bypass: On insert, if the new item’s TinyLFU estimate is very high (≥5), we place it directly into M2 (protected), accelerating warmup for hot items. We maintain M2’s size using existing decayed-aware demotion.
+
+These changes are self-contained and consistent with the existing SLRU and LRFU decayed metadata. They should lower the miss rate on scan-heavy and mixed workloads while preserving strong locality performance.
+
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def on_insert(self, cache_snapshot, obj):
+        """
+        Insert (on miss) processing:
+        - Initialize LRFU metadata modestly (to reduce scan pollution).
+        - Increment TinyLFU.
+        - Insert new key into window W (MRU).
+        - If W exceeds target, move W's LRU to main probationary (M1).
+        - Keep protected region within target by demoting a decayed-cold entry if needed.
+        """
+        self._ensure_capacity(cache_snapshot.capacity)
+        now = cache_snapshot.access_count
+        key = obj.key
+        self.sketch.increment(key, 1)
+
+        # Initialize decayed metadata
+        self.last_time[key] = now
+        self.score[key] = 0.5
+
+        # Ensure it's not tracked elsewhere
+        self.W.pop(key, None)
+        self.M1.pop(key, None)
+        self.M2.pop(key, None)
+
+        # Insert into window
+        self._touch(self.W, key)
+
+        # Rebalance: if W is beyond target, move W's LRU to M1 (admission path)
+        w_tgt, _, prot_tgt = self._targets()
+        if len(self.W) > w_tgt:
+            w_lru = self._lru(self.W)
+            if w_lru is not None and w_lru != key:
+                self.W.pop(w_lru, None)
+                # Move into M1 probationary
+                self._touch(self.M1, w_lru)
+
+        # Keep protected region within target (decayed-aware demotion)
+        if len(self.M2) > prot_tgt:
+            demote, _, _ = self._sample_cold_candidate(self.M2, now)
+            if demote is not None:
+                self.M2.pop(demote, None)
+                self._touch(self.M1, demote)
+
+        # Periodically tune window size
+        self._maybe_tune(now)
+=======
+    def on_insert(self, cache_snapshot, obj):
+        """
+        Insert (on miss) processing:
+        - Initialize LRFU metadata modestly (to reduce scan pollution).
+        - Increment TinyLFU.
+        - Hot bypass: if estimate is very high, place directly into M2.
+        - Else insert into window W (MRU).
+        - On window overflow, competitively admit W's LRU into M1 only if it is
+          at least as hot as a sampled cold M1 candidate; otherwise drop it to
+          avoid polluting main.
+        - Keep protected region within target by demoting a decayed-cold entry if needed.
+        """
+        self._ensure_capacity(cache_snapshot.capacity)
+        now = cache_snapshot.access_count
+        key = obj.key
+        self.sketch.increment(key, 1)
+
+        # Initialize decayed metadata
+        self.last_time[key] = now
+        self.score[key] = 0.5
+
+        # Ensure it's not tracked elsewhere
+        self.W.pop(key, None)
+        self.M1.pop(key, None)
+        self.M2.pop(key, None)
+
+        # Hot bypass threshold based on TinyLFU estimate
+        est_new = self.sketch.estimate(key)
+        hot_bypass_thr = 5
+
+        if est_new >= hot_bypass_thr:
+            # Bypass window to protected main
+            self._touch(self.M2, key)
+        else:
+            # Insert into window
+            self._touch(self.W, key)
+
+        # Rebalance with competitive admission from window to M1
+        w_tgt, _, prot_tgt = self._targets()
+        if len(self.W) > w_tgt:
+            w_lru = self._lru(self.W)
+            if w_lru is not None and w_lru != key:
+                # Remove from window first to keep W bounded
+                self.W.pop(w_lru, None)
+                # Compare against a sampled cold M1 candidate
+                cand_m1, f_m1, d_m1 = self._sample_cold_candidate(self.M1, now)
+                f_w = self.sketch.estimate(w_lru)
+                d_w = self._decayed_score(w_lru, now)
+                admit = False
+                if cand_m1 is None:
+                    # If M1 is empty, admit
+                    admit = True
+                else:
+                    # Admit if W_LRU is hotter by TinyLFU, tie-broken by decayed score
+                    if f_w > (f_m1 or 0):
+                        admit = True
+                    elif f_w == (f_m1 or 0) and d_w >= (d_m1 or 0.0):
+                        admit = True
+                if admit:
+                    self._touch(self.M1, w_lru)
+                # else: drop from policy to avoid main pollution
+
+        # Keep protected region within target (decayed-aware demotion)
+        if len(self.M2) > prot_tgt:
+            demote, _, _ = self._sample_cold_candidate(self.M2, now)
+            if demote is not None:
+                self.M2.pop(demote, None)
+                self._touch(self.M1, demote)
+
+        # Periodically tune window size
+        self._maybe_tune(now)
+>>>>>>> REPLACE
+</DIFF>

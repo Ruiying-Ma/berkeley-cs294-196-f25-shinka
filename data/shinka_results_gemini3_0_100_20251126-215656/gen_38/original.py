@@ -1,0 +1,179 @@
+# EVOLVE-BLOCK-START
+"""Adaptive S3-FIFO with Dual Ghost Queues"""
+
+# Global state
+# Queues: Small (Probation), Main (Protected)
+# Ghost Queues: Ghost Small (Evicted from S), Ghost Main (Evicted from M)
+# We use dicts as ordered sets (insertion order preserved)
+_s3_small = {}
+_s3_main = {}
+_s3_ghost_s = {}
+_s3_ghost_m = {}
+_s3_freq = {}
+_last_ts = -1
+_s3_ratio = 0.1 # Initial ratio for small queue
+
+def _check_reset(snapshot):
+    global _s3_small, _s3_main, _s3_ghost_s, _s3_ghost_m, _s3_freq, _last_ts, _s3_ratio
+    # If access count drops, it indicates a new trace has started
+    if snapshot.access_count < _last_ts:
+        _s3_small.clear()
+        _s3_main.clear()
+        _s3_ghost_s.clear()
+        _s3_ghost_m.clear()
+        _s3_freq.clear()
+        _s3_ratio = 0.1
+    _last_ts = snapshot.access_count
+
+def evict(cache_snapshot, obj):
+    '''
+    Adaptive S3-FIFO eviction.
+    Uses dual ghost queues to adapt the size of the Small queue.
+    Evicts from Small (Probation) or Main (Protected) based on S3-FIFO logic + adaptive threshold.
+    '''
+    global _s3_small, _s3_main, _s3_freq, _s3_ratio
+    _check_reset(cache_snapshot)
+    
+    curr_size = len(cache_snapshot.cache)
+    s_target = max(1, int(curr_size * _s3_ratio))
+    
+    while True:
+        # Check Small FIFO if it's larger than target
+        # OR if Main is empty (must evict from somewhere)
+        check_small = (len(_s3_small) > s_target) or (not _s3_main)
+        
+        if check_small:
+            if not _s3_small:
+                # Should not happen if cache is full, but fallback to Main if exists
+                if _s3_main:
+                    check_small = False 
+                else:
+                    # Desperate fallback
+                    if cache_snapshot.cache:
+                        return next(iter(cache_snapshot.cache))
+                    return None
+            
+            if check_small:
+                candidate = next(iter(_s3_small))
+                
+                # Consistency check: if key not in actual cache, clean up and skip
+                if candidate not in cache_snapshot.cache:
+                    _s3_small.pop(candidate, None)
+                    _s3_freq.pop(candidate, None)
+                    continue
+                
+                # S3-FIFO Logic for Small
+                freq = _s3_freq.get(candidate, 0)
+                if freq > 0:
+                    # Accessed while in Small -> Promote to Main
+                    _s3_small.pop(candidate)
+                    _s3_main[candidate] = None # Insert at tail (MRU)
+                    _s3_freq[candidate] = 0    # Reset frequency
+                    continue
+                else:
+                    # Not visited: Evict from Small
+                    return candidate
+        
+        # Check Main FIFO (Protected)
+        if _s3_main:
+            candidate = next(iter(_s3_main))
+            
+            if candidate not in cache_snapshot.cache:
+                _s3_main.pop(candidate, None)
+                _s3_freq.pop(candidate, None)
+                continue
+            
+            freq = _s3_freq.get(candidate, 0)
+            if freq > 0:
+                # Accessed while in Main -> Second Chance (Reinsert)
+                _s3_main.pop(candidate)
+                _s3_main[candidate] = None # Reinsert at tail
+                _s3_freq[candidate] = 0
+                continue
+            else:
+                # Not visited in Main: Evict
+                return candidate
+
+def update_after_hit(cache_snapshot, obj):
+    global _s3_freq
+    _check_reset(cache_snapshot)
+    # Frequency capped at 3
+    curr = _s3_freq.get(obj.key, 0)
+    _s3_freq[obj.key] = min(curr + 1, 3)
+
+def update_after_insert(cache_snapshot, obj):
+    global _s3_small, _s3_main, _s3_ghost_s, _s3_ghost_m, _s3_freq, _s3_ratio
+    _check_reset(cache_snapshot)
+    
+    key = obj.key
+    # Adaptive check
+    # Step size for adaptation
+    delta = 0.02
+    
+    if key in _s3_ghost_s:
+        # Hit in Ghost S -> Small was too small
+        _s3_ratio = min(0.9, _s3_ratio + delta)
+        # Promote to Main (restore)
+        if key not in _s3_main and key not in _s3_small:
+            _s3_main[key] = None
+            _s3_freq[key] = 0
+        _s3_ghost_s.pop(key)
+        
+    elif key in _s3_ghost_m:
+        # Hit in Ghost M -> Main was too small (Small too big)
+        _s3_ratio = max(0.01, _s3_ratio - delta)
+        # Promote to Main (restore)
+        if key not in _s3_main and key not in _s3_small:
+            _s3_main[key] = None
+            _s3_freq[key] = 0
+        _s3_ghost_m.pop(key)
+        
+    else:
+        # New insert -> Small (Probation)
+        if key not in _s3_small and key not in _s3_main:
+            _s3_small[key] = None
+            _s3_freq[key] = 0
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    global _s3_small, _s3_main, _s3_ghost_s, _s3_ghost_m, _s3_freq
+    _check_reset(cache_snapshot)
+    
+    key = evicted_obj.key
+    
+    # Identify where the object was evicted from and track in appropriate ghost queue
+    if key in _s3_small:
+        _s3_small.pop(key)
+        _s3_ghost_s[key] = None
+        # Ghost management (limit size to capacity)
+        if len(_s3_ghost_s) > cache_snapshot.capacity:
+            _s3_ghost_s.pop(next(iter(_s3_ghost_s)), None)
+            
+    elif key in _s3_main:
+        _s3_main.pop(key)
+        _s3_ghost_m[key] = None
+        # Ghost management (limit size to capacity)
+        if len(_s3_ghost_m) > cache_snapshot.capacity:
+            _s3_ghost_m.pop(next(iter(_s3_ghost_m)), None)
+            
+    _s3_freq.pop(key, None)
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

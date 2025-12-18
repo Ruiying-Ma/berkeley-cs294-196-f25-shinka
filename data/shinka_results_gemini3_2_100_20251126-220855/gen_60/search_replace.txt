@@ -1,0 +1,94 @@
+<NAME>
+expand_ghost_capacity
+</NAME>
+
+<DESCRIPTION>
+Increase the Ghost registry target size from 2x to 8x capacity. Trace 14 performance (0.0000) strongly suggests a loop pattern larger than the current cache plus ghost history. By significantly expanding the ghost registry, the algorithm can track frequency history for much larger working sets, allowing it to distinguish between one-time scans and long-period loops that exceed the physical cache size.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Ghost registry size target (2x capacity for better loop detection)
+        s3_config['ghost_target'] = cap * 2
+
+def _age_freqs():
+=======
+        # Ghost registry size target (8x capacity for better loop detection)
+        s3_config['ghost_target'] = cap * 8
+
+def _age_freqs():
+>>>>>>> REPLACE
+
+</DIFF>
+
+<NAME>
+adaptive_admission_policy
+</NAME>
+
+<DESCRIPTION>
+Implement an adaptive admission policy by modifying `evict` and `update_after_insert`.
+1. In `update_after_insert`: Defer promotion. Ghost hits are restored and inserted into `s3_small` (Probation) instead of being immediately promoted to `s3_main`. This prevents "warm" but potentially less valuable items from bypassing the admission check.
+2. In `evict`: Enhance the promotion logic. Instead of promoting any item with `freq > 0`, we compare the candidate's frequency against the frequency of the LRU victim in `s3_main`. The candidate is promoted only if `candidate_freq >= main_victim_freq`. This ensures that items in the protected Main queue are only displaced by items of equal or higher historical utility, significantly reducing thrashing in loop-dominated traces.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Check Promotion (freq > 0 means at least 1 hit in probation)
+        if s3_freq.get(victim_key, 0) > 0:
+            # Promote to Main (MRU)
+            s3_main[victim_key] = 1
+            s3_main.move_to_end(victim_key)
+        else:
+            # Victim found. Put back to ensure consistency for update_after_evict
+            s3_small[victim_key] = 1
+            return victim_key
+=======
+        # Adaptive Promotion: Compare with Main's LRU victim
+        victim_freq = s3_freq.get(victim_key, 0)
+        should_promote = False
+
+        if not s3_main:
+            should_promote = True
+        else:
+            # Peek at Main's LRU without removing
+            main_lru_key = next(iter(s3_main))
+            main_lru_freq = s3_freq.get(main_lru_key, 0)
+            # Promote if we are at least as valuable as the item we would eventually evict from Main
+            if victim_freq >= main_lru_freq:
+                should_promote = True
+
+        if should_promote:
+            # Promote to Main (MRU)
+            s3_main[victim_key] = 1
+            s3_main.move_to_end(victim_key)
+        else:
+            # Victim found. Put back to ensure consistency for update_after_evict
+            s3_small[victim_key] = 1
+            return victim_key
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    if key in s3_ghost:
+        # Restore frequency with decay to prevent stale dominance
+        restored_freq = s3_ghost.pop(key)
+        s3_freq[key] = max(0, restored_freq // 2)
+        # Promote to Main immediately
+        s3_main[key] = 1
+        s3_main.move_to_end(key)
+    else:
+        # New Item -> Small
+        s3_small[key] = 1
+        s3_freq[key] = 0
+=======
+    if key in s3_ghost:
+        # Restore frequency with decay
+        restored_freq = s3_ghost.pop(key)
+        s3_freq[key] = max(0, restored_freq // 2)
+        # Insert to Small (Probation)
+        s3_small[key] = 1
+    else:
+        # New Item -> Small
+        s3_small[key] = 1
+        s3_freq[key] = 0
+>>>>>>> REPLACE
+
+</DIFF>

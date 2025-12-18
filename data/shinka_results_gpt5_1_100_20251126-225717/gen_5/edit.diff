@@ -1,0 +1,154 @@
+--- a/original.py
++++ b/original.py
+@@ -1,79 +1,135 @@
+ # EVOLVE-BLOCK-START
+ """Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+ 
+-m_key_timestamp = dict()
++# Segmented LRU (2Q-like): probationary (recent) and protected (frequent) segments.
++# - Newly inserted objects go to probationary.
++# - On first hit, they are promoted to protected.
++# - Evict from probationary first to resist scans; if empty, evict from protected.
++m_ts = dict()             # key -> last access timestamp
++m_probation = set()       # keys seen once (recently inserted)
++m_protected = set()       # keys with demonstrated reuse (promoted on hit)
+ 
+ def evict(cache_snapshot, obj):
+     '''
+     This function defines how the algorithm chooses the eviction victim.
+     - Args:
+         - `cache_snapshot`: A snapshot of the current cache state.
+         - `obj`: The new object that needs to be inserted into the cache.
+     - Return:
+         - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+     '''
+-    candid_obj_key = None
+-    min_ts = min(m_key_timestamp.values())
+-    candid_obj_keys = list(key for key in cache_snapshot.cache if m_key_timestamp[key] == min_ts)
+-    candid_obj_key = candid_obj_keys[0]
+-    return candid_obj_key
++    global m_ts, m_probation, m_protected
++
++    keys_in_cache = set(cache_snapshot.cache.keys())
++
++    # Keep metadata consistent with actual cache content
++    if m_probation:
++        m_probation.intersection_update(keys_in_cache)
++    if m_protected:
++        m_protected.intersection_update(keys_in_cache)
++    if m_ts:
++        for k in list(m_ts.keys()):
++            if k not in keys_in_cache:
++                m_ts.pop(k, None)
++                m_probation.discard(k)
++                m_protected.discard(k)
++
++    def oldest_key(candidates):
++        # Return the key with the smallest timestamp among candidates
++        return min(candidates, key=lambda k: m_ts.get(k, -1))
++
++    probation_candidates = m_probation & keys_in_cache
++    protected_candidates = m_protected & keys_in_cache
++
++    # Prefer evicting from probationary segment to avoid polluting protected items
++    if probation_candidates:
++        return oldest_key(probation_candidates)
++    if protected_candidates:
++        return oldest_key(protected_candidates)
++
++    # Fallback: evict the globally oldest if segmentation hasn't been set yet
++    if keys_in_cache:
++        return oldest_key(keys_in_cache)
++    return None
+ 
+ def update_after_hit(cache_snapshot, obj):
+     '''
+     This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+     - Args:
+         - `cache_snapshot`: A snapshot of the current cache state.
+         - `obj`: The object accessed during the cache hit.
+     - Return: `None`
+     '''
+-    global m_key_timestamp
+-    assert obj.key in m_key_timestamp
+-    m_key_timestamp[obj.key] = cache_snapshot.access_count
++    global m_ts, m_probation, m_protected
++    now = cache_snapshot.access_count
++    key = obj.key
++
++    # Ensure timestamp exists
++    if key not in m_ts:
++        m_ts[key] = now
++
++    # Promote on first hit; otherwise remain/update in protected
++    if key in m_probation:
++        m_probation.discard(key)
++        m_protected.add(key)
++    elif key not in m_protected:
++        # If metadata was missing, treat as protected to avoid premature eviction
++        m_protected.add(key)
++
++    # Update recency timestamp
++    m_ts[key] = now
+ 
+ def update_after_insert(cache_snapshot, obj):
+     '''
+     This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+     - Args:
+         - `cache_snapshot`: A snapshot of the current cache state.
+         - `obj`: The object that was just inserted into the cache.
+     - Return: `None`
+     '''
+-    global m_key_timestamp
+-    assert obj.key not in m_key_timestamp
+-    m_key_timestamp[obj.key] = cache_snapshot.access_count
++    global m_ts, m_probation, m_protected
++    now = cache_snapshot.access_count
++    key = obj.key
++
++    # New insert starts in probationary segment
++    m_ts[key] = now
++    m_protected.discard(key)
++    m_probation.add(key)
+ 
+ def update_after_evict(cache_snapshot, obj, evicted_obj):
+     '''
+     This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+     - Args:
+         - `cache_snapshot`: A snapshot of the current cache state.
+         - `obj`: The object to be inserted into the cache.
+         - `evicted_obj`: The object that was just evicted from the cache.
+     - Return: `None`
+     '''
+-    global m_key_timestamp
+-    assert obj.key not in m_key_timestamp
+-    assert evicted_obj.key in m_key_timestamp
+-    m_key_timestamp.pop(evicted_obj.key)
++    global m_ts, m_probation, m_protected
++    evk = evicted_obj.key
++    # Remove all metadata for the evicted object
++    m_ts.pop(evk, None)
++    m_probation.discard(evk)
++    m_protected.discard(evk)
+ 
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

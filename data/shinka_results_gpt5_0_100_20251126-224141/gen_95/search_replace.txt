@@ -1,0 +1,77 @@
+<NAME>
+gentle_guard_tuning_and_effective_p
+</NAME>
+
+<DESCRIPTION>
+I am refining the scan-guard and effective p logic to better align with canonical ARC adaptive behavior while reducing overreaction to temporary cold bursts. The previous settings used a relatively short cold-streak threshold (C//8) to arm the guard and a more aggressive effective p drop during the guard, which could prematurely bias evictions away from recency and harm workloads that mix scans with reuse.
+
+Changes:
+- Raise the cold-streak threshold to C//2 for arming the guard, making guard activation less trigger-happy.
+- Adjust the effective_p drop computation during the guard to a softer, windowed form: effective_p = max(0, p - min(C//16, 1 + (cold_streak - C//2)//(C//16))). This preserves ARC’s adaptability but avoids large transient drops.
+- Make the one-shot demotion bias fire also when len(T2) == len(T1) (>= instead of >), to better counter early pollution when frequency history is absent (B2 empty).
+- Keep canonical ghost-driven p updates and ensure we don’t double-adjust p in insert when evict already did.
+
+This should reduce misses in mixed or scan-heavy traces by stabilizing ARC’s balance while maintaining its responsiveness to real shifts.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    else:
+        # Brand-new: do NOT change p here; optionally open a short guard window on long cold streaks
+        if cold_streak >= max(1, C // 8):
+            scan_guard_until = max(scan_guard_until, cache_snapshot.access_count + _guard_window(C))
+=======
+    else:
+        # Brand-new: do NOT change p here; optionally open a short guard window on long cold streaks
+        if cold_streak >= max(1, C // 2):
+            scan_guard_until = max(scan_guard_until, cache_snapshot.access_count + _guard_window(C))
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # ARC REPLACE with guard-adjusted effective p
+    t1_sz = len(arc_T1)
+    guard_active = (scan_guard_until != -1 and cache_snapshot.access_count < scan_guard_until)
+    # Gentle effective_p drop under guard
+    drop_cap = max(1, C // 16)
+    extra = 0
+    if guard_active:
+        extra = min(drop_cap, 1 + max(0, (cold_streak - max(1, C // 8))) // max(1, C // 16))
+    p_eff = max(0, arc_p - extra)
+    # One-shot demotion bias when scans likely and no freq history (B2 empty)
+    if guard_active and len(arc_B2) == 0 and len(arc_T2) > len(arc_T1) and not guard_demote_once:
+        p_eff = 0
+        guard_demote_once = True
+=======
+    # ARC REPLACE with guard-adjusted effective p
+    t1_sz = len(arc_T1)
+    guard_active = (scan_guard_until != -1 and cache_snapshot.access_count < scan_guard_until)
+    # Gentle effective_p drop under guard with softer, dynamic window
+    threshold = max(1, C // 2)
+    unit = max(1, C // 16)
+    extra = 0
+    if guard_active:
+        extra = min(unit, 1 + max(0, cold_streak - threshold) // unit)
+    p_eff = max(0, arc_p - extra)
+    # One-shot demotion bias when scans likely and no freq history (B2 empty)
+    if guard_active and len(arc_B2) == 0 and len(arc_T2) >= len(arc_T1) and not guard_demote_once:
+        p_eff = 0
+        guard_demote_once = True
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # If long cold streak and no active guard, open a short guard window
+        if cold_streak >= max(1, C // 8) and not guard_active:
+            scan_guard_until = max(scan_guard_until, cache_snapshot.access_count + _guard_window(C))
+=======
+        # If long cold streak and no active guard, open a short guard window
+        if cold_streak >= max(1, C // 2) and not guard_active:
+            scan_guard_until = max(scan_guard_until, cache_snapshot.access_count + _guard_window(C))
+>>>>>>> REPLACE
+
+</DIFF>

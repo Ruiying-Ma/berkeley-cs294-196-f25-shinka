@@ -1,0 +1,165 @@
+<NAME>
+improved_smarts3fifo
+</NAME>
+
+<DESCRIPTION>
+This edit enhances the Smart S3-FIFO algorithm to better handle large loops (scans) and high-frequency items.
+1.  **Frequency Decay**: In `evict`, when an item in the Main queue (M) is hit, its frequency is decremented (e.g., 3 -> 2) instead of reset to 0. This effectively gives higher-frequency items multiple "lives" (queue traversals) before eviction, approximating LFU behavior for the working set.
+2.  **Frequency Preservation**: When promoting items from the Small queue (S) to M, the accumulated frequency is preserved instead of reset. This ensures items that were hot during probation enter the protected queue with their priority intact.
+3.  **Extended Ghost Registry**: The ghost registry capacity is increased from 2x to 5x the cache capacity. This significantly improves the algorithm's ability to detect and rescue items involved in large loops (like Trace 14 and 27) that exceed the physical cache size but fit within extended history.
+4.  **M-Eviction Ghosting**: Items evicted directly from M (when S is full) are now added to the ghost registry. Previously, only S-victims were tracked. This fixes a gap where valuable items demoted from M and immediately evicted were lost from history.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    Selects a victim.
+    Policy:
+    - If S is above target size (10%) or M is empty: Clean S.
+      - S-Victim accessed? -> Promote to M.
+      - Else -> Evict & Ghost.
+    - Else (S is small enough, M has data): Clean M.
+      - M-Victim accessed? -> Reinsert M.
+      - Else ->
+         - If S has room? -> Demote to S.
+         - Else -> Evict directly.
+    '''
+    # 10% capacity target for S
+    capacity = cache_snapshot.capacity
+    s_target = max(int(capacity * 0.1), 1)
+
+    # Cap ghost to N (e.g., 2x capacity)
+    ghost_limit = capacity * 2
+
+    while True:
+        # Check if we need to prioritize S eviction
+        # We process S if it's over budget, OR if M is empty (must keep cache full)
+        force_s = len(s_queue) > s_target or len(m_queue) == 0
+
+        if force_s:
+            if not s_queue:
+                # Fallback if M is empty and S is empty (should not happen in full cache)
+                # But if we just demoted everything?
+                if m_queue:
+                    force_s = False # Go to M logic
+                else:
+                    return next(iter(cache_snapshot.cache)) # Failsafe
+
+            if force_s:
+                candidate, _ = s_queue.popitem(last=False)
+                cnt = freq_map.get(candidate, 0)
+
+                if cnt > 0:
+                    # Accessed in S -> Promote to M
+                    m_queue[candidate] = None
+                    freq_map[candidate] = 0 # Reset frequency on move
+                else:
+                    # Not accessed -> Evict
+                    # Record in ghost
+                    ghost_registry[candidate] = None
+                    if len(ghost_registry) > ghost_limit:
+                        ghost_registry.popitem(last=False)
+                    return candidate
+
+        if not force_s:
+            # Process M
+            if not m_queue:
+                # M empty, go back to S (loop will handle)
+                continue
+
+            candidate, _ = m_queue.popitem(last=False)
+            cnt = freq_map.get(candidate, 0)
+
+            if cnt > 0:
+                # Accessed in M -> Reinsert M (Second Chance)
+                m_queue[candidate] = None
+                freq_map[candidate] = 0
+            else:
+                # Cold in M
+                # Conditional Demotion: Only if S has space
+                if len(s_queue) < s_target:
+                    s_queue[candidate] = None
+                    # frequency remains 0
+                else:
+                    # S is full, don't pollute it. Evict M-victim directly.
+                    return candidate
+=======
+def evict(cache_snapshot, obj):
+    '''
+    Selects a victim.
+    Policy:
+    - If S is above target size (10%) or M is empty: Clean S.
+      - S-Victim accessed? -> Promote to M.
+      - Else -> Evict & Ghost.
+    - Else (S is small enough, M has data): Clean M.
+      - M-Victim accessed? -> Reinsert M with Decayed Frequency.
+      - Else ->
+         - If S has room? -> Demote to S.
+         - Else -> Evict directly & Ghost.
+    '''
+    # 10% capacity target for S
+    capacity = cache_snapshot.capacity
+    s_target = max(int(capacity * 0.1), 1)
+
+    # Cap ghost to 5x capacity for better history coverage (helps large loops)
+    ghost_limit = capacity * 5
+
+    while True:
+        # Check if we need to prioritize S eviction
+        # We process S if it's over budget, OR if M is empty (must keep cache full)
+        force_s = len(s_queue) > s_target or len(m_queue) == 0
+
+        if force_s:
+            if not s_queue:
+                # Fallback if M is empty and S is empty
+                if m_queue:
+                    force_s = False # Go to M logic
+                else:
+                    return next(iter(cache_snapshot.cache)) # Failsafe
+
+            if force_s:
+                candidate, _ = s_queue.popitem(last=False)
+                cnt = freq_map.get(candidate, 0)
+
+                if cnt > 0:
+                    # Accessed in S -> Promote to M
+                    m_queue[candidate] = None
+                    # Keep accumulated frequency (don't reset) to reward hotness from S
+                else:
+                    # Not accessed -> Evict
+                    # Record in ghost
+                    ghost_registry[candidate] = None
+                    if len(ghost_registry) > ghost_limit:
+                        ghost_registry.popitem(last=False)
+                    return candidate
+
+        if not force_s:
+            # Process M
+            if not m_queue:
+                # M empty, go back to S (loop will handle)
+                continue
+
+            candidate, _ = m_queue.popitem(last=False)
+            cnt = freq_map.get(candidate, 0)
+
+            if cnt > 0:
+                # Accessed in M -> Reinsert M (Second Chance)
+                # Decay frequency instead of hard reset to reward high-frequency items
+                m_queue[candidate] = None
+                freq_map[candidate] = cnt - 1
+            else:
+                # Cold in M (freq=0)
+                # Conditional Demotion: Only if S has space
+                if len(s_queue) < s_target:
+                    s_queue[candidate] = None
+                    # frequency remains 0
+                else:
+                    # S is full, don't pollute it. Evict M-victim directly.
+                    # Record in ghost (critical to track M-victims)
+                    ghost_registry[candidate] = None
+                    if len(ghost_registry) > ghost_limit:
+                        ghost_registry.popitem(last=False)
+                    return candidate
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,590 @@
+# INDIVIDUAL PROGRAM SUMMARIES
+
+The following are summaries of individual programs evaluated since the last meta update:
+
+**Program Name: Basic Dictionary-Based Least Recently Used (LRU)**
+- **Implementation**: The algorithm tracks the most recent access time (access count) for each object in a global dictionary and evicts the object with the lowest timestamp value.
+- **Performance**: It achieves a combined score of 0.21, performing strongly on traces with high temporal locality but poorly on scan-heavy or looping patterns.
+- **Feedback**: While the logic correctly implements the standard LRU policy, the O(N) linear scan for the minimum timestamp is inefficient, and the lack of frequency tracking limits hit rates on non-recency-based workloads.
+**Program Identifier:** Generation 0 - Patch Name initial_program - Correct Program: True
+
+**Program Name: LFU-DA with Dynamic Aging and LRU Tie-Breaking**
+- **Implementation**: The algorithm implements Least Frequently Used with Dynamic Aging (LFU-DA) by calculating priorities as frequency plus a global aging factor (the priority of the last evicted item), using a linear scan to identify the eviction victim.
+- **Performance**: It achieved a combined score of 0.22, demonstrating strong performance on frequency-stable workloads (up to 0.88 hit rate) but failing completely on scan-heavy traces (0.00 hit rate).
+- **Feedback**: While the dynamic aging factor effectively prevents cache pollution common in standard LFU, the algorithm lacks specific mechanisms to handle scan patterns and the $O(N)$ eviction search is computationally inefficient.
+**Program Identifier:** Generation 1 - Patch Name lfuda_eviction - Correct Program: True
+
+**Program Name: S3-FIFO with Static S-Queue Allocation and Lazy Promotion**
+- **Implementation**: Utilizes two queues (S for new, M for frequent) with a 10% static allocation for S, employing lazy promotion where accessed eviction candidates are moved to M.
+- **Performance**: Achieves a combined score of 0.23, showing strong locality handling (hit rates >0.88) but poor performance on specific scan patterns (hit rates ~0.00).
+- **Feedback**: The implementation correctly separates one-hit wonders, but the fixed 10% S-queue size lacks adaptability for varying workload phases, causing significant drops in hit rate for certain traces.
+**Program Identifier:** Generation 2 - Patch Name s3fifo_v1 - Correct Program: True
+
+**Program Name: Segmented LRU with Fixed Protected Capacity**
+- **Implementation**: This Segmented LRU (SLRU) implementation uses two `OrderedDict` segments, `probationary` and `protected`, promoting items to `protected` on hits with a fixed cap of 80% capacity. Overflow from `protected` demotes items back to `probationary`, and eviction strictly targets the LRU of the `probationary` segment first.
+- **Performance**: It achieved a combined score of 0.23, with high efficiency on select patterns (up to 0.88) but near-zero hit rates on numerous other traces.
+- **Feedback**: The rigid 80% protected limit provides scan resistance but likely starves the probationary segment during high churn, suggesting an adaptive partition size would improve consistency across diverse workloads.
+**Program Identifier:** Generation 3 - Patch Name slru_algorithm - Correct Program: True
+
+**Program Name: LeCaR with Randomized Policy Selection**
+- **Implementation**: Maintains a probability weight to dynamically switch between LRU and LFU eviction, updating the weight via multiplicative updates when re-accessing previously evicted keys tracked in history buffers.
+- **Performance**: The algorithm achieves a low overall score of 0.21, with hit rates varying drastically from near 0% on many traces to 87% on specific stable workloads.
+- **Feedback**: The probabilistic switching mechanism combined with a fixed learning rate appears too unstable for dynamic workloads, often failing to converge on an optimal policy quickly enough.
+**Program Identifier:** Generation 4 - Patch Name lecar_adaptive_eviction - Correct Program: True
+
+**Program Name: LFU-DA with Ghost Frequency History**
+- **Implementation**: The algorithm implements Least Frequently Used with Dynamic Aging (LFU-DA), setting priority as frequency plus an aging factor $L$ (updated to the evicted item's priority), and maintains a "ghost" history to restore frequencies for recently evicted items.
+- **Performance**: It achieved a combined score of 0.23, demonstrating high hit rates on frequency-skewed traces (up to 0.88) but failing near-completely on scan or loop patterns (near 0.0).
+- **Feedback**: While dynamic aging helps adapt to shifting frequency distributions, the algorithm lacks specific scan resistance, causing new items to be evicted immediately against established high-frequency items in scan-heavy workloads.
+**Program Identifier:** Generation 5 - Patch Name lfu_da_ghost - Correct Program: True
+
+**Program Name: Adaptive Replacement Cache (ARC) with Ghost Lists**
+- **Implementation**: Maintains four separate LRU dictionaries (T1/T2 for resident data, B1/B2 for eviction history) and dynamically shifts a partition parameter `p` to balance recency and frequency based on ghost list hits.
+- **Performance**: Achieved a combined score of 0.24, demonstrating high effectiveness on repeating patterns (hit rates >0.8) but varying performance on high-churn or scan-heavy traces.
+- **Feedback**: The implementation correctly applies ARC's sophisticated adaptability logic, successfully optimizing for both recency and frequency, though the overhead of maintaining complex state may impact efficiency on highly volatile workloads.
+**Program Identifier:** Generation 6 - Patch Name implement_arc - Correct Program: True
+
+**Program Name: Adaptive Replacement Cache (ARC) with Trace Reset**
+- **Implementation**: Implements the ARC algorithm using four LRU lists (T1, T2, B1, B2) to dynamically balance recency and frequency by adjusting a partition parameter `p` based on ghost list hits, including a check to reset state for new traces.
+- **Performance**: The algorithm achieves a combined score of 0.24, performing robustly on mixed workloads (e.g., traces 1-10) but showing lower hit rates on pure scans.
+- **Feedback**: The implementation correctly separates eviction decisions from state updates to fit the framework, and the self-tuning capability effectively captures both recent and frequent access patterns without manual tuning.
+**Program Identifier:** Generation 7 - Patch Name implement_arc_algorithm - Correct Program: True
+
+**Program Name: S3-FIFO Eviction with Ghost Cache and Dual Queues**
+- **Implementation**: Maintains a small nursery queue (10%) and a main queue (90%) with a ghost cache to rescue frequently evicted items, using a 1-bit clock scheme for promotion and reinsertion.
+- **Performance**: Combined score of 0.23, showing strong results on high-locality workloads (up to 88% hit rate) but near-zero performance on several specific traces.
+- **Feedback**: The use of ghost caches and the S/M split provides effective scan resistance and frequency tracking, though the static 10% nursery size may lack flexibility for varying working set structures.
+**Program Identifier:** Generation 8 - Patch Name s3fifo - Correct Program: True
+
+**Program Name: Segmented LRU with Fixed 80% Protected Capacity**
+- **Implementation**: Utilizes an ordered dictionary for global LRU tracking and a set to maintain a protected segment (fixed at 80% of cache) where items are promoted upon hits and the segment's LRU is demoted when full.
+- **Performance**: Achieves a combined score of 0.23, performing well on stable frequency traces (up to 0.88 hit rate) but poorly on high-churn or scan-heavy workloads.
+- **Feedback**: The static partitioning effectively isolates the working set for specific traces but lacks the adaptability required to handle diverse access patterns found in the broader dataset.
+**Program Identifier:** Generation 9 - Patch Name slru_eviction - Correct Program: True
+
+**Program Name: Adaptive Replacement Cache (ARC)**
+- **Implementation**: Maintains four LRU lists (T1/T2 for resident data, B1/B2 for eviction history) and dynamically adjusts a target partition size `p` based on hits in the ghost lists to balance recency and frequency.
+- **Performance**: The algorithm achieves a combined score of 0.25, with exceptional performance on high-locality traces (up to 0.89 hit rate) but inconsistent results on scanning workloads.
+- **Feedback**: The implementation successfully leverages ghost lists to adapt to changing workload patterns, offering a robust trade-off between LRU and LFU strategies without manual tuning.
+**Program Identifier:** Generation 10 - Patch Name arc_eviction - Correct Program: True
+
+**Program Name: Adaptive Replacement Cache (ARC) Implementation**
+- **Implementation**: Implements ARC using four dictionaries (T1/T2 for resident, B1/B2 for ghosts) to dynamically tune a partition parameter `p` that balances recency versus frequency based on eviction history.
+- **Performance**: Achieved a combined score of 0.24, demonstrating strong adaptability on mixed workloads (up to 0.89 hit rate) while struggling with specific high-churn traces.
+- **Feedback**: The implementation correctly captures the self-tuning nature of ARC to maximize hit rates, though the extensive state management and adaptation lag result in poor performance on datasets with rapidly shifting or massive working sets.
+**Program Identifier:** Generation 11 - Patch Name implement_arc_algorithm - Correct Program: True
+
+**Program Name: ARC with S3-FIFO Nursery Hybrid**
+- **Implementation**: This algorithm places a small FIFO nursery queue in front of an Adaptive Replacement Cache (ARC), promoting accessed nursery items to ARC's recency list while using ghost lists to dynamically tune the balance between recency and frequency segments.
+- **Performance**: The algorithm achieved a combined score of 0.23, showing high variability with excellent hit rates on specific traces (e.g., 0.88) but near-zero performance on several others.
+- **Feedback**: While the nursery effectively filters one-hit wonders, its integration likely disrupts ARC's ghost list learning mechanism for certain access patterns, preventing the algorithm from correctly adapting `p` and leading to instability across diverse workloads.
+**Program Identifier:** Generation 12 - Patch Name s3_fifo_arc_hybrid - Correct Program: True
+
+**Program Name: S3-FIFO-D with Ghost Queue and Partitioned FIFO**
+- **Implementation**: Implements a segmented FIFO strategy with a small probation queue (10% capacity) and a main queue, using a ghost cache to rescue evicted items and a second-chance mechanism for recurring hits in the main segment.
+- **Performance**: The algorithm achieved a combined score of 0.25, excelling on stable workloads (e.g., trace 28 with 0.89) but performing poorly on scan-heavy traces (e.g., trace 14 with 0.00).
+- **Feedback**: The fixed 10% probation size appears too rigid for workloads with high churn, suggesting that adaptive queue sizing or a more robust frequency filter is needed to handle diverse access patterns effectively.
+**Program Identifier:** Generation 13 - Patch Name s3_fifo_d - Correct Program: True
+
+**Program Name: LIRS Cache Eviction with Static HIR Buffer**
+- **Implementation**: Implements the Low Inter-reference Recency Set (LIRS) algorithm using `OrderedDicts` for the history stack and resident queue, with a fixed 5% capacity reservation for HIR blocks.
+- **Performance**: Achieves a composite score of 0.22, showing high effectiveness on stable, looping patterns (up to 88% hit rate) but near-zero performance on volatile traces.
+- **Feedback**: While the LIRS logic effectively isolates the working set from scans, the static configuration and rigid promotion rules struggle to adapt to traces with rapidly shifting locality or random access patterns.
+**Program Identifier:** Generation 14 - Patch Name lirs_optimized - Correct Program: True
+
+**Program Name: Static W-TinyLFU with Segmented LRU**
+- **Implementation**: Implements a W-TinyLFU architecture with a fixed 5% admission window and a Segmented LRU main cache, using frequency-based duels to decide whether to admit new items or retain existing ones.
+- **Performance**: Achieved a combined score of 0.25, demonstrating strong performance on frequency-biased workloads but failing significantly on scan-heavy traces.
+- **Feedback**: The static window size limits the algorithm's ability to adapt to changing workload patterns; implementing dynamic window sizing (as in Adaptive W-TinyLFU) could improve robustness across diverse traces.
+**Program Identifier:** Generation 15 - Patch Name w_tinylfu_slru - Correct Program: True
+
+**Program Name: Randomized Adaptive Replacement Cache (ARC)**
+- **Implementation**: Maintains ARC's dual lists (recency/frequency) and adaptive parameter `p` using ghost entries, but utilizes random eviction within the selected list instead of LRU.
+- **Performance**: Achieved a combined score of 0.25 with highly variable hit rates, excelling on some workloads (0.89) but failing completely on others (0.00).
+- **Feedback**: Replacing LRU with random eviction undermines ARC's recency tracking, significantly reducing effectiveness on standard locality traces despite the correctly implemented adaptive balancing logic.
+**Program Identifier:** Generation 16 - Patch Name arc_random_eviction - Correct Program: True
+
+**Program Name: S3-FIFO with Static Partitioning and Ghost Queue**
+- **Implementation**: This algorithm maintains three queues (Small, Main, Ghost) with a static 10% Small partition, promoting items to Main upon re-access or Ghost hits to filter one-time scans.
+- **Performance**: It achieved a combined score of 0.25, showing high efficiency on some workloads (up to 89% hit rate) but performing poorly on others.
+- **Feedback**: While the S3-FIFO logic successfully identifies frequent items in standard distributions, the static queue sizing limits adaptability, causing significant misses in changing workload patterns.
+**Program Identifier:** Generation 17 - Patch Name s3_fifo_refined - Correct Program: True
+
+**Program Name: Nursery-ARC (NARC) Hybrid Cache Algorithm**
+- **Implementation**: This approach couples a 15% FIFO "Nursery" buffer to filter one-hit wonders with an Adaptive Replacement Cache (ARC) for the remaining capacity, utilizing lazy promotion to move reused items from the Nursery to the main ARC instance.
+- **Performance**: The algorithm achieves a combined score of 0.23, demonstrating exceptional hit rates on frequency-heavy traces (up to 88%) but significant inconsistency on other workloads.
+- **Feedback**: While the nursery successfully prevents scan pollution, the decision to exclude nursery victims from ARC's ghost lists likely hinders the adaptive parameter `p` from correctly responding to shifts in global recency demands.
+**Program Identifier:** Generation 18 - Patch Name nursery_arc - Correct Program: True
+
+**Program Name: LIRS Algorithm with 99% LIR Capacity Allocation**
+- **Implementation**: Implements the LIRS policy using a stack and queue to manage Low and High Inter-reference Recency blocks, tracking non-resident HIRs to detect looping patterns. It allocates 99% of the cache capacity to LIR blocks, effectively minimizing the resident HIR queue.
+- **Performance**: Achieved a score of 0.24 with high hit rates on looping traces (e.g., 0.89 on trace 28) but near-zero performance on many others.
+- **Feedback**: The aggressive 99% LIR target leaves insufficient space for the HIR queue, likely causing thrashing on workloads relying on recent short-term locality.
+**Program Identifier:** Generation 19 - Patch Name lirs_implementation - Correct Program: True
+
+**Program Name: W-TinyLFU with Doorkeeper and Segmented LRU**
+- **Implementation**: This approach implements W-TinyLFU using a tiny 1% Window LRU and a Main SLRU (Probation/Protected), managing admission via a Doorkeeper frequency filter and periodic aging.
+- **Performance**: It achieves a combined score of 0.21, showing strong results on high-repetition traces but failing significantly on scan-heavy or rapid-turnover workloads.
+- **Feedback**: The static, very small window size effectively filters noise but makes the cache overly resistant to admitting new items, leading to poor adaptability on traces lacking long-term frequency stability.
+**Program Identifier:** Generation 20 - Patch Name w_tinylfu_implementation - Correct Program: True
+
+**Program Name: S3-FIFO Eviction with Small, Main, and Ghost Queues**
+- **Implementation**: Maintains Small (10%) and Main (90%) FIFO queues with a Ghost cache for history; accessed items in Small are promoted to Main during eviction, while Main items get a second chance.
+- **Performance**: The algorithm achieved a composite score of 0.25, showing high efficiency on stable workloads (up to 0.89 hit rate) but struggling significantly on dynamic or scan-heavy traces.
+- **Feedback**: The fixed 10/90 split provides basic scan resistance, but the poor performance on many traces suggests that a static resizing policy or the specific ghost queue management may be too rigid for diverse access patterns.
+**Program Identifier:** Generation 21 - Patch Name s3fifo_algorithm - Correct Program: True
+
+**Program Name:** Adaptive TinyLFU with SLRU and Doorkeeper Mechanism
+- **Implementation:** This complex eviction policy integrates a window cache and segmented SLRU main cache, employing a Doorkeeper-assisted frequency counter for admission duels and dynamically sizing the window based on ghost cache hits.
+- **Performance:** The algorithm achieved a combined score of 0.22, excelling on specific patterns (up to 0.88 hit rate) but performing poorly (near zero) on numerous other traces.
+- **Feedback:** The approach effectively protects frequent items in stable workloads but struggles with rapid adaptations or scans, suggesting the admission or aging parameters may be over-tuned for stability over responsiveness.
+**Program Identifier:** Generation 22 - Patch Name adaptive_tinylfu_doorkeeper - Correct Program: True
+
+**Program Name: W-TinyLFU with SLRU Main Cache**
+- **Implementation**: Uses a 5% FIFO admission window and a Segmented LRU (Probation/Protected) main cache, arbitrating eviction via frequency comparisons with a doorkeeper and periodic aging.
+- **Performance**: Achieved a combined score of 0.19, excelling on specific high-locality traces (up to 0.76 hit rate) but struggling significantly with sparse or scan-heavy workloads.
+- **Feedback**: The W-TinyLFU structure effectively prevents pollution via frequency-based admission, but the static 5% window and SLRU splits likely limit adaptability across the diverse trace characteristics.
+**Program Identifier:** Generation 23 - Patch Name w_tinylfu_implementation - Correct Program: True
+
+**Program Name: W-TinyLFU with Segmented LRU and Frequency Sketch**
+- **Implementation**: Manages cache via Window, Probation, and Protected segments using `OrderedDict`s, employing a frequency sketch with a Doorkeeper to govern admission between Window and Probation victims.
+- **Performance**: Yielded a score of 0.19, excelling in repeated-access patterns (max 0.76 hit rate) but failing significantly on unique-access or scan-heavy traces.
+- **Feedback**: The strict 1% window and frequency-based admission effectively filter noise in stable workloads but struggle to adapt to rapid shifts or working sets larger than the protected segment.
+**Program Identifier:** Generation 24 - Patch Name wtinylfu_pp - Correct Program: True
+
+**Program Name: Adaptive S3-FIFO with Ghost Lists**
+- **Implementation**: Merges S3-FIFO's structure (Small/Main queues with hit-bit promotion) with ARC's adaptive sizing logic, using ghost lists to dynamically tune the Small queue capacity based on eviction history.
+- **Performance**: Achieved a combined score of 0.25, with high variability ranging from ~0.89 on optimal traces to near zero on others.
+- **Feedback**: The hybrid adaptation logic struggles to converge on diverse workloads, likely because the FIFO-based eviction combined with ARC-style parameter tuning creates instability in queue sizing compared to static S3-FIFO or LRU-based ARC.
+**Program Identifier:** Generation 25 - Patch Name adaptive_s3_fifo - Correct Program: True
+
+**Program Name: W-TinyLFU Eviction with SLRU and Frequency Admission**
+- **Implementation:** This algorithm employs a W-TinyLFU architecture featuring a 1% FIFO admission window and a Segmented LRU (Probation/Protected) main cache, using frequency counts to duel potential victims during eviction.
+- **Performance:** It achieved a combined score of 0.26, performing exceptionally well on frequency-biased workloads (up to 0.89 hit rate) while failing on several others with near-zero hit rates.
+- **Feedback:** The frequency-based admission policy successfully filters low-value items in stable workloads, but the small static window size and aggressive filtering likely caused the poor performance on traces requiring faster adaptation or larger scan resistance.
+**Program Identifier:** Generation 26 - Patch Name w_tinylfu_impl - Correct Program: True
+
+**Program Name: W-TinyLFU with Global State**
+- **Implementation**: Implements W-TinyLFU using global dictionaries for storage segments (Window, Probation, Protected) and a frequency counter for admission duels, with a 1%/99% split.
+- **Performance**: Score 0.0 (Failed validation tests).
+- **Feedback**: The solution failed validation, likely due to improper state isolation using global variables causing data leakage between trace runs, or boundary errors in the admission duel logic.
+**Program Identifier:** Generation 27 - Patch Name w_tinylfu_eviction - Correct Program: False
+
+**Program Name: Adaptive S3-FIFO with ARC-based Queue Sizing**
+- **Implementation**: This approach combines S3-FIFO's tri-queue structure (Small, Main, Ghost) with ARC's adaptive sizing logic, dynamically adjusting the Small queue's capacity target based on ghost queue hits.
+- **Performance**: The program achieved a combined score of 0.25, with highly variable results ranging from excellent (0.89) to completely ineffective (0.00).
+- **Feedback**: The hybrid adaptation logic struggles to stabilize the FIFO queues on certain workloads, likely because ARC's resizing strategy (designed for LRU) conflicts with S3-FIFO's frequency-based promotion rules, leading to thrashing.
+**Program Identifier:** Generation 28 - Patch Name adapt_s3fifo - Correct Program: True
+
+**Program Name: W-TinyLFU with SLRU and Doorkeeper Frequency Aging**
+- **Implementation**: Implements W-TinyLFU using a 5% Window LRU and 95% Main SLRU (80% Protected), employing a Doorkeeper filter and frequency dictionary with periodic aging to arbitrate admission duels.
+- **Performance**: Achieved a combined score of 0.21, demonstrating excellent filtering on specific static traces (up to 87% hit rate) but failing completely (near 0%) on many others.
+- **Feedback**: While the admission policy effectively isolates high-frequency items in ideal scenarios, the specific aging parameters or Doorkeeper implementation likely cause aggressive forgetting on sparse or dynamic workloads, leading to extreme performance volatility.
+**Program Identifier:** Generation 29 - Patch Name wtinylfu - Correct Program: True
+
+**Program Name: W-TinyLFU with Doorkeeper and SLRU Main Cache**
+- **Implementation**: Combines a 5% Window LRU and a 95% Segmented LRU (Probation/Protected) main cache, using a Doorkeeper-filtered frequency counter to arbitrate eviction between the admission window and the main segment.
+- **Performance**: Achieved a combined score of 0.25, with strong hits on specific frequency-heavy traces but near-zero results on many others.
+- **Feedback**: The static window sizing and specific frequency comparison logic struggle with scan-heavy or shifting workloads, suggesting the need for dynamic region resizing (like Adaptive TinyLFU) to improve robustness.
+**Program Identifier:** Generation 30 - Patch Name wtinylfu_doorkeeper_aging - Correct Program: True
+
+**Program Name: Hybrid W-TinyLFU with FIFO Window and Doorkeeper**
+- **Implementation**: This algorithm integrates a 10% FIFO window with a segmented SLRU main cache, using frequency-based dueling and a Doorkeeper to manage admission and eviction. It features lazy promotion where window items are only moved to the main cache if hit before eviction.
+- **Performance**: It achieves a score of 0.22, excelling in high-frequency scenarios (up to 0.88 hit rate) but failing on scan-heavy or sparse traces (near 0 hit rate).
+- **Feedback**: The combination of S3-FIFO promotion mechanics and TinyLFU frequency tracking provides strong filtering, but the static window sizing and specific aging parameters limit adaptability across diverse workloads.
+**Program Identifier:** Generation 31 - Patch Name s3fifo_tiny_lfu_hybrid - Correct Program: True
+
+**Program Name: WALRUS: Window-LFU with Aging and Ghost Frequencies**
+- **Implementation**: Combines a small FIFO window (10%) for scan resistance with an approximate LFU main segment using random sampling, while tracking ghost frequencies and applying periodic aging (halving counts) to adapt to shifting popularity.
+- **Performance**: Achieves a combined score of 0.24, excelling on frequency-heavy traces (e.g., 0.86 on trace 28) but performing poorly on some specific patterns (e.g., 0.00 on trace 14).
+- **Feedback**: The duel between the FIFO tail and Main segment samples effectively filters one-hit wonders, but the static window size and randomized eviction may lack the precision required for workloads needing strict recency or exact LFU enforcement.
+**Program Identifier:** Generation 32 - Patch Name walrus - Correct Program: True
+
+**Program Name: W-TinyLFU with Segmented LRU and Frequency Admission**
+- **Implementation**: Implements W-TinyLFU using a 1% Window LRU and a Main SLRU (20% Probation, 80% Protected), resolving evictions by comparing access frequencies (with aging) between Window and Probation candidates.
+- **Performance**: Achieves a combined score of 0.21, performing exceptionally well on specific static traces (up to 0.86) but struggling significantly with dynamic or low-locality workloads.
+- **Feedback**: The 1% window size provides strong scan resistance but appears too restrictive for many traces; the frequency-based admission filter likely rejects too many new items in shifting workloads, suggesting a larger window or more lenient admission might improve robustness.
+**Program Identifier:** Generation 33 - Patch Name wtinylfu_slru - Correct Program: True
+
+**Program Name: W-TinyLFU with Doorkeeper and SLRU Segmentation**
+- **Implementation**: Utilizes a 1% LRU window and a Segmented LRU (Probation/Protected) main cache, using a Doorkeeper frequency filter and periodic aging to manage admission via victim dueling.
+- **Performance**: Achieved a score of 0.23, demonstrating excellent filtering on specific workloads (hit rates up to 0.88) but failing significantly on others (near 0).
+- **Feedback**: The small fixed window and strict frequency-based admission effectively prevent cache pollution but hinder adaptation to shifting working sets, resulting in high variance across different access patterns.
+**Program Identifier:** Generation 34 - Patch Name wtinylfu_doorkeeper_aging - Correct Program: True
+
+**Program Name: W-TinyLFU with Doorkeeper and SLRU Structure**
+- **Implementation**: This approach maintains a 1% LRU admission window feeding into a Segmented LRU (SLRU) main cache, employing a Doorkeeper and frequency counters to resolve eviction conflicts between window and main cache candidates.
+- **Performance**: The algorithm yielded a combined score of 0.26, showing high hit rates on static locality traces but failing significantly on several dynamic or scanning workloads.
+- **Feedback**: The rigid 1% window size effectively filters one-time accesses but appears too restrictive for certain patterns, preventing the main cache from populating effectively when admission criteria are not met quickly.
+**Program Identifier:** Generation 35 - Patch Name wtinylfu_doorkeeper_sized - Correct Program: True
+
+**Program Name: Walrus: Window-LFU with Aging and Ghost Frequencies**
+- **Implementation**: Splits cache into a FIFO window and a sampled LFU main segment, using a frequency duel to decide whether to promote window items or evict from main. It tracks global ghost frequencies, applies periodic frequency halving (aging) every `capacity` accesses, and caps frequency counts at 15.
+- **Performance**: Achieved a combined score of 0.24, with high variance ranging from 86% hit rates to complete failure (0.00%) on specific traces.
+- **Feedback**: The periodic aging matches the cache capacity, which likely deletes ghost frequencies too quickly for loops slightly larger than the cache, causing the 0.00 scores. Additionally, the low frequency cap (15) limits the ability to distinguish between highly popular items in skewed workloads.
+**Program Identifier:** Generation 36 - Patch Name walrus_strict_cap - Correct Program: True
+
+**Program Name: Frequency-Enhanced S3-FIFO with Multi-Level Aging**
+- **Implementation**: The algorithm modifies S3-FIFO by replacing binary eviction bits with a 3-bit frequency counter, using a probation queue (Small) and a protected queue (Main) where items are aged by decrementing frequency rather than immediate eviction.
+- **Performance**: It achieved a combined score of 0.24, excelling on frequency-stable workloads (e.g., trace 28 with 0.89) but failing completely on scan-heavy traces (e.g., trace 14 with 0.00).
+- **Feedback**: While the granular frequency counters improve retention for consistently hot items ("stickiness"), the slow aging process prevents rapid adaptation to new working sets, causing significant regressions in dynamic or scan-heavy scenarios.
+**Program Identifier:** Generation 37 - Patch Name s3fifo_f - Correct Program: True
+
+**Program Name: W-TinyLFU with Doorkeeper and SLRU Main Cache**
+- **Implementation**: Implements W-TinyLFU using a 5% admission window and an SLRU main cache (80% protected), employing a Doorkeeper and periodic frequency aging for admission arbitration.
+- **Performance**: Achieves a combined score of 0.26, demonstrating strong effectiveness on high-frequency traces (e.g., 0.88 on trace 28) but lower hit rates on sparse workloads.
+- **Feedback**: The combination of TinyLFU admission and SLRU provides robust scan resistance and frequency retention, though the fixed window size limits adaptation to purely recency-driven phases.
+**Program Identifier:** Generation 38 - Patch Name w_tinylfu_doorkeeper_aging - Correct Program: True
+
+**Program Name: W-TinyLFU with Segmented LRU and Doorkeeper**
+- **Implementation**: Combines a 1% FIFO admission window with a Segmented LRU (Probation/Protected) main cache, employing a Doorkeeper and frequency counters with periodic aging for admission control.
+- **Performance**: Achieved a combined score of 0.26, demonstrating strong hit rates on frequency-biased workloads but failing completely on trace 14 (0.0% hit rate).
+- **Feedback**: The aggressive frequency-based filtering works well for stable working sets, but the rigid 1% window size and SLRU management proved brittle, leading to instability on specific access patterns.
+**Program Identifier:** Generation 39 - Patch Name intro_doorkeeper_aging - Correct Program: True
+
+**Program Name: W-TinyLFU with SLRU Main Cache and Doorkeeper**
+- **Implementation**: Features a 5% Window LRU and an SLRU main cache (Probation/Protected), using a frequency-based TinyLFU admission policy with a Doorkeeper filter and periodic aging to arbitrate evictions.
+- **Performance**: Achieves a combined score of 0.26, demonstrating strong performance on high-locality workloads (hit rates >0.80) but poor results on sparse or looping patterns.
+- **Feedback**: The combination of Window LRU and SLRU effectively filters one-time access scans, but the static configuration and frequency aging logic struggle to adapt to traces with rapidly shifting or large working sets.
+**Program Identifier:** Generation 40 - Patch Name persistent_dk_and_conditional_growth - Correct Program: True
+
+**Program Name: W-TinyLFU with Doorkeeper and Strict SLRU Promotion**
+- **Implementation**: Implements a W-TinyLFU architecture with a fixed 1% admission window, frequency-based "dueling" eviction, and an SLRU main segment that requires a frequency count > 2 for promotion to the protected region.
+- **Performance**: The algorithm achieves a combined score of 0.25, showing strength in high-repetition traces (e.g., trace 28) but struggling significantly with scanning or low-reuse patterns (e.g., trace 14).
+- **Feedback**: The strict promotion criteria and static tiny window size likely prevent cold items from establishing residence in changing workloads, leading to poor hit rates on traces requiring faster adaptation or larger scan buffers.
+**Program Identifier:** Generation 41 - Patch Name refined_wtinylfu - Correct Program: True
+
+**Program Name: Adaptive W-TinyLFU with Ghost Lists and SLRU**
+- **Implementation**: Combines a W-TinyLFU admission policy with a Segmented LRU (SLRU) main cache, dynamically adjusting the window size based on hits in ghost lists to balance recency and frequency.
+- **Performance**: Achieved a composite score of 0.26, performing exceptionally well on high-frequency traces (up to 88% hit rate) but struggling significantly on trace 14 (0%).
+- **Feedback**: The adaptive window sizing and Doorkeeper mechanism effectively handle varying workloads and scan resistance, though the failure on trace 14 suggests the admission policy or adaptation logic may be overly restrictive or unstable in specific scenarios.
+**Program Identifier:** Generation 42 - Patch Name adaptive_tinylfu - Correct Program: True
+
+**Program Name: W-TinyLFU with Doorkeeper and Segmented LRU**
+- **Implementation**: Implements W-TinyLFU logic with a 1% Window LRU, a Segmented LRU (Probation/Protected) Main cache, and frequency-based admission using a Doorkeeper.
+- **Performance**: 0.0 overall score; the program failed validation tests.
+- **Feedback**: The eviction strategy contains a critical bug where it returns `None` during the admission duel if the Main cache is empty, causing runtime crashes.
+**Program Identifier:** Generation 43 - Patch Name wtinylfu_approx - Correct Program: False
+
+**Program Name: W-TinyLFU with Doorkeeper and SLRU Main Cache**
+- **Implementation**: Uses a 1% LRU window and a 99% SLRU main cache (20% probation/80% protected), employing a Doorkeeper-filtered frequency sketch to duel eviction candidates between the window and main segments.
+- **Performance**: Achieved a combined score of 0.27, performing well on static/Zipfian workloads (up to 0.89 hit rate) but poorly on dynamic or scan-heavy traces.
+- **Feedback**: The rigorous admission policy and SLRU structure effectively filter rare items, but the 1% window size appears too restrictive for workloads relying on immediate recency, leading to near-zero hit rates in several cases.
+**Program Identifier:** Generation 44 - Patch Name tinylfu_opt - Correct Program: True
+
+**Program Name: W-TinyLFU with Doorkeeper and SLRU Main Cache**
+- **Implementation**: This W-TinyLFU variant maintains a 1% LRU window and an SLRU main cache, using a Doorkeeper set for frequency estimation and a specific threshold (>2 accesses) for promotion to the protected segment.
+- **Performance**: The algorithm achieves a combined score of 0.23, performing exceptionally well on frequency-heavy traces (up to 88% hit rate) but poorly on recency-based or scanning workloads.
+- **Feedback**: The static 1% window is likely too restrictive for many access patterns, and the strict admission policy causes significant misses on traces with shifting working sets or low reuse.
+**Program Identifier:** Generation 45 - Patch Name tuned_wtinylfu_params - Correct Program: True
+
+**Program Name: W-TinyLFU with Doorkeeper and SLRU Segmentation**
+- **Implementation**: The algorithm partitions cache into a 5% Window LRU and a segmented Main SLRU (Probation/Protected), using a Doorkeeper filter and frequency-based dueling with periodic aging to govern admission.
+- **Performance**: Achieved a combined score of 0.25, performing exceptionally well on frequency-heavy traces (up to 0.89 hit rate) but failing significantly on scan-heavy workloads (near 0.00).
+- **Feedback**: While the admission policy effectively isolates hot items in stable distributions, the aggressive protection of high-frequency items likely prevents the cache from adapting to new working sets or scans, causing the Window to churn without promoting new content.
+**Program Identifier:** Generation 46 - Patch Name optimize_promotion_and_frequency - Correct Program: True
+
+**Program Name: W-TinyLFU with SLRU and Doorkeeper Frequency Filter**
+- **Implementation**: Utilizes a small admission window (2%) and a segmented SLRU (Probation/Protected) for the main cache, employing a frequency-based "duel" between window and main victims to determine eviction.
+- **Performance**: Achieved a combined score of 0.26, with strong results on repetitive patterns (e.g., 0.88 on trace 28) but near-zero hit rates on several scan-heavy traces.
+- **Feedback**: The very small window size effectively filters one-time access patterns but likely discards valid items too early in high-churn workloads; adjusting the window ratio or aging mechanism could improve versatility.
+**Program Identifier:** Generation 47 - Patch Name increase_window_and_freq_cap - Correct Program: True
+
+**Program Name: W-TinyLFU Lite with Window-SLRU Segmentation**
+- **Implementation**: Features a 1% LRU Window and a Main SLRU (Probation/Protected) structure, where eviction candidates from the Window duel Probation items based on accumulated frequencies to determine admission.
+- **Performance**: Achieved a combined score of 0.21, demonstrating high variance with excellent hit rates on specific traces (up to 0.87) but near-zero performance on others.
+- **Feedback**: The aggressive 1% window configuration effectively prioritizes high-frequency items in stable workloads but likely discards new items too quickly in dynamic or scan-heavy scenarios, leading to poor adaptability.
+**Program Identifier:** Generation 48 - Patch Name wtinylfu_lite - Correct Program: True
+
+**Program Name: W-TinyLFU Cache with Doorkeeper and Frequency Aging**
+- **Implementation**: Implements a segmented cache (Window, Probation, Protected) with TinyLFU-style admission, using a Doorkeeper for new items and periodic frequency halving to adapt to shifts.
+- **Performance**: Achieved a score of 0.24, showing high hit rates on looping traces (e.g., 0.88 on trace 28) but near-zero on several others.
+- **Feedback**: The frequency-based admission effectively filters pollution in stable workloads, but the small fixed window (5%) may be insufficient for capturing transient locality or scans.
+**Program Identifier:** Generation 49 - Patch Name tune_wtinylfu_params - Correct Program: True
+
+**Program Name: W-TinyLFU with Doorkeeper, Aging, and Biased Protection**
+- **Implementation**: Uses a 1% admission window and SLRU main cache, featuring a size-limited Doorkeeper, frequency aging every 5x capacity, and an admission duel heavily biased towards retaining main cache items.
+- **Performance**: The algorithm achieved a combined score of 0.27, excelling on stable workloads but performing poorly on dynamic traces.
+- **Feedback**: The strong bias favoring main cache retention (requiring window frequency > main frequency + 1) likely prevents the cache from adapting quickly to new working sets, creating resistance to workload changes.
+**Program Identifier:** Generation 50 - Patch Name wtinylfu_biased_dk_refined - Correct Program: True
+
+**Program Name: Biased W-TinyLFU with Size-Based Doorkeeper**
+- **Implementation**: Implements W-TinyLFU with a 1% admission window and SLRU main cache, employing a biased eviction duel (`window_freq > main_freq + 1`) to favor retaining existing items and a Doorkeeper reset triggered by capacity thresholds.
+- **Performance**: Achieved a combined score of 0.27, performing strongly on repetitive workloads (e.g., 0.89 on trace 28) but poorly on scan-heavy traces (e.g., 0.00 on trace 14).
+- **Feedback**: The biased duel effectively stabilizes the cache against churn by requiring significant frequency evidence for admission, but the small window size leaves the algorithm vulnerable to rapid access pattern changes.
+**Program Identifier:** Generation 51 - Patch Name wtinylfu_biased - Correct Program: True
+
+**Program Name: W-TinyLFU with Doorkeeper and SLRU**
+- **Implementation**: This policy integrates a 1% Window LRU with a Segmented LRU (Probation/Protected) Main cache, employing a Doorkeeper mechanism to filter rare items before tracking their frequency for TinyLFU-based admission duels.
+- **Performance**: The algorithm achieved a combined score of 0.26, performing exceptionally well on high-locality traces (up to 88%) but suffering near-zero hit rates on several specific workloads.
+- **Feedback**: While the Doorkeeper and SLRU structure effectively manage established hot items, the extremely small window size combined with the specific admission filtering likely caused the poor performance on traces requiring faster adaptation or larger capture buffers.
+**Program Identifier:** Generation 52 - Patch Name optimize_tinylfu_parameters_and_logic - Correct Program: True
+
+**Program Name: W-TinyLFU with Static Window and Frequency Sketch**
+- **Implementation**: Implements W-TinyLFU using a 1% Window LRU and segmented Main LRU (Probation/Protected) governed by a TinyLFU admission policy with a frequency dictionary and Doorkeeper set.
+- **Performance**: Achieved a combined score of 0.21, performing well on high-locality workloads but suffering near-zero hit rates on scan-heavy traces.
+- **Feedback**: The static 1% window size is likely too small for recency-heavy workloads, and the lack of adaptive sizing prevents the cache from adjusting to varying traffic patterns effectively.
+**Program Identifier:** Generation 53 - Patch Name wtinylfu_opt - Correct Program: True
+
+**Program Name: Adaptive S3-FIFO with ARC-style Ghosts**
+- **Implementation**: Implements a two-queue system (Small/Main) where the Small queue's size dynamically adjusts based on ghost list hits, mimicking ARC's adaptive logic. Uses hit counts for second-chance promotion from Small to Main and retention within Main.
+- **Performance**: Combined score of 0.24; performs well on select traces but poorly on many others (e.g., < 5% hit rate).
+- **Feedback**: The adaptation logic appears unstable, leading to cache thrashing on specific workloads; while the ghost-based resizing is clever, it often fails to retain the working set effectively compared to simpler static policies.
+**Program Identifier:** Generation 54 - Patch Name adaptive_s3_fifo - Correct Program: True
+
+**Program Name: W-TinyLFU with SLRU Main Cache and Doorkeeper**
+- **Implementation**: Implements a Window-TinyLFU architecture using a 5% admission window, a Segmented LRU (SLRU) main cache, and a Doorkeeper-based frequency counter with periodic aging.
+- **Performance**: Achieved a combined score of 0.26, performing well on high-frequency traces (0.76-0.88) but poorly on scan-heavy or looping workloads (0.00-0.02).
+- **Feedback**: The combination of SLRU and frequency-based admission effectively protects hot items in static distributions, but the static window size or admission duel appears too rigid for scans or shifting working sets where new items fail to displace incumbents.
+**Program Identifier:** Generation 55 - Patch Name improved_tinylfu_eviction - Correct Program: True
+
+**Program Name: W-TinyLFU with Doorkeeper and Adaptive Frequency Aging**
+- **Implementation**: Combines a small admission Window with an SLRU main cache, using a Doorkeeper to filter rare items and halving frequencies every 5x capacity. Eviction relies on a duel between Window and Main victims, biased to favor the Main cache unless the new item has a strictly higher frequency.
+- **Performance**: Achieved a combined score of 0.25, excelling on stable traces (e.g., 0.88 hit rate) but performing poorly on high-churn or scanning workloads.
+- **Feedback**: The biased eviction and slow aging (5x capacity) effectively protect against pollution in static environments but make the cache too rigid to adapt to shifting working sets or distinct phases.
+**Program Identifier:** Generation 56 - Patch Name optimize_parameters_and_duel - Correct Program: True
+
+**Program Name: W-TinyLFU with Doorkeeper and Biased Window Duel**
+- **Implementation**: This W-TinyLFU adaptation employs a 1% admission window, segmented SLRU main cache, and a size-resetting Doorkeeper, determining eviction via a duel that strongly biases against window admission.
+- **Performance**: The algorithm achieved a combined hit rate of 0.27, performing well on static frequency distributions but poorly on traces with rapid churn or scans.
+- **Feedback**: The strong bias against admitting items from the small window effectively protects the cache from pollution but hinders adaptation to shifting workloads, resulting in near-zero hit rates on specific dynamic traces.
+**Program Identifier:** Generation 57 - Patch Name wtinylfu_optimized - Correct Program: True
+
+**Program Name: W-TinyLFU with Doorkeeper and Aggressive Admission Policy**
+- **Implementation**: Combines a 1% LRU window and an SLRU main cache, using a Doorkeeper-filtered frequency counter with periodic aging. The eviction policy heavily biases against new items, requiring the window candidate's frequency to strictly exceed the main candidate's by a margin (`fw > fm + 1`) to survive.
+- **Performance**: The algorithm achieves a combined score of 0.27, showing strong locality capture on some traces but failing completely (near 0% hit rate) on others.
+- **Feedback**: The strict admission criteria and tiny window size likely prevent the cache from adapting to shifts in the working set, as new items are evicted before they can accumulate enough frequency to displace existing entries.
+**Program Identifier:** Generation 58 - Patch Name w_tinylfu_doorkeeper_optimized - Correct Program: True
+
+**Program Name: Optimized W-TinyLFU with Doorkeeper and SLRU**
+- **Implementation**: Combines a small 1% Window LRU and 99% SLRU Main cache with Doorkeeper frequency tracking, employing a biased eviction duel that aggressively protects Main items with any history (`freq > 0`) over growing the Window.
+- **Performance**: Achieved a combined score of 0.26, showing high hit rates on stable distributions but near-zero performance on several dynamic or scan-heavy traces.
+- **Feedback**: The "Spare Main" logic is likely too conservative, causing new items in the Window to be evicted immediately if the Main victim has any frequency count; this prevents the Window from effectively filtering new content and adapting to workload changes.
+**Program Identifier:** Generation 59 - Patch Name optimized_wtinylfu_slru - Correct Program: True
+
+**Program Name: Adaptive W-TinyLFU with ARC-style Ghost Sizing**
+- **Implementation**: Combines W-TinyLFU's frequency-based admission and SLRU main cache with ARC's ghost entry mechanism to dynamically adjust the window-to-main ratio based on recent eviction patterns.
+- **Performance**: Score: 0.0 (Failed validation due to runtime error).
+- **Feedback**: The algorithm crashes because the `capacity` variable is accessed but not defined in the `update_after_evict` function; ensuring correct variable scope from the `cache_snapshot` is necessary for functionality.
+**Program Identifier:** Generation 60 - Patch Name adaptive_tiny_lfu - Correct Program: False
+
+**Program Name: W-TinyLFU with Doorkeeper, SLRU, and Biased Eviction**
+- **Implementation**: The algorithm maintains a small Window LRU and a Segmented LRU Main cache, managing admission via a Doorkeeper and frequency counters with a bias towards retaining Main items. It employs periodic frequency aging and Doorkeeper resets based on cache capacity to limit metadata growth.
+- **Performance**: With a combined score of 0.27, the cache excels at static frequency retention but fails significantly on dynamic or looping traces (e.g., trace 14).
+- **Feedback**: The implementation prioritizes stability through biased eviction, but the conservative aging strategy leads to cache pollution by obsolete high-frequency items, hurting performance during workload shifts.
+**Program Identifier:** Generation 61 - Patch Name tune_aging_and_doorkeeper - Correct Program: True
+
+**Program Name: W-TinyLFU with Doorkeeper and SLRU**
+- **Implementation**: Implements Window-TinyLFU with a 1% LRU window and a 99% SLRU main cache, utilizing a Doorkeeper-filtered frequency map to duel eviction candidates between the window and main cache.
+- **Performance**: The algorithm achieved a combined score of 0.27, excelling on specific repetitive traces (up to 0.88 hit rate) but performing poorly (near 0) on many others.
+- **Feedback**: The extremely small admission window (1%) likely filters out valid content too aggressively in dynamic workloads, suggesting a larger window or adaptive sizing is needed to handle diverse access patterns.
+**Program Identifier:** Generation 62 - Patch Name optimize_tinylfu_params_and_logic - Correct Program: True
+
+**Program Name: W-TinyLFU with Segmented SLRU and Doorkeeper Filter**
+- **Implementation**: Implements a 5% LRU admission window and a segmented SLRU main cache (Probation/Protected), guarded by a frequency filter using a Doorkeeper and periodic aging.
+- **Performance**: Achieves a combined score of 0.26, excelling on high-locality traces (e.g., Trace 28) but failing near-completely on specific patterns like Trace 14.
+- **Feedback**: The strict incumbent bias (`fw > fm + 1`) during eviction effectively filters pollution but likely prevents the cache from adapting quickly enough to shifting working sets in scanning workloads.
+**Program Identifier:** Generation 63 - Patch Name wtinylfu_hysteresis_dk_lru - Correct Program: True
+
+**Program Name: Optimized W-TinyLFU with SLRU Main Cache**
+- **Implementation**: Combines a small 1% admission window with a Segmented LRU (SLRU) main cache, utilizing a frequency sketch with a Doorkeeper mechanism and a low maximum frequency cap for fast adaptation.
+- **Performance**: Achieves a combined score of 0.27, showing excellent results on stationary workloads (up to 89%) but poor handling of certain dynamic traces (0% on trace 14).
+- **Feedback**: The implementation's strict incumbency bias effectively protects hot items in the SLRU, though the very small window size limits its ability to handle patterns relying heavily on recent insertion history.
+**Program Identifier:** Generation 64 - Patch Name wtinylfu_optimized - Correct Program: True
+
+**Program Name: W-TinyLFU with SLRU and Adaptive Incumbency Bias**
+- **Implementation**: Utilizes a 1% window and 99% SLRU main segment, employing a frequency sketch with a "doorkeeper" and an eviction duel where window candidates must exceed the main candidate's frequency plus a dynamic bias (boosted if recently demoted) to enter.
+- **Performance**: Achieves a combined score of 0.27, excelling on static frequency-heavy workloads (e.g., 0.89 hit rate) but failing significantly on dynamic traces (several near 0%).
+- **Feedback**: The small window combined with a high barrier to entry (strong incumbency bias) makes the cache highly resistant to pollution but too rigid, failing to admit new items in changing workloads.
+**Program Identifier:** Generation 65 - Patch Name wtinylfu_bias - Correct Program: True
+
+**Program Name: W-TinyLFU with Doorkeeper and Tuned SLRU**
+- **Implementation**: Implements a W-TinyLFU structure with a 1% admission window and an SLRU main cache, utilizing a Doorkeeper mechanism and frequency-based duels with adaptive aging for eviction decisions.
+- **Performance**: The approach yields a combined score of 0.27, performing well on frequency-heavy workloads but failing completely (0.0 hit rate) on trace 14.
+- **Feedback**: The extremely small window size and strict admission filtering provide strong scan resistance but likely cause the zero hit rates by rejecting new working sets too aggressively.
+**Program Identifier:** Generation 66 - Patch Name wtinylfu_opt_hybrid - Correct Program: True
+
+**Program Name: W-TinyLFU with Biased Eviction and 1% Window**
+- **Implementation**: Combines an SLRU main cache with a fixed 1% admission window and a Doorkeeper-based frequency filter, employing a biased eviction duel that strictly favors retaining main cache items unless window candidates have significantly higher frequency.
+- **Performance**: Achieved a combined score of 0.27, performing well on static heavy-hitter workloads (up to 89% hit rate) but poorly on dynamic or scan-heavy traces.
+- **Feedback**: The tiny window size and high barrier to entry (biased eviction) make the cache too conservative, failing to adapt quickly to shifting working sets while successfully filtering one-time access noise.
+**Program Identifier:** Generation 67 - Patch Name optimize_wtinylfu_window_and_aging - Correct Program: True
+
+**Program Name: W-TinyLFU with SLRU and Doorkeeper Aging**
+- **Implementation**: This algorithm employs a Window-TinyLFU architecture with a 5% admission window and a Segmented LRU (Probation/Protected) main cache, utilizing a Doorkeeper and frequency counters with periodic halving to manage admission.
+- **Performance**: The approach yields a combined score of 0.26, performing well on static frequency patterns (up to 0.88 hit rate) but struggling significantly with large scans and high-churn traces.
+- **Feedback**: While the Doorkeeper mechanism correctly filters one-hit wonders, the fixed window size and strict admission bias (`fw > fm + 1`) likely hinder adaptation to dynamic workloads or loops where looser admission or faster adaptability is required.
+**Program Identifier:** Generation 68 - Patch Name init_doorkeeper_ordered_dict - Correct Program: True
+
+**Program Name: Optimized W-TinyLFU with SLRU and Biased Admission**
+- **Implementation**: Combines a 1% LRU window and an 80% protected SLRU main cache with frequency tracking via a doorkeeper and periodic aging.
+- **Performance**: Achieves a score of 0.27 with strong results on repeated access patterns (up to 0.89 hit rate) but low hit rates on scan-heavy traces.
+- **Feedback**: The tiny window and biased admission logic successfully filter one-hit wonders, but the static 1% window size might be too aggressive for workloads requiring higher recency retention.
+**Program Identifier:** Generation 69 - Patch Name slower_aging - Correct Program: True
+
+**Program Name: W-TinyLFU with Doorkeeper, SLRU, and Frequency Aging**
+- **Implementation**: Combines a 1% LRU admission window with a segmented LRU (SLRU) main cache, using a Doorkeeper-filtered frequency map and periodic aging to arbitrate eviction duels.
+- **Performance**: Achieved a combined score of 0.23, excelling on highly skewed workloads (up to 88% hit rate) but failing near-completely on scan-heavy traces.
+- **Feedback**: The static 1% window size is efficient for filtering rare items in stable distributions but proves too rigid for workloads requiring larger admission buffers to capture shifting locality.
+**Program Identifier:** Generation 70 - Patch Name wtinylfu_slru_refined - Correct Program: True
+
+**Program Name: Segment-Aware W-TinyLFU with High-Res Frequency and Tuned Aging**
+- **Implementation**: Combines a 1% Window with an SLRU Main cache, utilizing a segmented eviction policy that strictly protects "Protected" items (`freq_window > freq_main + 1`) while enabling fair duels for "Probation" items. It tracks popularity using 31-point frequency counters with slow 10x capacity aging.
+- **Performance**: Achieves a score of 0.25, showing high hit rates on static workloads (up to 0.88) but near-zero performance on many dynamic traces.
+- **Feedback**: The defensive eviction logic strongly favors established items, but combined with a tiny window and slow aging, it prevents the cache from adapting to new patterns, causing severe failures on shifting working sets.
+**Program Identifier:** Generation 71 - Patch Name segment_aware_wtinylfu - Correct Program: True
+
+**Program Name: W-TinyLFU with Doorkeeper and SLRU**
+- **Implementation**: Implements a W-TinyLFU architecture with a small 1% admission window and a segmented SLRU main cache, utilizing a Doorkeeper mechanism and frequency counting with periodic aging to manage cache admission.
+- **Performance**: Achieved a combined score of 0.26, demonstrating strength in high-locality scenarios but struggling significantly with scan-heavy or shifting workloads (e.g., 0.00% on trace 14).
+- **Feedback**: The static 1% window size appears too small to capture transient locality effectively in some traces, and the strict admission bias may be preventing new working sets from populating the main cache.
+**Program Identifier:** Generation 72 - Patch Name wtinylfu_slru_crossover - Correct Program: True
+
+**Program Name: W-TinyLFU with Doorkeeper and SLRU**
+- **Implementation**: Combines a 1% LRU window with a 99% SLRU main cache (20% probation, 80% protected), using a Doorkeeper mechanism and frequency map to adjudicate eviction duels between window and main candidates.
+- **Performance**: Achieved a combined score of 0.24, showing strong results on specific stable workloads (e.g., traces 27-28) but failing significantly on many others (near zero on traces 13-19).
+- **Feedback**: The extremely small admission window (1%) likely causes high churn for new items in dynamic workloads, and the admission duel appears too restrictive, preventing the cache from adapting to shifting popularity patterns.
+**Program Identifier:** Generation 73 - Patch Name segment_aware_duel_and_fast_promotion - Correct Program: True
+
+**Program Name: W-TinyLFU with SLRU and Segmented Duel Bias**
+- **Implementation**: Combines a 1% LRU admission window with an SLRU main cache, utilizing a frequency-based eviction duel that applies a specific bias (+2) to defend items in the Protected segment alongside periodic aging.
+- **Performance**: Achieved a combined score of 0.26, demonstrating high hit rates on stable frequency-heavy traces but failing significantly on dynamic or scan-heavy workloads.
+- **Feedback**: The small window size and strong protection bias likely prevent the cache from adapting to new hot items in changing workloads; relaxing the admission criteria or implementing dynamic resizing could improve robustness across diverse traces.
+**Program Identifier:** Generation 74 - Patch Name wtinylfu_adaptive_bias - Correct Program: True
+
+**Program Name: W-TinyLFU with Segmented Duel and Adaptive Aging**
+- **Implementation**: This W-TinyLFU variant employs a 1% admission window and an SLRU main cache, using a doorkeeper-enhanced frequency sketch with an aging mechanism that halves counts every 5x capacity.
+- **Performance**: Achieved a combined score of 0.25, demonstrating strong results on static frequency patterns (e.g., 0.89 on trace 28) but struggling significantly with high-churn workloads (e.g., <0.03 on trace 14).
+- **Feedback**: The implementation's bias towards keeping protected items and its small window size offer stability for established hot data but hinder the algorithm's ability to adapt quickly to shifting access patterns.
+**Program Identifier:** Generation 75 - Patch Name refined_wtinylfu_adaptive - Correct Program: True
+
+**Program Name: Biased W-TinyLFU with SLRU and Doorkeeper**
+- **Implementation**: Combines a 1% FIFO window with an SLRU main cache, utilizing a frequency-based eviction duel with specific bias for incumbent and recently demoted items.
+- **Performance**: Achieved a combined score of 0.27, performing well on high-locality traces but failing significantly on several specific scan-like patterns.
+- **Feedback**: The heavy bias towards the main cache protects popular items well, but the small static window and strict admission likely hinder performance on shifting workloads.
+**Program Identifier:** Generation 76 - Patch Name wtinylfu_demotion_bias - Correct Program: True
+
+**Program Name: W-TinyLFU with SLRU and Segment-Aware Frequency Dueling**
+- **Implementation**: This algorithm employs a 1% LRU Window and an SLRU main cache (Probation/Protected), utilizing a Doorkeeper-based frequency sketch with periodic aging for admission control. The eviction policy features a segment-aware duel that protects high-frequency items by requiring strictly higher frequency from the Window victim to displace Protected items.
+- **Performance**: The solution achieved a combined score of 0.24, demonstrating strong results on frequency-biased traces but suffering from near-zero hit rates on several scan-heavy or sparse workloads.
+- **Feedback**: While the segment-aware dueling logic effectively preserves popular data, the 1% window size appears too restrictive for traces requiring rapid adaptation, suggesting a need for a dynamic window size or less aggressive filtering.
+**Program Identifier:** Generation 77 - Patch Name wtinylfu_segment_aware - Correct Program: True
+
+**Program Name: W-TinyLFU with SLRU Main Cache and Frequency Sketch**
+- **Implementation**: Utilizes a 1% Window LRU and an SLRU main cache (Probation/Protected), employing a frequency sketch with a doorkeeper and periodic aging to manage eviction via admission duels.
+- **Performance**: Achieved a combined score of 0.21, exhibiting high variance with strong results on static patterns (0.87) but near-zero hit rates on dynamic traces.
+- **Feedback**: The fixed 1% window size is likely too restrictive for workloads with shifting working sets, preventing new items from establishing residency, while the aggressive admission policy leads to starvation in several scenarios.
+**Program Identifier:** Generation 78 - Patch Name wtinylfu_opt - Correct Program: True
+
+**Program Name: W-TinyLFU with SLRU and Periodic Doorkeeper**
+- **Implementation:** Maintains a 1% LRU window and an SLRU main cache, utilizing frequency density duels for admission and a Doorkeeper that resets periodically to mitigate scan impact.
+- **Performance:** Achieves a combined score of 0.26, performing well on static locality traces (up to 89%) but failing near-completely on several dynamic patterns.
+- **Feedback:** The fixed 1% window size is too aggressive for traces with moderate reuse distances, and the strict admission policy likely prevents necessary cache population in sparse or looping workloads.
+**Program Identifier:** Generation 79 - Patch Name density_tinylfu_tuned - Correct Program: True
+
+**Program Name: Optimized W-TinyLFU with SLRU and Doorkeeper**
+- **Implementation**: Combines a small Window (1%) with a Segmented LRU (Probation/Protected) for the main cache, using a TinyLFU admission policy that duels eviction candidates based on frequencies tracked by a Doorkeeper set and aging counters.
+- **Performance**: Achieves a combined score of 0.23, with high hit rates on repetitive traces but near-zero performance on scanning workloads.
+- **Feedback**: The strict frequency-based admission and strong bias towards keeping 'Protected' items maximize hit rates for static distributions, but significantly hinder the cache's ability to adapt to scanning patterns or rapid working set changes.
+**Program Identifier:** Generation 80 - Patch Name wtinylfu_slru_opt - Correct Program: True
+
+**Program Name: Optimized W-TinyLFU with Doorkeeper and SLRU**
+- **Implementation**: Implements Window-TinyLFU with a 1% window and 99% SLRU main cache, featuring a Doorkeeper for admission filtering and frequency-based dueling. It adds specific optimizations like sketch-accelerated promotion and "second chance" credits for demoted protected items.
+- **Performance**: Achieved a combined score of 0.23, with strong results on static working sets (up to 88%) but poor performance on scan-heavy traces.
+- **Feedback**: The very small window (1%) combined with aggressive admission filtering likely caused the poor performance on scans and looping patterns, as new items were evicted before proving their worth against the established main cache.
+**Program Identifier:** Generation 81 - Patch Name wtinylfu_opt_v2 - Correct Program: True
+
+**Program Name: W-TinyLFU with Two-Hit Promotion and Demotion Bias**
+- **Implementation**: This W-TinyLFU variant uses a 1% window and segmented main cache, requiring two hits to promote from Probation while granting strong frequency bias (5) to demoted items during eviction duels.
+- **Performance**: It achieves a combined score of 0.26, performing well on stable working sets (up to 89% hit rate) but poorly on dynamic or scan-heavy workloads.
+- **Feedback**: The aggressive incumbency protection and strict promotion criteria effectively filter noise but likely hinder the cache's ability to adapt quickly to shifting access patterns.
+**Program Identifier:** Generation 82 - Patch Name adaptive_w_tiny_lfu_plus - Correct Program: True
+
+**Program Name: Segment-Aware W-TinyLFU with Adaptive Aging and Bias**
+- **Implementation**: Uses a 1% admission window feeding an SLRU (Probation/Protected) structure, where eviction decisions rely on frequency comparisons biased to favor Protected items against new admissions.
+- **Performance**: Combined score of 0.24, performing well on stable distributions (up to 0.88 hit rate) but failing significantly on traces with high churn or scanning patterns.
+- **Feedback**: The restrictive 1% window and specific protection bias (+1) appear to hinder adaptability in dynamic workloads, causing useful new items to be rejected too early in high-turnover scenarios.
+**Program Identifier:** Generation 83 - Patch Name segment_aware_wtinylfu - Correct Program: True
+
+**Program Name: W-TinyLFU with Ghost Shield for Demoted Items**
+- **Implementation**: Implements W-TinyLFU with a segmented main cache (Probation/Protected) and a frequency-based eviction duel that applies a "Ghost Shield" bias to protect items recently demoted from the protected segment.
+- **Performance**: Achieved a combined score of 0.26, demonstrating strong performance on high-locality traces (up to 0.89) but failing significantly on scan-heavy workloads (near 0.00).
+- **Feedback**: The heavy bias towards protecting demoted incumbents helps in stable workloads but likely prevents the cache from adapting quickly enough to new content in high-churn or scanning scenarios.
+**Program Identifier:** Generation 84 - Patch Name wtinylfu_ghost_shield - Correct Program: True
+
+**Program Name: W-TinyLFU with Segmented SLRU and Doorkeeper**
+- **Implementation**: Utilizes a 5% Window LRU and a segmented Main SLRU (Probation/Protected) governed by a frequency-based admission policy with a Doorkeeper filter and periodic aging.
+- **Performance**: Achieves a composite score of 0.24, demonstrating strong performance on high-locality traces (up to 0.88) but poor handling of scan-heavy workloads (often <0.05).
+- **Feedback**: The implementation of TinyLFU admission effectively prevents cache pollution, but the small fixed window size limits its ability to adapt to workloads requiring larger immediate buffers or cyclic access patterns.
+**Program Identifier:** Generation 85 - Patch Name segment_aware_duel_and_dk_reset - Correct Program: True
+
+**Program Name: W-TinyLFU with Segmented SLRU and Doorkeeper Admission**
+- **Implementation**: Combines a 1% LRU window with an SLRU main cache (Probation/Protected), managing eviction via a frequency-based duel utilizing a Doorkeeper and aging counters.
+- **Performance**: Achieved a score of 0.24, with high hit rates on stable distributions but near-zero performance on high-churn or scan-heavy workloads.
+- **Feedback**: The static 1% window size proved too small for diverse workloads, and the admission policy likely prevented adapting to shifting working sets in dynamic traces.
+**Program Identifier:** Generation 86 - Patch Name wtinylfu_optimized - Correct Program: True
+
+**Program Name: Adaptive W-TinyLFU with SLRU and Frequency Sketch**
+- **Implementation**: Combines a small 1% recency window with a Segmented LRU (SLRU) main cache, utilizing a frequency sketch with a doorkeeper and periodic aging to manage admission between segments.
+- **Performance**: Achieved a combined score of 0.24, excelling on frequency-heavy traces (reaching 0.88 hit rate) but performing poorly on scan-based workloads (often near 0.0).
+- **Feedback**: The 1% window size is overly aggressive, causing the cache to fail on scan patterns where items are evicted before accumulating the frequency required to pass the admission filter into the main cache.
+**Program Identifier:** Generation 87 - Patch Name wtinylfu_adaptive - Correct Program: True
+
+**Program Name: W-TinyLFU with Doorkeeper and SLRU Fast Promotion**
+- **Implementation**: This approach combines a tiny 1% LRU window with an SLRU main cache, utilizing a Doorkeeper to filter one-hit wonders and a fast promotion mechanism to move high-frequency items directly to the protected segment.
+- **Performance**: Achieved a combined score of 0.26, excelling on stable patterns (e.g., 0.89 on trace 28) but failing completely on specific dynamic traces (0.00 on trace 14).
+- **Feedback**: The eviction policy's tie-breaking favors incumbent items over new window candidates; this rigidity, coupled with the very small window, prevents the cache from adapting to new working sets in looping or scanning workloads.
+**Program Identifier:** Generation 88 - Patch Name segment_aware_eviction_fast_prom - Correct Program: True
+
+**Program Name: W-TinyLFU with Doorkeeper and Adaptive SLRU**
+- **Implementation**: Features a 1% LRU window feeding an SLRU main cache, utilizing a Doorkeeper and frequency counters with periodic aging to filter admissions.
+- **Performance**: Achieved a combined score of 0.24, with high effectiveness on stable locality traces but poor results on dynamic or scan-heavy workloads.
+- **Feedback**: The tiny window size and strict admission policy hinder adaptation to shifting working sets, causing near-zero hit rates on several traces.
+**Program Identifier:** Generation 89 - Patch Name segment_aware_duel_and_dk_tuning - Correct Program: True
+
+# GLOBAL INSIGHTS SCRATCHPAD
+
+The following are global insights about optimization approaches and their effectiveness:
+
+Based on the analysis of the individual program summaries (Generations 80-89) and the Current Best Program, here are the actionable optimization insights.
+
+## Successful Algorithmic Patterns
+- **Implicit Incumbent Favoritism**: The **Current Best Program** (Score 0.27) uses a strict inequality (`freq_window > freq_main`) during eviction duels. This implicitly breaks ties in favor of the incumbent Main cache item. Comparative analysis shows that **Generation 82** (Score 0.26) and **Generation 84** (Score 0.26) tried to improve this with explicit biases ("+5 demotion bias" and "Ghost Shield"), but these modifications slightly reduced the score compared to the cleaner, implicit approach.
+- **Secondary Probation Filtering**: The **Current Best Program** enforces a "2-hit" rule within the Probation segment before promoting an item to the Protected segment. **Generation 88** (Score 0.26) attempted a "Fast Promotion" mechanism to bypass this for high-frequency items but scored lower. This confirms that a strict secondary filter—preventing noise from polluting the Protected segment—is superior to aggressive promotion.
+- **Demotion to Probation**: A critical pattern in the best implementation is handling Protected segment overflow by demoting items to the Probation segment rather than evicting them. This gives "warm" items a second chance to compete against new Window candidates. **Generation 80** (Score 0.23) applied strict frequency-based admission without this graceful demotion flow (or with too much bias), leading to worse performance.
+
+## Ineffective Approaches
+- **Explicit Arithmetic Biasing**: Several programs attempted to artificially boost incumbent frequencies. **Generation 83** added a `+1` bias, and **Generation 80** used strong protection biases, resulting in scores of 0.24 and 0.23 respectively. Evaluation feedback indicates these explicit biases make the cache too rigid, causing it to fail on dynamic workloads where the **Current Best Program's** natural tie-breaking succeeds.
+- **Window Size Expansion**: **Generation 85** (Score 0.24) increased the Window size to 5% to better handle scanning workloads. While this theoretically helps scans, the score dropped significantly compared to the **Current Best Program** (1% Window). The loss of Main cache capacity (reduced from 99% to 95%) outweighs the benefits on scan traces for this specific dataset.
+- **Aggressive Admission Filtering**: **Generation 81** (Score 0.23) combined a 1% window with aggressive admission filtering. The feedback noted that this combination was too strict, evicting new items before they could prove their worth. The **Current Best Program** balances the 1% window with a standard Doorkeeper and fair aging (5x capacity) rather than aggressive rejection.
+
+## Implementation Insights
+- **Separate Probation State Tracking**: The **Current Best Program** utilizes a dedicated auxiliary dictionary, `probation_hits`, to track hit counts for items within the Probation segment. This implementation detail allows for stateful promotion logic (requiring 2 hits) without polluting the main object structure or the primary cache storage, facilitating cleaner state transitions compared to **Generation 82**.
+- **Graceful Demotion Reset**: In the **Current Best Program**, when a Protected item is demoted, it is moved to the Probation segment (`state.probation[victim] = True`) but notably *without* an entry in `probation_hits`. This effectively resets its promotion eligibility, requiring it to prove itself again, which serves as a robust mechanism to filter out items that were once hot but have cooled down.
+- **Strict Window Capacity Enforcement**: The `evict` function in the **Current Best Program** strictly checks `if len(state.window) >= state.window_size` to force an eviction decision. This implementation guarantees the Window never silently expands beyond 1%, preserving the exact 99% capacity for the SLRU structure, which is critical for the high hit rates (0.89) on Trace 28.
+
+## Performance Analysis
+- **The 0.27 Optimization Ceiling**: There is a clear performance plateau. The **Current Best Program** achieves 0.27, while highly optimized variants like **Generation 82**, **84**, and **88** cluster at 0.26. The 0.01 difference stems from the Best Program's ability to maintain peak performance on stable traces (Trace 28: ~0.89) by avoiding the complexity overhead of explicit biases or fast-promotion shortcuts.
+- **Trace 14 vs. Trace 28 Trade-off**: Top-performing programs consistently accept a 0.00 hit rate on Trace 14 (looping scan) to maximize locality on Trace 28 (Zipfian). **Generation 85** attempted to improve scan performance (reaching 0.05 on scan) but saw its overall score drop to 0.24 due to losses on stable traces. This confirms that under the current scoring metric, optimizing for static locality is far more valuable than mitigating scan penalties.
+- **Stability of the 1% Window**: Despite repeated feedback in **Generation 86, 87, 89** suggesting the 1% window is "too small," empirical results show it is the optimal configuration. Programs that alter this balance (e.g., adaptive windows or larger fixed sizes) consistently underperform (0.24 vs 0.27), proving that the 99% SLRU allocation is the primary driver of the high score.
+
+# META RECOMMENDATIONS
+
+The following are actionable recommendations for the next program generations:
+
+Based on the analysis of the global insights and the current best program (Generation 69), here are 5 actionable recommendations for future mutations.
+
+1.  **Grant "Second Chance" Status on Demotion**
+    Modify the `update_after_hit` logic to set `state.probation_hits[victim] = True` immediately when an item is demoted from `protected` to `probation` due to overflow. Currently, demoted items are treated as raw newcomers requiring two hits to return; granting them "second chance" status allows these proven items to return to the protected segment with a single subsequent hit, reducing churn at the working set boundary.
+
+2.  **Lower Frequency Saturation Cap**
+    Reduce `self.max_freq` from 60 to **15** or **20**. The current cap creates too much inertia, causing "ghost" heavy hitters to persist long after they have stopped being relevant. A lower saturation point, combined with the existing 5x aging interval, will significantly improve the cache's ability to adapt to phase changes (dynamic workloads) while still maintaining the "Implicit Incumbent Favoritism" pattern.
+
+3.  **Implement Segment-Dependent Eviction Logic**
+    Refine the `evict` function to use different tie-breaking logic based on the victim's segment. Use `freq_window >= freq_main` (ties evict Main) if the victim is in the **Probation** segment, but maintain strictly `freq_window > freq_main` (ties keep Main) if the victim is in the **Protected** segment. This encourages faster turnover in the probation buffer for new content while strictly stabilizing the core protected segment against replacement.
+
+4.  **Sketch-Accelerated Promotion**
+    Update `update_after_hit` to allow immediate promotion from `probation` to `protected` if `state.get_freq(key)` exceeds a significant threshold (e.g., 5 or 10), even if the `probation_hits` condition is not met. This utilizes the persistent frequency sketch to fast-track historically heavy hitters that are re-entering the cache, allowing them to bypass the standard "two-hit" probationary requirement intended for unknown items.
+
+5.  **Size-Based Doorkeeper Reset**
+    Decouple the doorkeeper clearing mechanism from the frequency aging timer. Add a check in `record_access`: if `len(state.doorkeeper) > 2 * capacity`, clear the set immediately. This prevents the admission filter from becoming "clogged" with one-hit wonders during long periods between aging intervals, ensuring it remains an effective filter against scanning workloads.

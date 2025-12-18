@@ -1,0 +1,412 @@
+<NAME>
+arc_heat_bias_with_guard_ewma
+</NAME>
+
+<DESCRIPTION>
+I introduce three targeted improvements, inspired by adaptive cache policies (ARC/SLRU) and decayed LFU, to reduce miss rate:
+
+1) Heat-based victim selection: In evict, within the chosen segment (ARC REPLACE rule), we pick the victim minimizing heat = freq − λ·age, with a higher λ in probation and lower λ in protected. This balances recency and frequency and avoids over-protecting stale but once-hot items. It’s a strict improvement over the prior lexicographic (freq, ts) rule.
+
+2) Gentle ARC-style p-target adaptation on hits: In update_after_hit, we slightly increase p when probation hits (favoring larger probation for two-touch) and decrease p on protected hits (favoring protected when stable reuse dominates). This stabilizes segment sizing across workloads. We clamp p to [0, cap].
+
+3) Scan guard with EWMA decay and softer LIP bias: In update_after_evict, when a strong protected item is evicted, we enable a short guard window but reduce duration and severity. In update_after_insert, we use a small LIP bias (timestamp backdating by cap/4 or cap/6) instead of a full cap backdate, and maintain a simple hit EWMA to automatically clear the guard once hit rate rebounds, preventing over-suppression.
+
+Additionally, I record ghost timestamps to support potential future heuristics and keep ghost sizes bounded via the existing trim. These changes keep the algorithm consistent while improving adaptivity and resilience against scans and churn, aiming to raise hit rates across the provided traces.
+
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    _ensure_capacity(cache_snapshot)
+
+    # ARC REPLACE(x): if |T1|>=1 and ((x in B2 and |T1| == p) or |T1| > p) -> evict from T1 else from T2
+    t1_size = len(_probation)
+    x_in_b2 = (obj is not None) and (obj.key in _B2_ghost)
+    p_int = int(round(_p_target))
+    choose_t1 = (t1_size >= 1) and ((x_in_b2 and t1_size == p_int) or (t1_size > _p_target))
+
+    # Frequency-aware candidate selection within the chosen segment
+    candid_obj_key = None
+    if choose_t1:
+        candid_obj_key = _min_by_freq_ts(_probation, cache_snapshot)
+    if candid_obj_key is None:
+        candid_obj_key = _min_by_freq_ts(_protected, cache_snapshot)
+    if candid_obj_key is None:
+        # Last-resort fallback: pick any key from the cache (should rarely happen).
+        for k in cache_snapshot.cache:
+            candid_obj_key = k
+            break
+    return candid_obj_key
+=======
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    _ensure_capacity(cache_snapshot)
+    now = cache_snapshot.access_count
+
+    # ARC REPLACE(x): if |T1|>=1 and ((x in B2 and |T1| == p) or |T1| > p) -> evict from T1 else from T2
+    t1_size = len(_probation)
+    x_in_b2 = (obj is not None) and (obj.key in _B2_ghost)
+    p_int = int(round(_p_target))
+    choose_t1 = (t1_size >= 1) and ((x_in_b2 and t1_size == p_int) or (t1_size > _p_target))
+
+    # Heat-based selection within chosen segment: heat = freq - lambda*age (min heat evicted)
+    def _pick_by_heat(seg_dict, lam):
+        best_k, best_heat, best_ts = None, None, None
+        cache_keys = cache_snapshot.cache.keys()
+        for k, ts in seg_dict.items():
+            if k in cache_keys:
+                last_ts = ts if ts is not None else m_key_timestamp.get(k, now)
+                age = max(0, now - last_ts)
+                f = _freq.get(k, 0)
+                heat = float(f) - lam * float(age)
+                if (best_heat is None) or (heat < best_heat) or (heat == best_heat and last_ts < best_ts):
+                    best_heat = heat
+                    best_ts = last_ts
+                    best_k = k
+        return best_k
+
+    lam_base = 1.0 / max(1, _cap_est)
+    candid_obj_key = None
+    if choose_t1:
+        candid_obj_key = _pick_by_heat(_probation, lam=1.5 * lam_base)
+    if candid_obj_key is None:
+        candid_obj_key = _pick_by_heat(_protected, lam=0.5 * lam_base)
+    if candid_obj_key is None:
+        # Last-resort fallback: pick any key from the cache (should rarely happen).
+        for k in cache_snapshot.cache:
+            candid_obj_key = k
+            break
+    return candid_obj_key
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_key_timestamp, _probation, _protected, _freq
+    _ensure_capacity(cache_snapshot)
+    _maybe_age(cache_snapshot)
+    current_ts = cache_snapshot.access_count
+    k = obj.key
+
+    # Maintain a general timestamp ledger for robustness.
+    m_key_timestamp[k] = current_ts
+
+    # Increment lightweight frequency counter
+    _freq[k] = _freq.get(k, 0) + 1
+
+    if k in _probation:
+        # Promote to protected on second touch.
+        _probation.pop(k, None)
+        _protected[k] = current_ts
+    elif k in _protected:
+        # Refresh recency within protected.
+        _protected[k] = current_ts
+    else:
+        # Metadata miss: treat as a re-reference and place in protected.
+        _protected[k] = current_ts
+
+    # Respect ARC target for protected by demoting its LRU if needed.
+    _, t2_target = _get_targets(cache_snapshot)
+    if len(_protected) > t2_target:
+        demote_key = _lru_key_in(_protected, cache_snapshot)
+        if demote_key is not None and demote_key != k:
+            demote_ts = _protected.pop(demote_key)
+            _probation[demote_key] = demote_ts
+
+    # If present in ghosts, clear and bound ghost history
+    if k in _B1_ghost:
+        _B1_ghost.pop(k, None)
+    if k in _B2_ghost:
+        _B2_ghost.pop(k, None)
+    _ghost_trim()
+=======
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_key_timestamp, _probation, _protected, _freq, _p_target, _guard_until
+    _ensure_capacity(cache_snapshot)
+    _maybe_age(cache_snapshot)
+    current_ts = cache_snapshot.access_count
+    k = obj.key
+
+    # Maintain a general timestamp ledger for robustness.
+    m_key_timestamp[k] = current_ts
+
+    # Update simple hit EWMA to manage guard cooldown
+    global _hit_ewma
+    if '_hit_ewma' not in globals():
+        _hit_ewma = 0.0
+    alpha = 0.1
+    _hit_ewma = (1.0 - alpha) * _hit_ewma + alpha * 1.0
+    if _hit_ewma > 0.3:
+        _guard_until = 0  # clear guard once hit rate rebounds
+
+    # Increment lightweight frequency counter
+    _freq[k] = _freq.get(k, 0) + 1
+
+    was_prob = k in _probation
+    was_prot = k in _protected
+
+    if was_prob:
+        # Promote to protected on reuse.
+        _probation.pop(k, None)
+        _protected[k] = current_ts
+    elif was_prot:
+        # Refresh recency within protected.
+        _protected[k] = current_ts
+    else:
+        # Metadata miss: treat as a re-reference and place in protected.
+        _protected[k] = current_ts
+
+    # Gentle ARC-style p adaptation: probation hits -> increase p; protected hits -> decrease p.
+    if was_prob:
+        _p_target = min(float(_cap_est), _p_target + 0.2)
+    elif was_prot:
+        _p_target = max(0.0, _p_target - 0.1)
+
+    # Respect ARC target for protected by demoting its LRU if needed.
+    _, t2_target = _get_targets(cache_snapshot)
+    if len(_protected) > t2_target:
+        demote_key = _lru_key_in(_protected, cache_snapshot)
+        if demote_key is not None and demote_key != k:
+            demote_ts = _protected.pop(demote_key)
+            _probation[demote_key] = demote_ts
+
+    # If present in ghosts, clear and bound ghost history
+    if k in _B1_ghost:
+        _B1_ghost.pop(k, None)
+    if k in _B2_ghost:
+        _B2_ghost.pop(k, None)
+    _ghost_trim()
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp, _probation, _protected, _p_target, _freq, _guard_until
+    _ensure_capacity(cache_snapshot)
+    _maybe_age(cache_snapshot)
+    current_ts = cache_snapshot.access_count
+    k = obj.key
+
+    # Record in general ledger
+    m_key_timestamp[k] = current_ts
+
+    in_b1 = k in _B1_ghost
+    in_b2 = k in _B2_ghost
+
+    if in_b1 or in_b2:
+        # ARC adaptation of p and re-admit into protected
+        if in_b1:
+            inc = max(1.0, float(len(_B2_ghost)) / max(1.0, float(len(_B1_ghost))))
+            _p_target = min(float(_cap_est), _p_target + inc)
+            _B1_ghost.pop(k, None)
+        else:
+            dec = max(1.0, float(len(_B1_ghost)) / max(1.0, float(len(_B2_ghost))))
+            _p_target = max(0.0, _p_target - dec)
+            _B2_ghost.pop(k, None)
+        _protected[k] = current_ts
+        # Seed frequency as reused
+        _freq[k] = max(_freq.get(k, 0) + 1, 2)
+
+        # Keep protected within its target by demoting its LRU if necessary
+        _, t2_target = _get_targets(cache_snapshot)
+        if len(_protected) > t2_target:
+            demote_key = _lru_key_in(_protected, cache_snapshot)
+            if demote_key is not None and demote_key != k:
+                demote_ts = _protected.pop(demote_key)
+                _probation[demote_key] = demote_ts
+    else:
+        # New to cache and ghosts: insert into probation
+        # If we recently had to evict a strong protected item, bias this newcomer as cold.
+        if current_ts <= _guard_until:
+            _probation[k] = current_ts - max(1, _cap_est)  # artificially older to prefer early eviction
+        else:
+            _probation[k] = current_ts
+        # Seed minimal frequency for new items
+        _freq[k] = _freq.get(k, 0)
+
+    _ghost_trim()
+=======
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp, _probation, _protected, _p_target, _freq, _guard_until
+    _ensure_capacity(cache_snapshot)
+    _maybe_age(cache_snapshot)
+    current_ts = cache_snapshot.access_count
+    k = obj.key
+
+    # Record in general ledger
+    m_key_timestamp[k] = current_ts
+
+    # Update hit EWMA with a miss signal to allow guard cooldown
+    global _hit_ewma
+    if '_hit_ewma' not in globals():
+        _hit_ewma = 0.0
+    _hit_ewma = (1.0 - 0.1) * _hit_ewma  # alpha=0.1, y=0 for miss
+
+    in_b1 = k in _B1_ghost
+    in_b2 = k in _B2_ghost
+
+    if in_b1 or in_b2:
+        # ARC adaptation of p and re-admit into protected
+        if in_b1:
+            inc = max(1.0, float(len(_B2_ghost)) / max(1.0, float(len(_B1_ghost))))
+            _p_target = min(float(_cap_est), _p_target + inc)
+            _B1_ghost.pop(k, None)
+        else:
+            dec = max(1.0, float(len(_B1_ghost)) / max(1.0, float(len(_B2_ghost))))
+            _p_target = max(0.0, _p_target - dec)
+            _B2_ghost.pop(k, None)
+        _protected[k] = current_ts
+        # Seed frequency as reused
+        _freq[k] = max(_freq.get(k, 0) + 1, 2)
+
+        # Keep protected within its target by demoting its LRU if necessary
+        _, t2_target = _get_targets(cache_snapshot)
+        if len(_protected) > t2_target:
+            demote_key = _lru_key_in(_protected, cache_snapshot)
+            if demote_key is not None and demote_key != k:
+                demote_ts = _protected.pop(demote_key)
+                _probation[demote_key] = demote_ts
+    else:
+        # New to cache and ghosts: insert into probation with moderated LIP bias.
+        lip_bias = 0
+        if current_ts <= _guard_until:
+            lip_bias = max(1, _cap_est // 4)  # softer bias under guard
+        else:
+            if len(_B1_ghost) <= len(_B2_ghost):
+                lip_bias = max(1, _cap_est // 6)
+        _probation[k] = current_ts - lip_bias if lip_bias > 0 else current_ts
+        # Seed minimal frequency for new items
+        _freq[k] = _freq.get(k, 0)
+
+    _ghost_trim()
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp, _probation, _protected, _freq, _guard_until
+    _ensure_capacity(cache_snapshot)
+    # Remove evicted key from segments and add to appropriate ghost history.
+    if evicted_obj is not None:
+        k = evicted_obj.key
+        was_t1 = k in _probation
+        was_t2 = k in _protected
+        fval = _freq.get(k, 0)
+
+        _probation.pop(k, None)
+        _protected.pop(k, None)
+        m_key_timestamp.pop(k, None)
+        _freq.pop(k, None)
+
+        if was_t1:
+            _B1_ghost[k] = True  # insert as MRU in ghost
+        elif was_t2:
+            _B2_ghost[k] = True
+            # If we had to evict a strong protected item, enable a short guard window.
+            if fval >= 2:
+                _guard_until = cache_snapshot.access_count + max(1, _cap_est // 2)
+        else:
+            # Unknown residency; default to B1
+            _B1_ghost[k] = True
+
+        _ghost_trim()
+    # Do not add obj here; it will be handled in update_after_insert.
+=======
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp, _probation, _protected, _freq, _guard_until
+    _ensure_capacity(cache_snapshot)
+    # Remove evicted key from segments and add to appropriate ghost history.
+    if evicted_obj is not None:
+        k = evicted_obj.key
+        was_t1 = k in _probation
+        was_t2 = k in _protected
+        fval = _freq.get(k, 0)
+
+        _probation.pop(k, None)
+        _protected.pop(k, None)
+        m_key_timestamp.pop(k, None)
+        _freq.pop(k, None)
+
+        now = cache_snapshot.access_count
+        if was_t1:
+            _B1_ghost[k] = now  # record timestamp in ghost
+        elif was_t2:
+            _B2_ghost[k] = now
+            # If we had to evict a strong protected item, enable a short guard window (softer).
+            if fval >= 2:
+                _guard_until = now + max(1, _cap_est // 4)
+        else:
+            # Unknown residency; default to B1
+            _B1_ghost[k] = now
+
+        _ghost_trim()
+    # Do not add obj here; it will be handled in update_after_insert.
+>>>>>>> REPLACE
+
+</DIFF>

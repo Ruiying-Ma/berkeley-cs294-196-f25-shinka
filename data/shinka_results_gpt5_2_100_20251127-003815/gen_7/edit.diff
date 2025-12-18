@@ -1,0 +1,513 @@
+--- a/original.py
++++ b/original.py
+@@ -1,246 +1,372 @@
+ # EVOLVE-BLOCK-START
+-"""Adaptive cache eviction using an ARC-like policy with ghost history.
++"""Window-TinyLFU with ARC-like adaptive window and segmented main (probation/protected).
+ 
+ Public API:
+ - evict(cache_snapshot, obj) -> key
+ - update_after_hit(cache_snapshot, obj)
+ - update_after_insert(cache_snapshot, obj)
+ - update_after_evict(cache_snapshot, obj, evicted_obj)
+ """
+ 
+ from collections import OrderedDict
+ 
+-class _ArcPolicy:
+-    """
+-    ARC-like policy:
+-    - T1: recency list (seen once, resident)
+-    - T2: frequency list (seen >=2, resident)
+-    - B1: ghost of keys evicted from T1
+-    - B2: ghost of keys evicted from T2
+-    - p: target size for T1 (adaptive; 0..capacity)
++
++class _CMiniSketch:
++    """
++    Lightweight Count-Min Sketch with periodic aging.
++    - 3 hash functions, width 2^wpow (default 4096).
++    - Conservative aging by halving counters every ~width increments.
++    """
++    __slots__ = ("w", "d", "tbl", "mask", "ops", "age_period", "seeds")
++
++    def __init__(self, width_power=12, d=3):
++        self.d = int(max(1, d))
++        w = 1 << int(max(8, width_power))  # at least 256
++        self.w = w
++        self.mask = w - 1
++        self.tbl = [[0] * w for _ in range(self.d)]
++        self.ops = 0
++        self.age_period = max(1024, w)  # roughly once per window
++        # Fixed odd seeds for mixing
++        self.seeds = (0x9e3779b185ebca87, 0xc2b2ae3d27d4eb4f, 0x165667b19e3779f9)
++
++    def _mix(self, h: int, seed: int) -> int:
++        x = (h ^ seed) & 0xFFFFFFFFFFFFFFFF
++        x ^= (x >> 33)
++        x = (x * 0xff51afd7ed558ccd) & 0xFFFFFFFFFFFFFFFF
++        x ^= (x >> 33)
++        x = (x * 0xc4ceb9fe1a85ec53) & 0xFFFFFFFFFFFFFFFF
++        x ^= (x >> 33)
++        return x & self.mask
++
++    def _maybe_age(self):
++        self.ops += 1
++        if self.ops % self.age_period == 0:
++            for row in self.tbl:
++                for i in range(self.w):
++                    row[i] >>= 1  # halve
++
++    def increment(self, key: str, amt: int = 1):
++        h = hash(key)
++        for i in range(self.d):
++            idx = self._mix(h, self.seeds[i % len(self.seeds)])
++            v = self.tbl[i][idx] + amt
++            if v > 255:
++                v = 255
++            self.tbl[i][idx] = v
++        self._maybe_age()
++
++    def estimate(self, key: str) -> int:
++        h = hash(key)
++        est = 1 << 30
++        for i in range(self.d):
++            idx = self._mix(h, self.seeds[i % len(self.seeds)])
++            v = self.tbl[i][idx]
++            if v < est:
++                est = v
++        return est
++
++
++class _WTinyLFU:
++    """
++    Window-TinyLFU with ARC-like adaptive window size and segmented main:
++    - W: window (recency buffer).
++    - P: probation (main-cold).
++    - H: protected (main-hot).
++    - Gw: ghost list of keys evicted from W.
++    - Gm: ghost list of keys evicted from main (P or H).
++    - p: target size for window W (0..capacity), adapted via ghost hits.
++    - sketch: decayed frequency estimator for TinyLFU admission/ordering.
+     """
+ 
+     __slots__ = (
+-        "T1", "T2", "B1", "B2",
+-        "p", "capacity", "_last_evicted_from"
++        "W", "P", "H", "Gw", "Gm", "p", "capacity", "_last_evicted_from",
++        "sketch", "_sample_k"
+     )
+ 
+     def __init__(self):
+-        self.T1 = OrderedDict()
+-        self.T2 = OrderedDict()
+-        self.B1 = OrderedDict()
+-        self.B2 = OrderedDict()
++        self.W = OrderedDict()
++        self.P = OrderedDict()
++        self.H = OrderedDict()
++        self.Gw = OrderedDict()
++        self.Gm = OrderedDict()
+         self.p = 0
+         self.capacity = None
+-        self._last_evicted_from = None  # 'T1' or 'T2'
+-
+-    # ---------- internal helpers ----------
++        self._last_evicted_from = None  # 'W'|'P'|'H'
++        self.sketch = _CMiniSketch(width_power=12, d=3)
++        self._sample_k = 6
++
++    # ---------- internal utils ----------
+ 
+     def _ensure_capacity(self, cap: int):
+-        # On first call or capacity change, reset safely.
+         if self.capacity is None:
+             self.capacity = max(int(cap), 1)
++            self._sample_k = max(3, min(8, self.capacity // 16 or 3))
++            # Reasonable default: 20% window
++            self.p = max(1, min(self.capacity - 1, int(self.capacity * 0.2))) if self.capacity > 1 else 0
+             return
+         if self.capacity != cap:
+-            # Reset state to avoid inconsistencies if framework changes capacity.
+-            self.T1.clear(); self.T2.clear(); self.B1.clear(); self.B2.clear()
+-            self.p = 0
++            # Reset state to remain consistent across capacity changes.
++            self.W.clear(); self.P.clear(); self.H.clear()
++            self.Gw.clear(); self.Gm.clear()
+             self.capacity = max(int(cap), 1)
+-
+-    def _is_in_cache(self, key: str, cache_snapshot) -> bool:
+-        return key in cache_snapshot.cache
+-
+-    def _prune_stale_residents(self, cache_snapshot):
+-        # Drop keys that our policy still tracks but the cache no longer has.
++            self._sample_k = max(3, min(8, self.capacity // 16 or 3))
++            self.p = max(1, min(self.capacity - 1, int(self.capacity * 0.2))) if self.capacity > 1 else 0
++
++    def _prune_residents(self, cache_snapshot):
+         cache_keys = cache_snapshot.cache.keys()
+-        for k in list(self.T1.keys()):
+-            if k not in cache_keys:
+-                self.T1.pop(k, None)
+-        for k in list(self.T2.keys()):
+-            if k not in cache_keys:
+-                self.T2.pop(k, None)
++        for d in (self.W, self.P, self.H):
++            for k in list(d.keys()):
++                if k not in cache_keys:
++                    d.pop(k, None)
+ 
+     def _prune_ghosts(self):
+         cap = self.capacity or 1
+-        # Bound each ghost list individually to capacity.
+-        while len(self.B1) > cap:
+-            self.B1.popitem(last=False)
+-        while len(self.B2) > cap:
+-            self.B2.popitem(last=False)
+-
+-    def _touch_T1(self, key: str):
+-        # Place/move key to MRU end of T1
+-        self.T1[key] = None
+-        self.T1.move_to_end(key)
+-
+-    def _touch_T2(self, key: str):
+-        # Place/move key to MRU end of T2
+-        self.T2[key] = None
+-        self.T2.move_to_end(key)
+-
+-    def _move_T1_to_B1(self, key: str):
+-        self.T1.pop(key, None)
+-        self.B1[key] = None
+-        self.B1.move_to_end(key)
+-
+-    def _move_T2_to_B2(self, key: str):
+-        self.T2.pop(key, None)
+-        self.B2[key] = None
+-        self.B2.move_to_end(key)
+-
+-    # ---------- public hooks called by the cache framework ----------
++        while len(self.Gw) > cap:
++            self.Gw.popitem(last=False)
++        while len(self.Gm) > cap:
++            self.Gm.popitem(last=False)
++
++    def _touch(self, od: OrderedDict, key: str):
++        od[key] = None
++        od.move_to_end(key)
++
++    def _promote_to_H(self, key: str):
++        # Move from P->H; bound H size to (capacity - p), demote oldest H to P if needed.
++        self.P.pop(key, None)
++        self._touch(self.H, key)
++        max_H = max(0, self.capacity - self.p)
++        while len(self.H) > max_H and len(self.H) > 0:
++            # Demote LRU of H to P front
++            k, _ = self.H.popitem(last=False)
++            self.P[k] = None
++            # keep at front (already LRU side)
++
++    def _sample_lru_min_freq(self, od: OrderedDict) -> str:
++        if not od:
++            return None
++        k = min(self._sample_k, len(od))
++        it = iter(od.keys())  # from LRU to MRU
++        min_key = None
++        min_f = None
++        for _ in range(k):
++            key = next(it)
++            f = self.sketch.estimate(key)
++            if min_f is None or f < min_f:
++                min_f = f
++                min_key = key
++        return min_key if min_key is not None else next(iter(od))
++
++    # ---------- public hooks ----------
+ 
+     def choose_victim(self, cache_snapshot, new_obj) -> str:
+         """
+-        ARC victim selection:
+-        Prefer evicting from T1 (recency) when T1 is large (>p) or incoming key
+-        has history in B2 and T1 == p; else from T2 (frequency).
++        WTinyLFU victim selection with competitive admission:
++        - Primary eviction choices are from W (if W > p) or P (probation).
++        - If both candidates exist, compare TinyLFU(new) vs TinyLFU(P_LRU_sample).
++          If new <= victim_P, evict from W (protect main).
++          Else evict from P (admit new to main via later insert/promotion).
++        - Use frequency-aware sampling from each list's LRU side.
+         """
+         self._ensure_capacity(cache_snapshot.capacity)
+-        self._prune_stale_residents(cache_snapshot)
+-
+-        in_B2 = (new_obj.key in self.B2)
+-
+-        # Decide which resident list to evict from
+-        choose_T1 = len(self.T1) > 0 and (len(self.T1) > self.p or (in_B2 and len(self.T1) == self.p))
+-
+-        victim_key = None
+-        if choose_T1 and len(self.T1) > 0:
+-            victim_key = next(iter(self.T1))
+-            self._last_evicted_from = 'T1'
+-        elif len(self.T2) > 0:
+-            victim_key = next(iter(self.T2))
+-            self._last_evicted_from = 'T2'
+-        elif len(self.T1) > 0:
+-            victim_key = next(iter(self.T1))
+-            self._last_evicted_from = 'T1'
++        self._prune_residents(cache_snapshot)
++
++        # Candidates from each segment
++        cand_W = self._sample_lru_min_freq(self.W) if len(self.W) > 0 else None
++        cand_P = self._sample_lru_min_freq(self.P) if len(self.P) > 0 else None
++
++        # If window exceeds target, evict from W
++        if cand_W is not None and len(self.W) > self.p:
++            self._last_evicted_from = 'W'
++            return cand_W
++
++        # If no P candidate, fallback to W then H then arbitrary
++        if cand_P is None:
++            if cand_W is not None:
++                self._last_evicted_from = 'W'
++                return cand_W
++            # Rare: evict from H's LRU (should be small), last resort
++            cand_H = self._sample_lru_min_freq(self.H) if len(self.H) > 0 else None
++            if cand_H is not None:
++                self._last_evicted_from = 'H'
++                return cand_H
++            # Fallback to any key in actual cache
++            self._last_evicted_from = 'W'
++            return next(iter(cache_snapshot.cache))
++
++        # Competitive admission via TinyLFU
++        f_new = self.sketch.estimate(new_obj.key)
++        f_p = self.sketch.estimate(cand_P)
++
++        if cand_W is None:
++            # No window to protect, evict from P
++            self._last_evicted_from = 'P'
++            return cand_P
++
++        # If the incoming is not better than P candidate, evict from window
++        if f_new <= f_p:
++            self._last_evicted_from = 'W'
++            return cand_W
+         else:
+-            # Fallback: unknown ordering, pick an arbitrary key from current cache.
+-            # This also handles situations where our state is cold but cache is warm.
+-            victim_key = next(iter(cache_snapshot.cache))
+-            self._last_evicted_from = 'T1'
+-
+-        return victim_key
++            self._last_evicted_from = 'P'
++            return cand_P
+ 
+     def on_hit(self, cache_snapshot, obj):
+-        """Hit handling: promote to T2 if in T1; reorder within T2 if already there."""
+-        self._ensure_capacity(cache_snapshot.capacity)
+-
+-        key = obj.key
+-        # Keep state robust to any desyncs:
+-        if key in self.T1:
+-            # Second touch: promote to T2
+-            self.T1.pop(key, None)
+-            self._touch_T2(key)
+-        elif key in self.T2:
+-            # Renew recency in T2
+-            self._touch_T2(key)
+-        else:
+-            # If our metadata missed this key, place it as frequent (it was a hit).
+-            self._touch_T2(key)
+-
+-    def on_insert(self, cache_snapshot, obj):
+-        """
+-        Insert handling (called on miss after space made, if needed):
+-        - If key in B1: increase p (bias to recency) and insert into T2.
+-        - If key in B2: decrease p (bias to frequency) and insert into T2.
+-        - Else: insert into T1.
++        """
++        On hit:
++        - Increment TinyLFU.
++        - If in W: move to MRU of W.
++        - If in P: promote to H (protected), bounding H.
++        - If in H: move to MRU of H.
++        - If unknown (desync), treat as P->H promotion to capture frequency.
+         """
+         self._ensure_capacity(cache_snapshot.capacity)
+         key = obj.key
+-
+-        if key in self.B1:
+-            # Increase p toward recency
+-            delta = max(1, len(self.B2) // max(1, len(self.B1)))
++        self.sketch.increment(key, 1)
++
++        if key in self.W:
++            self._touch(self.W, key)
++            return
++        if key in self.P:
++            self._promote_to_H(key)
++            return
++        if key in self.H:
++            self._touch(self.H, key)
++            return
++
++        # Metadata missed but cache hit: assume it's frequent; place into H.
++        self._touch(self.P, key)
++        self._promote_to_H(key)
++
++    def on_insert(self, cache_snapshot, obj):
++        """
++        On insert (after miss and making space, if needed):
++        - Increment TinyLFU.
++        - ARC-like adaptation of window size 'p' using ghost histories:
++          * If key in Gw: increase p (favor recency), insert to W.
++          * If key in Gm: decrease p (favor frequency), insert to P (probation).
++        - Else: insert to W (recency buffer).
++        - Bound H size to (capacity - p) by demotion, prune ghosts.
++        """
++        self._ensure_capacity(cache_snapshot.capacity)
++        key = obj.key
++        self.sketch.increment(key, 1)
++
++        if key in self.Gw:
++            # Increase p towards recency
++            delta = max(1, len(self.Gm) // max(1, len(self.Gw)))
+             self.p = min(self.capacity, self.p + delta)
+-            self.B1.pop(key, None)
+-            self._touch_T2(key)
+-        elif key in self.B2:
+-            # Decrease p toward frequency
+-            delta = max(1, len(self.B1) // max(1, len(self.B2)))
++            self.Gw.pop(key, None)
++            self._touch(self.W, key)
++        elif key in self.Gm:
++            # Decrease p towards frequency
++            delta = max(1, len(self.Gw) // max(1, len(self.Gm)))
+             self.p = max(0, self.p - delta)
+-            self.B2.pop(key, None)
+-            self._touch_T2(key)
++            self.Gm.pop(key, None)
++            # Insert into probation to allow quick promotion on next hit
++            self._touch(self.P, key)
+         else:
+-            # New key with no ghost history: start in T1
+-            self._touch_T1(key)
+-
+-        # Ensure ghosts are bounded
++            # Fresh key: recency admission
++            self._touch(self.W, key)
++
++        # Keep H bounded relative to current p
++        max_H = max(0, self.capacity - self.p)
++        while len(self.H) > max_H and len(self.H) > 0:
++            k, _ = self.H.popitem(last=False)
++            self.P[k] = None  # demote to probation
++
+         self._prune_ghosts()
+ 
+     def on_evict(self, cache_snapshot, obj, evicted_obj):
+         """
+-        Eviction handling: move the evicted resident to its corresponding ghost list.
+-        Maintain bounded ghost metadata and adapt later on insert.
++        After eviction: record the evicted resident into the appropriate ghost list.
+         """
+         self._ensure_capacity(cache_snapshot.capacity)
+         evk = evicted_obj.key
+ 
+-        if evk in self.T1:
+-            self._move_T1_to_B1(evk)
+-        elif evk in self.T2:
+-            self._move_T2_to_B2(evk)
++        if evk in self.W:
++            self.W.pop(evk, None)
++            self.Gw[evk] = None
++            self.Gw.move_to_end(evk)
++            src = 'W'
++        elif evk in self.P:
++            self.P.pop(evk, None)
++            self.Gm[evk] = None
++            self.Gm.move_to_end(evk)
++            src = 'P'
++        elif evk in self.H:
++            self.H.pop(evk, None)
++            self.Gm[evk] = None
++            self.Gm.move_to_end(evk)
++            src = 'H'
+         else:
+-            # Fall back to our last decision if state was pruned.
+-            if self._last_evicted_from == 'T1':
+-                self.B1[evk] = None
+-                self.B1.move_to_end(evk)
++            # If our metadata didn't know, fall back to last decision
++            if self._last_evicted_from == 'W':
++                self.Gw[evk] = None
++                self.Gw.move_to_end(evk)
++                src = 'W'
+             else:
+-                self.B2[evk] = None
+-                self.B2.move_to_end(evk)
+-
++                self.Gm[evk] = None
++                self.Gm.move_to_end(evk)
++                src = 'P'
++
++        # Bound ghosts
+         self._prune_ghosts()
++        # Light resident pruning to avoid stale references
++        self._prune_residents(cache_snapshot)
++
++    # End class
+ 
+ 
+ # Single policy instance reused across calls
+-_policy = _ArcPolicy()
++_policy = _WTinyLFU()
+ 
+ 
+ def evict(cache_snapshot, obj):
+     """
+     Choose eviction victim key for the incoming obj.
+     """
+     return _policy.choose_victim(cache_snapshot, obj)
+ 
+ 
+ def update_after_hit(cache_snapshot, obj):
+     """
+     Update policy state after a cache hit on obj.
+     """
+     _policy.on_hit(cache_snapshot, obj)
+ 
+ 
+ def update_after_insert(cache_snapshot, obj):
+     """
+     Update policy state after a new obj is inserted into the cache.
+     """
+     _policy.on_insert(cache_snapshot, obj)
+ 
+ 
+ def update_after_evict(cache_snapshot, obj, evicted_obj):
+     """
+     Update policy state after evicting evicted_obj to make room for obj.
+     """
+     _policy.on_evict(cache_snapshot, obj, evicted_obj)
+ 
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

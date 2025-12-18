@@ -1,0 +1,182 @@
+# EVOLVE-BLOCK-START
+"""
+Adaptive S3-LRU with Ghost Queues
+Combines S3-FIFO's scan resistance with LRU's recency management and ARC-like adaptive sizing.
+- S_Queue: FIFO probation queue.
+- M_Queue: LRU protected queue.
+- Adaptive sizing of S based on ghost hits.
+- Ghost queues track evicted items from S and M to drive adaptation.
+"""
+
+from collections import OrderedDict
+
+# Global State
+# q_S: FIFO queue for probation (OrderedDict for O(1) ops)
+# q_M: LRU queue for protected items
+# g_S: Ghost queue for S evictions
+# g_M: Ghost queue for M evictions
+# accessed_S: Set of keys in S that have been accessed (Lazy Promotion)
+# ratio_S: Target fraction of cache for S queue
+# last_access_count: Timestamp to detect trace changes
+q_S = OrderedDict()
+q_M = OrderedDict()
+g_S = OrderedDict()
+g_M = OrderedDict()
+accessed_S = set()
+ratio_S = 0.1
+last_access_count = -1
+
+def _reset_state(snapshot):
+    global q_S, q_M, g_S, g_M, accessed_S, ratio_S, last_access_count
+    if snapshot.access_count < last_access_count:
+        q_S.clear()
+        q_M.clear()
+        g_S.clear()
+        g_M.clear()
+        accessed_S.clear()
+        ratio_S = 0.1
+    last_access_count = snapshot.access_count
+
+def evict(cache_snapshot, obj):
+    """
+    Determine eviction victim.
+    - Adapts S-queue size target.
+    - Checks S-queue first (Probation). Promotes if accessed.
+    - Evicts from M-queue (LRU) if S is within target.
+    """
+    global q_S, q_M, g_S, g_M, accessed_S, ratio_S
+    _reset_state(cache_snapshot)
+    
+    capacity = cache_snapshot.capacity
+    target_s = max(1, int(capacity * ratio_S))
+    
+    # Infinite loop safe-guard is the cache capacity, 
+    # but practically we just iterate until we find a victim.
+    while True:
+        # Rule: Evict from S if > target OR M is empty
+        evict_from_s = len(q_S) > target_s or not q_M
+        
+        # Edge case: S empty but M not empty (should imply evict_from_s=False)
+        if evict_from_s and not q_S:
+            evict_from_s = False
+            
+        if evict_from_s:
+            # Candidate from FIFO head of S
+            candidate, _ = q_S.popitem(last=False)
+            
+            # Sync check
+            if candidate not in cache_snapshot.cache:
+                accessed_S.discard(candidate)
+                continue
+            
+            if candidate in accessed_S:
+                # Lazy Promotion: Move to M (Tail/MRU)
+                accessed_S.discard(candidate)
+                q_M[candidate] = None
+                # Did not free space, continue loop
+                continue
+            else:
+                # Evict Candidate from S
+                g_S[candidate] = None
+                # Cap Ghost S
+                if len(g_S) > capacity * 2:
+                    g_S.popitem(last=False)
+                return candidate
+        else:
+            # Evict from M (LRU Head)
+            if not q_M:
+                # Should not happen if cache full
+                return None
+            
+            candidate, _ = q_M.popitem(last=False)
+            
+            if candidate not in cache_snapshot.cache:
+                continue
+            
+            # Evict Candidate from M -> Ghost M
+            g_M[candidate] = None
+            # Cap Ghost M
+            if len(g_M) > capacity * 2:
+                g_M.popitem(last=False)
+            return candidate
+
+def update_after_hit(cache_snapshot, obj):
+    """
+    Update state on cache hit.
+    - M: Update LRU position.
+    - S: Mark accessed (Lazy promotion).
+    """
+    global q_S, q_M, accessed_S
+    _reset_state(cache_snapshot)
+    
+    key = obj.key
+    if key in q_M:
+        q_M.move_to_end(key)
+    elif key in q_S:
+        accessed_S.add(key)
+
+def update_after_insert(cache_snapshot, obj):
+    """
+    Handle new object insertion.
+    - Check Ghosts for Adaptation.
+    - Insert into S or M.
+    """
+    global q_S, q_M, g_S, g_M, accessed_S, ratio_S
+    _reset_state(cache_snapshot)
+    
+    key = obj.key
+    
+    # Adaptation Logic
+    if key in g_S:
+        # Hit in Ghost S: S was too small
+        # Increase S target
+        ratio_S = min(0.9, ratio_S + 0.02)
+        # Promote to M on rescue
+        q_M[key] = None
+        del g_S[key]
+    elif key in g_M:
+        # Hit in Ghost M: M was too small (S too big)
+        # Decrease S target
+        ratio_S = max(0.05, ratio_S - 0.02)
+        # Promote to M
+        q_M[key] = None
+        del g_M[key]
+    else:
+        # Fresh insert -> S
+        q_S[key] = None
+        accessed_S.discard(key)
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    """
+    Cleanup after eviction.
+    Victim is already removed from queues in evict(), but we ensure consistency.
+    """
+    global q_S, q_M, accessed_S
+    _reset_state(cache_snapshot)
+    
+    key = evicted_obj.key
+    # Just in case evict() didn't align with system eviction (unlikely)
+    q_S.pop(key, None)
+    q_M.pop(key, None)
+    accessed_S.discard(key)
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

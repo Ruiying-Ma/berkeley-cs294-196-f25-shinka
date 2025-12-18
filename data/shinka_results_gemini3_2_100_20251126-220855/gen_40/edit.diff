@@ -1,0 +1,311 @@
+--- a/original.py
++++ b/original.py
+@@ -1,174 +1,185 @@
+ # EVOLVE-BLOCK-START
+-"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
++"""Cache eviction algorithm combining ARC adaptive sizing with S3 probabilistic rescue"""
+ from collections import OrderedDict
+ import random
+ 
+-# S3-Jitter-Ghost Global State
+-s3_small = OrderedDict() # FIFO queue for new/probationary items
+-s3_main = OrderedDict()  # LRU queue for promoted/protected items
+-s3_ghost = OrderedDict() # FIFO queue for tracking history of evicted items
+-s3_freq = {}             # Frequency map for items in Small
+-s3_params = {}           # Configuration parameters
+-last_access_count = -1
++# Global State
++m_t1 = OrderedDict() # T1: Recent cache entries (Probation)
++m_t2 = OrderedDict() # T2: Frequent cache entries (Protected)
++m_b1 = OrderedDict() # B1: Ghost entries evicted from T1
++m_b2 = OrderedDict() # B2: Ghost entries evicted from T2
++m_p = 0              # Target size for T1
++m_last_access_count = -1
+ 
+-def _reset_state(cache_snapshot):
+-    """Resets global state if a new trace is detected."""
+-    global s3_small, s3_main, s3_ghost, s3_freq, s3_params, last_access_count
+-    if cache_snapshot.access_count < last_access_count:
+-        s3_small.clear()
+-        s3_main.clear()
+-        s3_ghost.clear()
+-        s3_freq.clear()
+-        s3_params.clear()
+-    last_access_count = cache_snapshot.access_count
+-    
+-    # Initialize parameters once per trace
+-    if not s3_params:
+-        cap = cache_snapshot.capacity
+-        s3_params['small_ratio'] = 0.1
+-        # Jitter range: +/- 5% of capacity
+-        s3_params['jitter_range'] = max(1, int(cap * 0.05))
+-        # Probability to randomly save a victim (Anti-Thrashing)
+-        s3_params['lucky_save_prob'] = 0.01
++def _check_reset(cache_snapshot):
++    """Resets global state if a new trace is detected based on access count rollback."""
++    global m_t1, m_t2, m_b1, m_b2, m_p, m_last_access_count
++    if cache_snapshot.access_count < m_last_access_count:
++        m_t1.clear()
++        m_t2.clear()
++        m_b1.clear()
++        m_b2.clear()
++        m_p = 0
++    m_last_access_count = cache_snapshot.access_count
+ 
+ def evict(cache_snapshot, obj):
+     '''
+-    Eviction Policy:
+-    - Calculates a jittered target size for the Small queue.
+-    - Tries to evict from Small first.
+-    - Promotes items from Small to Main if they have >0 hits.
+-    - Uses "Lucky Save" (epsilon-greedy) to keep random items, breaking loops.
+-    - If Small is safe, evicts from Main (LRU).
++    Hybrid ARC Eviction:
++    - Adaptive 'p' parameter from ARC.
++    - Randomized victim selection from T1 (from Inspiration).
++    - Probabilistic 'Lucky Save' from S3 to prevent thrashing in T1.
+     '''
+-    _reset_state(cache_snapshot)
++    _check_reset(cache_snapshot)
++    global m_p
++
++    key = obj.key
+     capacity = cache_snapshot.capacity
++
++    # 1. Adapt p (target size of T1) based on hits in ghost lists
++    if key in m_b1:
++        delta = 1
++        if len(m_b1) > 0 and len(m_b2) > 0:
++            delta = max(1, len(m_b2) / len(m_b1))
++        m_p = min(capacity, m_p + delta)
++    elif key in m_b2:
++        delta = 1
++        if len(m_b1) > 0 and len(m_b2) > 0:
++            delta = max(1, len(m_b1) / len(m_b2))
++        m_p = max(0, m_p - delta)
++
++    # 2. Select victim source (T1 vs T2)
++    # Apply small jitter to p for boundary fuzzing (inspired by S3)
++    # This prevents the algorithm from getting stuck at a hard threshold
++    p_jitter = random.randint(-1, 1) if capacity > 10 else 0
++    target_t1 = max(0, min(capacity, m_p + p_jitter))
++
++    evict_t1 = False
++    if len(m_t1) > 0:
++        if len(m_t1) > target_t1:
++            evict_t1 = True
++        elif key in m_b2 and len(m_t1) >= int(target_t1):
++            evict_t1 = True
+     
+-    # Dynamic target size for Small queue to avoid resonance
+-    jitter = random.randint(-s3_params['jitter_range'], s3_params['jitter_range'])
+-    target_small = max(1, int(capacity * s3_params['small_ratio']) + jitter)
+-    
+-    # 1. Process Small Queue
+-    # We loop here because we might promote items instead of evicting
+-    while len(s3_small) > target_small or (not s3_main and s3_small):
+-        # Peek at FIFO head (oldest)
+-        victim_key = next(iter(s3_small))
++    # If T2 is empty, we must evict from T1
++    if len(m_t2) == 0:
++        evict_t1 = True
++
++    # 3. Select specific victim
++    if evict_t1 and m_t1:
++        # Loop to allow for 'Lucky Save' retries
++        # Try up to 3 times to find a victim
++        for _ in range(3):
++            # Randomized selection from bottom k (Scan resistance)
++            k = 5
++            candidates = []
++            it = iter(m_t1)
++            try:
++                for _ in range(k):
++                    candidates.append(next(it))
++            except StopIteration:
++                pass
++            
++            victim = random.choice(candidates)
++            
++            # Lucky Save (from S3): Small chance to give second chance
++            # Helps retain items during transient scans/loops
++            if random.random() < 0.05: # 5% chance
++                m_t1.move_to_end(victim) # Move to MRU (Rescue)
++                # Victim is now at end, next loop will pick different candidates
++                continue 
++            else:
++                return victim
+         
+-        # Check Promotion Criteria (at least 1 hit)
+-        if s3_freq.get(victim_key, 0) > 0:
+-            # Promote to Main
+-            s3_small.move_to_end(victim_key, last=False) # Helper to pop head
+-            s3_small.popitem(last=False)
+-            
+-            s3_main[victim_key] = 1
+-            s3_main.move_to_end(victim_key) # Insert at MRU
+-            
+-            # Remove from freq map (only tracks Small)
+-            if victim_key in s3_freq:
+-                del s3_freq[victim_key]
+-            # Loop continues to find next victim
+-        else:
+-            # Valid victim found (0 hits)
+-            # Lucky Save: Random chance to spare this item
+-            if random.random() < s3_params['lucky_save_prob']:
+-                # Move to end (newest) - give it another cycle
+-                s3_small.move_to_end(victim_key)
+-            else:
+-                return victim_key
+-
+-    # 2. Process Main Queue (LRU)
+-    if s3_main:
+-        # Lucky Save for Main (Anti-Loop for Main segment)
+-        # Try up to 3 times to find a victim that isn't "lucky"
+-        for _ in range(3):
+-            victim_key = next(iter(s3_main)) # LRU head
+-            if random.random() < s3_params['lucky_save_prob']:
+-                s3_main.move_to_end(victim_key) # Save to MRU
+-            else:
+-                return victim_key
+-        # Fallback if we saved 3 times
+-        return next(iter(s3_main))
+-
+-    # Fallback (should be covered by while loop)
+-    if s3_small:
+-        return next(iter(s3_small))
+-    return None
++        # Fallback if we looped out (pick LRU)
++        return next(iter(m_t1))
++    else:
++        # T2 Eviction: LRU
++        # T2 contains high-value items, LRU is usually optimal here
++        return next(iter(m_t2)) if m_t2 else next(iter(m_t1))
+ 
+ def update_after_hit(cache_snapshot, obj):
+     '''
+-    On Hit:
+-    - Main: Move to MRU.
+-    - Small: Increment freq (lazy promotion).
++    On Cache Hit:
++    - If in T1, move to T2 (MRU).
++    - If in T2, move to MRU of T2.
+     '''
+-    _reset_state(cache_snapshot)
++    _check_reset(cache_snapshot)
+     key = obj.key
+-    
+-    if key in s3_main:
+-        s3_main.move_to_end(key)
+-    elif key in s3_small:
+-        # Increment freq, cap at 3 to avoid infinite growth
+-        s3_freq[key] = min(s3_freq.get(key, 0) + 1, 3)
++
++    if key in m_t1:
++        del m_t1[key]
++        m_t2[key] = 1
++        m_t2.move_to_end(key)
++    elif key in m_t2:
++        m_t2.move_to_end(key)
+     else:
+-        # Recovery for inconsistency
+-        s3_main[key] = 1
+-        s3_main.move_to_end(key)
++        # Should be in cache, but if missing from metadata, add to T2 (self-healing)
++        m_t2[key] = 1
++        m_t2.move_to_end(key)
+ 
+ def update_after_insert(cache_snapshot, obj):
+     '''
+-    On Insert (Miss):
+-    - Ghost: If present, promote directly to Main (High Value).
+-    - Else: Insert into Small (Probation).
++    On Cache Insert (Miss):
++    - If previously in ghost B1/B2, promote to T2.
++    - Otherwise, insert into T1.
+     '''
+-    _reset_state(cache_snapshot)
++    _check_reset(cache_snapshot)
+     key = obj.key
+-    
+-    if key in s3_ghost:
+-        # Resurrect from Ghost directly to Main
+-        s3_main[key] = 1
+-        s3_main.move_to_end(key)
+-        del s3_ghost[key]
++
++    if key in m_b1:
++        del m_b1[key]
++        m_t2[key] = 1
++        m_t2.move_to_end(key)
++    elif key in m_b2:
++        del m_b2[key]
++        m_t2[key] = 1
++        m_t2.move_to_end(key)
+     else:
+-        # New item to Small
+-        s3_small[key] = 1
+-        s3_freq[key] = 0
++        # Totally new item
++        m_t1[key] = 1
++        m_t1.move_to_end(key)
+ 
+ def update_after_evict(cache_snapshot, obj, evicted_obj):
+     '''
+     On Eviction:
+-    - Remove from queues.
+-    - Add to Ghost list for history tracking.
++    - Move evicted key from T1/T2 to B1/B2.
++    - Maintain capacity of ghost lists.
+     '''
+     key = evicted_obj.key
+-    
+-    if key in s3_small:
+-        del s3_small[key]
+-        if key in s3_freq:
+-            del s3_freq[key]
+-    elif key in s3_main:
+-        del s3_main[key]
+-        
+-    # Add to Ghost
+-    s3_ghost[key] = 1
+-    # Limit Ghost size to capacity
+-    if len(s3_ghost) > cache_snapshot.capacity:
+-        s3_ghost.popitem(last=False)
++    capacity = cache_snapshot.capacity
++
++    if key in m_t1:
++        del m_t1[key]
++        m_b1[key] = 1
++        m_b1.move_to_end(key)
++    elif key in m_t2:
++        del m_t2[key]
++        m_b2[key] = 1
++        m_b2.move_to_end(key)
++
++    # Restrict size of ghost lists to capacity
++    if len(m_b1) > capacity:
++        m_b1.popitem(last=False)
++    if len(m_b2) > capacity:
++        m_b2.popitem(last=False)
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

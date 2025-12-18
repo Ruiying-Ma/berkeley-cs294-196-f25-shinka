@@ -1,0 +1,307 @@
+<NAME>
+arc_eviction
+</NAME>
+
+<DESCRIPTION>
+Implement Adaptive Replacement Cache (ARC).
+ARC dynamically balances between Recency (T1) and Frequency (T2) by tracking evicted items in ghost lists (B1, B2).
+- Maintains T1, T2 (cache) and B1, B2 (ghost).
+- Adapts parameter `p` based on hits in B1 (increase p) or B2 (decrease p).
+- Robust against scans (frequency items protected in T2) and adapts to changing working sets.
+- Handles `evict`, `hit`, `insert`, `evict_update` correctly to maintain ARC invariants.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+# S3-FIFO State
+algo_state = {
+    'S': deque(),        # Small FIFO queue (approx 10% cache)
+    'M': deque(),        # Main FIFO queue (approx 90% cache)
+    'ghost': {},         # Ghost cache (dict for FIFO ordering)
+    'accessed': set(),   # Track accessed items (1-bit clock)
+    'location': {},      # Map key -> 'S' or 'M'
+    'max_time': 0        # Track time to detect trace resets
+}
+
+def _check_reset(current_time):
+    # If time goes backwards, we are likely processing a new trace
+    if current_time < algo_state['max_time']:
+        algo_state['S'].clear()
+        algo_state['M'].clear()
+        algo_state['ghost'].clear()
+        algo_state['accessed'].clear()
+        algo_state['location'].clear()
+        algo_state['max_time'] = 0
+    algo_state['max_time'] = current_time
+
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO Eviction Logic:
+    - Maintains a small FIFO (S) and a main FIFO (M).
+    - New items go to S.
+    - Eviction candidates are chosen from S (if full) or M.
+    - Items in S with access bit set move to M.
+    - Items in M with access bit set get reinserted (Second Chance).
+    '''
+    S = algo_state['S']
+    M = algo_state['M']
+    accessed = algo_state['accessed']
+    location = algo_state['location']
+
+    capacity = cache_snapshot.capacity
+    target_S_size = max(1, int(capacity * 0.1))
+
+    victim = None
+
+    # Loop until a victim is found.
+    # This loop modifies the queues by moving "saved" items.
+    while victim is None:
+        # Determine which queue to evict from
+        evict_from_S = False
+        if len(S) > target_S_size:
+            evict_from_S = True
+        elif len(M) == 0:
+            evict_from_S = True
+
+        if evict_from_S:
+            if not S: break # Should not happen if cache not empty
+
+            candidate = S[0] # Peek head (oldest)
+            if candidate in accessed:
+                # Been accessed: Promote to M
+                S.popleft()
+                M.append(candidate)
+                location[candidate] = 'M'
+                accessed.remove(candidate)
+            else:
+                # Not accessed: Evict
+                victim = candidate
+        else:
+            if not M: break
+
+            candidate = M[0] # Peek head (oldest)
+            if candidate in accessed:
+                # Been accessed: Reinsert in M (Second Chance)
+                M.popleft()
+                M.append(candidate)
+                # location is already 'M'
+                accessed.remove(candidate)
+            else:
+                # Not accessed: Evict
+                victim = candidate
+
+    return victim
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    Hit: Mark object as accessed.
+    '''
+    _check_reset(cache_snapshot.access_count)
+    algo_state['accessed'].add(obj.key)
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Insert: Place in S or M (if ghost).
+    '''
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+
+    # If previously evicted from M (ghost), restore to M
+    if key in algo_state['ghost']:
+        algo_state['M'].append(key)
+        algo_state['location'][key] = 'M'
+        del algo_state['ghost'][key]
+    else:
+        # New item goes to S
+        algo_state['S'].append(key)
+        algo_state['location'][key] = 'S'
+
+    # Start with accessed bit 0 (unless it was a hit/insert race, but usually 0)
+    # We explicitly remove it to be safe, though usually not present.
+    if key in algo_state['accessed']:
+        algo_state['accessed'].remove(key)
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Evict: Remove victim from queues and manage ghost.
+    '''
+    key = evicted_obj.key
+    loc = algo_state['location'].get(key)
+
+    # Remove from S or M
+    if loc == 'S':
+        # Optimize: usually at head
+        if algo_state['S'] and algo_state['S'][0] == key:
+            algo_state['S'].popleft()
+        else:
+            try: algo_state['S'].remove(key)
+            except ValueError: pass
+        # Evicted from S -> No ghost (scan filter)
+
+    elif loc == 'M':
+        if algo_state['M'] and algo_state['M'][0] == key:
+            algo_state['M'].popleft()
+        else:
+            try: algo_state['M'].remove(key)
+            except ValueError: pass
+
+        # Evicted from M -> Add to ghost
+        algo_state['ghost'][key] = True
+
+        # Maintain ghost size <= capacity
+        if len(algo_state['ghost']) > cache_snapshot.capacity:
+            # FIFO eviction from ghost
+            oldest = next(iter(algo_state['ghost']))
+            del algo_state['ghost'][oldest]
+
+    # Cleanup metadata
+    if key in algo_state['location']:
+        del algo_state['location'][key]
+    if key in algo_state['accessed']:
+        algo_state['accessed'].remove(key)
+=======
+# ARC State
+algo_state = {
+    't1': {},    # key -> None (OrderedDict behavior for LRU)
+    't2': {},    # key -> None
+    'b1': {},    # key -> None
+    'b2': {},    # key -> None
+    'p': 0.0,    # Target size of T1
+    'max_time': 0
+}
+
+def _check_reset(current_time):
+    if current_time < algo_state['max_time']:
+        algo_state['t1'].clear()
+        algo_state['t2'].clear()
+        algo_state['b1'].clear()
+        algo_state['b2'].clear()
+        algo_state['p'] = 0.0
+        algo_state['max_time'] = 0
+    algo_state['max_time'] = current_time
+
+def evict(cache_snapshot, obj):
+    '''
+    ARC Eviction Logic.
+    Decides whether to evict from T1 or T2 based on target size p and ghost hits.
+    '''
+    t1 = algo_state['t1']
+    t2 = algo_state['t2']
+    b1 = algo_state['b1']
+    b2 = algo_state['b2']
+    p = algo_state['p']
+    key = obj.key
+    capacity = cache_snapshot.capacity
+
+    # Calculate effective p for this decision (simulate adaptation)
+    # We do not modify global p here, that happens in update_after_insert
+    curr_p = p
+    if key in b1:
+        delta = 1
+        if len(b2) > len(b1):
+            delta = len(b2) / len(b1)
+        curr_p = min(capacity, p + delta)
+    elif key in b2:
+        delta = 1
+        if len(b1) > len(b2):
+            delta = len(b1) / len(b2)
+        curr_p = max(0, p - delta)
+
+    # Decide victim
+    # Logic: if (|T1| > p) or (x in B2 and |T1| == p) -> Evict T1
+    evict_t1 = False
+    if len(t1) > 0 and (len(t1) > curr_p or (key in b2 and len(t1) == int(curr_p))):
+        evict_t1 = True
+    elif len(t2) == 0:
+        evict_t1 = True
+
+    if evict_t1:
+        return next(iter(t1))
+    else:
+        return next(iter(t2))
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    Hit: Move to T2 MRU.
+    '''
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+    t1 = algo_state['t1']
+    t2 = algo_state['t2']
+
+    if key in t1:
+        del t1[key]
+        t2[key] = None
+    elif key in t2:
+        del t2[key]
+        t2[key] = None
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Insert: Handle ghost hits, update p, insert to T1 or T2.
+    '''
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+    t1 = algo_state['t1']
+    t2 = algo_state['t2']
+    b1 = algo_state['b1']
+    b2 = algo_state['b2']
+    p = algo_state['p']
+    capacity = cache_snapshot.capacity
+
+    # Adapt p and move from ghost if needed
+    if key in b1:
+        delta = 1
+        if len(b2) > len(b1):
+            delta = len(b2) / len(b1)
+        algo_state['p'] = min(capacity, p + delta)
+
+        del b1[key]
+        t2[key] = None # Move to T2 MRU
+
+    elif key in b2:
+        delta = 1
+        if len(b1) > len(b2):
+            delta = len(b1) / len(b2)
+        algo_state['p'] = max(0, p - delta)
+
+        del b2[key]
+        t2[key] = None # Move to T2 MRU
+
+    else:
+        # New item -> T1 MRU
+        t1[key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Evict: Move victim to ghost list and enforce ghost capacity.
+    '''
+    v_key = evicted_obj.key
+    t1 = algo_state['t1']
+    t2 = algo_state['t2']
+    b1 = algo_state['b1']
+    b2 = algo_state['b2']
+    capacity = cache_snapshot.capacity
+
+    # Identify where it was and move to ghost
+    if v_key in t1:
+        del t1[v_key]
+        b1[v_key] = None
+    elif v_key in t2:
+        del t2[v_key]
+        b2[v_key] = None
+
+    # Enforce ghost capacity
+    while len(b1) + len(b2) > capacity:
+        if len(b1) > len(t2):
+            if b1:
+                del b1[next(iter(b1))]
+            elif b2:
+                del b2[next(iter(b2))]
+        else:
+            if b2:
+                del b2[next(iter(b2))]
+            elif b1:
+                del b1[next(iter(b1))]
+>>>>>>> REPLACE
+</DIFF>

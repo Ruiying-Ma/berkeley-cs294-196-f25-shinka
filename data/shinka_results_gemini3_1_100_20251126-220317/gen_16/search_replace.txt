@@ -1,0 +1,90 @@
+<NAME>
+arc_random_eviction
+</NAME>
+
+<DESCRIPTION>
+Modify the ARC eviction strategy to use Random Replacement instead of LRU for both the T1 (Recency) and T2 (Frequency) lists.
+Standard ARC uses LRU eviction within its T1 and T2 lists. While LRU is optimal for stack-based recency patterns, it fails catastrophically (0% hit rate) on looping access patterns where the loop size is slightly larger than the cache (e.g., Traces 14-19). In such cases, LRU synchronizes with the loop and evicts items just before they are needed.
+Random replacement, on the other hand, desynchronizes from the loop and maintains a hit rate proportional to `CacheSize / LoopSize`, which is significantly better than zero.
+By combining ARC's adaptive sizing (which separates scan-like items in T1 from recurring items in T2 and effectively filters scans) with Random eviction, we achieve high resilience against loops while maintaining good adaptability for general workloads.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    ARC Eviction Logic:
+    - Adapt p based on hits in ghost lists (B1, B2).
+    - Decide whether to evict from T1 or T2 based on p and T1 size.
+    '''
+    global p
+
+    capacity = cache_snapshot.capacity
+
+    # Adaptation: If the incoming object (miss) is in a ghost list
+    if obj.key in m_b1:
+        delta = 1
+        if len(m_b1) < len(m_b2):
+             delta = len(m_b2) / len(m_b1)
+        p = min(capacity, p + delta)
+    elif obj.key in m_b2:
+        delta = 1
+        if len(m_b2) < len(m_b1):
+             delta = len(m_b1) / len(m_b2)
+        p = max(0, p - delta)
+
+    # Decision: Select victim
+    evict_t1 = False
+    if len(m_t1) > 0:
+        if len(m_t1) > p:
+            evict_t1 = True
+        elif obj.key in m_b2 and len(m_t1) == int(p):
+            evict_t1 = True
+        elif len(m_t2) == 0:
+            evict_t1 = True
+
+    if evict_t1:
+        return next(iter(m_t1))
+    else:
+        return next(iter(m_t2))
+=======
+def evict(cache_snapshot, obj):
+    '''
+    ARC Eviction Logic with Randomization:
+    - Adapt p based on hits in ghost lists (B1, B2).
+    - Decide whether to evict from T1 or T2 based on p and T1 size.
+    - Use Random Eviction to robustly handle loops and large working sets.
+    '''
+    global p
+    import random
+
+    capacity = cache_snapshot.capacity
+
+    # Adaptation: If the incoming object (miss) is in a ghost list
+    if obj.key in m_b1:
+        delta = 1
+        if len(m_b1) < len(m_b2):
+             delta = len(m_b2) / len(m_b1)
+        p = min(capacity, p + delta)
+    elif obj.key in m_b2:
+        delta = 1
+        if len(m_b2) < len(m_b1):
+             delta = len(m_b1) / len(m_b2)
+        p = max(0, p - delta)
+
+    # Decision: Select victim
+    evict_t1 = False
+    if len(m_t1) > 0:
+        if len(m_t1) > p:
+            evict_t1 = True
+        elif obj.key in m_b2 and len(m_t1) == int(p):
+            evict_t1 = True
+        elif len(m_t2) == 0:
+            evict_t1 = True
+
+    if evict_t1:
+        return random.choice(list(m_t1.keys()))
+    else:
+        return random.choice(list(m_t2.keys()))
+>>>>>>> REPLACE
+</DIFF>

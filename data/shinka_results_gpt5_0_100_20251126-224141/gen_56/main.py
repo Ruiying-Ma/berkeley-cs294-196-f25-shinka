@@ -1,0 +1,397 @@
+# EVOLVE-BLOCK-START
+"""Segmented LRU (SLRU) + TinyLFU-style aging + ghost-driven adaptation.
+Optimized to lower miss rates across diverse workloads.
+"""
+
+from collections import OrderedDict
+
+# Timestamp map for tie-breaking/fallback
+m_key_timestamp = dict()
+
+# Lightweight TinyLFU counters with periodic aging
+m_freq = dict()
+_last_age_access = 0
+AGE_INTERVAL_FACTOR = 4  # age every ~4×capacity accesses (min 500)
+
+# SLRU segments (LRU order: left=LRU, right=MRU)
+slru_prob = OrderedDict()  # probation (recent/new/demoted)
+slru_prot = OrderedDict()  # protected (frequent/hit)
+
+# Ghost lists: keys only
+ghost_B1 = OrderedDict()  # evicted from probation
+ghost_B2 = OrderedDict()  # evicted from protected
+
+# Target size for protected segment (adaptive), and capacity (items)
+slru_q = 0
+slru_capacity = None
+
+# Track which key has already adapted q in evict to avoid double-step in insert
+_skip_adapt_on_insert = set()
+
+
+def _ensure_capacity(cache_snapshot):
+    global slru_capacity, slru_q
+    if slru_capacity is None:
+        slru_capacity = max(int(cache_snapshot.capacity), 1)
+        # Start with half protected
+        slru_q = max(0, min(slru_capacity, slru_capacity // 2))
+    else:
+        # Clamp q if capacity has changed externally
+        slru_q = max(0, min(slru_q, slru_capacity))
+
+
+def _maybe_age(cache_snapshot):
+    global _last_age_access, m_freq
+    if slru_capacity is None:
+        return
+    interval = max(500, slru_capacity * AGE_INTERVAL_FACTOR)
+    now = cache_snapshot.access_count
+    if now - _last_age_access >= interval:
+        # Halve all frequencies to age out stale popularity
+        for k in list(m_freq.keys()):
+            newv = m_freq.get(k, 0) >> 1
+            if newv <= 0:
+                m_freq.pop(k, None)
+            else:
+                m_freq[k] = newv
+        _last_age_access = now
+
+
+def _move_to_mru(od, key):
+    if key in od:
+        od.pop(key, None)
+    od[key] = True
+
+
+def _pop_lru(od):
+    if od:
+        k, _ = od.popitem(last=False)
+        return k
+    return None
+
+
+def _trim_ghosts():
+    # Keep ghosts disjoint from residents
+    for k in list(slru_prob.keys()):
+        ghost_B1.pop(k, None)
+        ghost_B2.pop(k, None)
+    for k in list(slru_prot.keys()):
+        ghost_B1.pop(k, None)
+        ghost_B2.pop(k, None)
+
+    cap = slru_capacity if slru_capacity is not None else 1
+    total_cap = 2 * cap
+    # Bias trimming toward proportional targets: |B1|≈(cap - q), |B2|≈q
+    target_b2 = max(0, min(slru_q, cap))
+    target_b1 = max(0, cap - target_b2)
+
+    while (len(ghost_B1) + len(ghost_B2)) > total_cap:
+        excess_b1 = max(0, len(ghost_B1) - target_b1)
+        excess_b2 = max(0, len(ghost_B2) - target_b2)
+        if excess_b1 >= excess_b2 and ghost_B1:
+            _pop_lru(ghost_B1)
+        elif ghost_B2:
+            _pop_lru(ghost_B2)
+        else:
+            # If both within targets but still over total, trim larger
+            if len(ghost_B1) >= len(ghost_B2) and ghost_B1:
+                _pop_lru(ghost_B1)
+            elif ghost_B2:
+                _pop_lru(ghost_B2)
+            else:
+                break
+
+
+def _resync(cache_snapshot):
+    # Ensure our SLRU lists cover all residents, and no ghosts overlap residents
+    cache_keys = set(cache_snapshot.cache.keys())
+
+    # Purge stale from segments
+    for k in list(slru_prob.keys()):
+        if k not in cache_keys:
+            slru_prob.pop(k, None)
+    for k in list(slru_prot.keys()):
+        if k not in cache_keys:
+            slru_prot.pop(k, None)
+
+    # Add untracked cached keys to probation
+    for k in cache_keys:
+        if k not in slru_prob and k not in slru_prot:
+            _move_to_mru(slru_prob, k)
+
+    # Ghosts disjoint from residents
+    for k in list(ghost_B1.keys()):
+        if k in cache_keys:
+            ghost_B1.pop(k, None)
+    for k in list(ghost_B2.keys()):
+        if k in cache_keys:
+            ghost_B2.pop(k, None)
+
+    _trim_ghosts()
+
+
+def _pick_lfu_among_lru(od, sample_k):
+    # Among the k oldest keys in od, pick the one with the lowest frequency.
+    # Tie-break by oldest timestamp to better approximate LRU for equals.
+    if not od:
+        return None
+    k = max(1, sample_k)
+    best_key, best_freq, best_ts = None, None, None
+    count = 0
+    for key in od.keys():
+        f = m_freq.get(key, 0)
+        ts = m_key_timestamp.get(key, float('inf'))
+        if (best_freq is None or
+            f < best_freq or
+            (f == best_freq and ts < best_ts)):
+            best_key, best_freq, best_ts = key, f, ts
+        count += 1
+        if count >= k:
+            break
+    return best_key if best_key is not None else next(iter(od))
+
+
+def _adapt_q_for_key(key):
+    # Ghost-driven adaptation of protected size slru_q
+    # B1 hit -> decrease q (favor recency); B2 hit -> increase q (favor frequency)
+    global slru_q
+    cap = slru_capacity if slru_capacity is not None else 1
+    step_cap = max(1, cap // 8)
+
+    if key in ghost_B1:
+        b1 = max(1, len(ghost_B1))
+        b2 = len(ghost_B2)
+        delta = (b2 + b1 - 1) // b1  # ceil(|B2|/|B1|)
+        dec = min(step_cap, max(1, delta))
+        slru_q = max(0, slru_q - dec)
+        _skip_adapt_on_insert.add(key)
+    elif key in ghost_B2:
+        b2 = max(1, len(ghost_B2))
+        b1 = len(ghost_B1)
+        delta = (b1 + b2 - 1) // b2  # ceil(|B1|/|B2|)
+        inc = min(step_cap, max(1, delta))
+        slru_q = min(cap, slru_q + inc)
+        _skip_adapt_on_insert.add(key)
+
+
+def _choose_victim(cache_snapshot, obj_key):
+    # Prefer evicting from probation using LFU among LRU sample
+    sample_k = min(16, max(2, (slru_capacity if slru_capacity else 1) // 8))
+    if slru_prob:
+        return _pick_lfu_among_lru(slru_prob, sample_k)
+    # If probation empty, fall back to protected LRU with the same LFU sampling
+    if slru_prot:
+        return _pick_lfu_among_lru(slru_prot, sample_k)
+    # Fallback: any cache key
+    for k in cache_snapshot.cache.keys():
+        return k
+    return None
+
+
+def evict(cache_snapshot, obj):
+    '''
+    SLRU eviction:
+    - Adapt protected target size q using ghost hit signal for obj.
+    - Evict using LFU-sampled LRU from probation; if empty, from protected.
+    '''
+    _ensure_capacity(cache_snapshot)
+    _maybe_age(cache_snapshot)
+
+    # Keep metadata consistent
+    if (len(slru_prob) + len(slru_prot)) != len(cache_snapshot.cache):
+        _resync(cache_snapshot)
+
+    # Pre-adapt q based on ghost membership of incoming key
+    _adapt_q_for_key(obj.key)
+
+    # Choose victim
+    victim = _choose_victim(cache_snapshot, obj.key)
+
+    # Last-resort: oldest by timestamp, else arbitrary
+    if victim is None:
+        if m_key_timestamp and cache_snapshot.cache:
+            min_ts = float('inf')
+            best = None
+            for k in cache_snapshot.cache.keys():
+                ts = m_key_timestamp.get(k, float('inf'))
+                if ts < min_ts:
+                    min_ts = ts
+                    best = k
+            victim = best
+        if victim is None and cache_snapshot.cache:
+            victim = next(iter(cache_snapshot.cache.keys()))
+    return victim
+
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    On hit:
+    - Promote to protected if in probation; refresh MRU if already protected.
+    - If metadata drifted, place into protected.
+    - Maintain protected size by demoting its LRU to probation if it exceeds q.
+    - Bump TinyLFU counter and timestamp.
+    '''
+    _ensure_capacity(cache_snapshot)
+    _maybe_age(cache_snapshot)
+    key = obj.key
+
+    # Hit implies reuse
+    m_freq[key] = m_freq.get(key, 0) + 1
+
+    if key in slru_prob:
+        slru_prob.pop(key, None)
+        _move_to_mru(slru_prot, key)
+    elif key in slru_prot:
+        _move_to_mru(slru_prot, key)
+    else:
+        # Defensive: treat as protected on hit
+        _move_to_mru(slru_prot, key)
+
+    # Enforce protected size
+    while len(slru_prot) > slru_q and slru_prot:
+        demote = _pop_lru(slru_prot)
+        if demote is not None:
+            _move_to_mru(slru_prob, demote)
+
+    # Residents must not exist in ghosts
+    ghost_B1.pop(key, None)
+    ghost_B2.pop(key, None)
+    _trim_ghosts()
+
+    # Timestamp for fallback tie-breaking
+    m_key_timestamp[key] = cache_snapshot.access_count
+
+    # Keep metadata consistent if needed
+    if (len(slru_prob) + len(slru_prot)) != len(cache_snapshot.cache):
+        _resync(cache_snapshot)
+
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On insert (after miss):
+    - If key is in B1/B2, adapt q unless already done in evict, then place into protected MRU (reuse).
+    - Otherwise, insert into probation MRU.
+    - Enforce protected size by demotion if needed.
+    - Maintain ghosts disjoint and trim.
+    '''
+    _ensure_capacity(cache_snapshot)
+    _maybe_age(cache_snapshot)
+    key = obj.key
+    global slru_q
+
+    came_from_ghost = False
+
+    if key in _skip_adapt_on_insert:
+        # Adaptation already applied during evict
+        _skip_adapt_on_insert.discard(key)
+        if key in ghost_B1:
+            ghost_B1.pop(key, None)
+            came_from_ghost = True
+        if key in ghost_B2:
+            ghost_B2.pop(key, None)
+            came_from_ghost = True
+        _move_to_mru(slru_prot, key)
+    elif key in ghost_B1:
+        # Favor recency: decrease q then insert as protected (since it's a reuse)
+        cap = slru_capacity if slru_capacity is not None else 1
+        step_cap = max(1, cap // 8)
+        b1 = max(1, len(ghost_B1))
+        b2 = len(ghost_B2)
+        delta = (b2 + b1 - 1) // b1
+        dec = min(step_cap, max(1, delta))
+        slru_q = max(0, slru_q - dec)
+        ghost_B1.pop(key, None)
+        _move_to_mru(slru_prot, key)
+        came_from_ghost = True
+    elif key in ghost_B2:
+        # Favor frequency: increase q then insert as protected
+        cap = slru_capacity if slru_capacity is not None else 1
+        step_cap = max(1, cap // 8)
+        b2 = max(1, len(ghost_B2))
+        b1 = len(ghost_B1)
+        delta = (b1 + b2 - 1) // b2
+        inc = min(step_cap, max(1, delta))
+        slru_q = min(cap, slru_q + inc)
+        ghost_B2.pop(key, None)
+        _move_to_mru(slru_prot, key)
+        came_from_ghost = True
+    else:
+        # Brand new: probation path
+        _move_to_mru(slru_prob, key)
+
+    # Enforce protected size
+    while len(slru_prot) > slru_q and slru_prot:
+        demote = _pop_lru(slru_prot)
+        if demote is not None:
+            _move_to_mru(slru_prob, demote)
+
+    # Keep ghosts disjoint and trimmed
+    ghost_B1.pop(key, None)
+    ghost_B2.pop(key, None)
+    _trim_ghosts()
+
+    # Track time; bump frequency only for ghost re-admissions (clear reuse signal)
+    m_key_timestamp[key] = cache_snapshot.access_count
+    if came_from_ghost:
+        m_freq[key] = m_freq.get(key, 0) + 1
+
+    # Clamp q within [0, C]
+    slru_q = max(0, min(slru_q, slru_capacity if slru_capacity is not None else slru_q))
+
+    # Defensive resync
+    if (len(slru_prob) + len(slru_prot)) != len(cache_snapshot.cache):
+        _resync(cache_snapshot)
+
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    After physical eviction:
+    - Remove victim from SLRU segment and move to corresponding ghost.
+    - Keep ghosts disjoint and trimmed.
+    '''
+    _ensure_capacity(cache_snapshot)
+    _maybe_age(cache_snapshot)
+    k = evicted_obj.key
+
+    if k in slru_prob:
+        slru_prob.pop(k, None)
+        ghost_B2.pop(k, None)
+        _move_to_mru(ghost_B1, k)
+    elif k in slru_prot:
+        slru_prot.pop(k, None)
+        ghost_B1.pop(k, None)
+        _move_to_mru(ghost_B2, k)
+    else:
+        # Unknown membership: preserve any existing ghost preference; else default to B1
+        if k in ghost_B2:
+            ghost_B1.pop(k, None)
+            _move_to_mru(ghost_B2, k)
+        else:
+            ghost_B2.pop(k, None)
+            _move_to_mru(ghost_B1, k)
+
+    # Remove timestamp entry for evicted item to avoid unbounded growth
+    m_key_timestamp.pop(k, None)
+
+    _trim_ghosts()
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

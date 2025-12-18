@@ -1,0 +1,208 @@
+<NAME>
+arc_simplify_strict_and_gentle_p
+</NAME>
+
+<DESCRIPTION>
+I revert to a stricter, canonical ARC behavior and remove two extra heuristics that likely introduced instability across mixed workloads: the idle p-decay and the aggressive scan clamp based on a cold_streak counter. These heuristics can overreact and perturb p away from the ghost-driven optimum, harming traces that are not pure scans. I also reduce the p step cap to capacity//16 to make p adjustments gentler and avoid overshoot while still reacting immediately to ghost hits, which should stabilize performance across diverse traces. The changes are:
+- Remove decay_p_if_idle calls from fast paths (evict, hit, insert).
+- Simplify on_insert to adjust p only on ghost hits (pure ARC) and eliminate cold_streak-driven scan clamp.
+- Reduce p adjustment step cap from capacity//8 to capacity//16 for better stability.
+All other ARC invariants remain, including proportional ghost trimming and strict REPLACE semantics. This should lower miss rates by avoiding over-tuning p and preventing unnecessary oscillations, especially on mixes of scan-like and reuse-heavy traces.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    @classmethod
+    def on_insert(cls, cache_snapshot, key):
+        # Adjust ARC target p using ghost hints (damped), then admit
+        step_cap = max(1, cls.capacity // 8)  # cap adjustment magnitude
+        if key in cls.B1:
+            # Favor recency: increase p
+            inc = max(1, len(cls.B2) // max(1, len(cls.B1)))
+            cls.p = min(cls.capacity, cls.p + min(inc, step_cap))
+            cls.last_ghost_hit_access = cache_snapshot.access_count
+            cls.cold_streak = 0
+            cls.B1.pop(key, None)
+            cls.B2.pop(key, None)  # keep ghosts disjoint
+            # On return, insert to T2 (has shown reuse)
+            cls.move_to_mru(cls.T2, key)
+        elif key in cls.B2:
+            # Favor frequency: decrease p
+            dec = max(1, len(cls.B1) // max(1, len(cls.B2)))
+            cls.p = max(0, cls.p - min(dec, step_cap))
+            cls.last_ghost_hit_access = cache_snapshot.access_count
+            cls.cold_streak = 0
+            cls.B2.pop(key, None)
+            cls.B1.pop(key, None)  # keep ghosts disjoint
+            cls.move_to_mru(cls.T2, key)
+        else:
+            # Brand-new: insert into T1 (probationary)
+            cls.move_to_mru(cls.T1, key)
+            cls.cold_streak += 1
+            # Scan clamp: prolonged cold stream -> push p down
+            if cls.cold_streak > cls.capacity:
+                cls.p = max(0, cls.p - max(1, cls.capacity // 4))
+            # Ensure ghosts are disjoint from residents
+            cls.B1.pop(key, None)
+            cls.B2.pop(key, None)
+
+        cls.ts[key] = cache_snapshot.access_count
+        cls.trim_ghosts()
+        # Light consistency guard
+        if (len(cls.T1) + len(cls.T2)) != len(cache_snapshot.cache):
+            cls.resync(cache_snapshot)
+=======
+    @classmethod
+    def on_insert(cls, cache_snapshot, key):
+        # Adjust ARC target p using ghost hints (damped), then admit
+        step_cap = max(1, cls.capacity // 16)  # gentler cap to avoid overshoot
+        if key in cls.B1:
+            # Favor recency: increase p
+            inc = max(1, len(cls.B2) // max(1, len(cls.B1)))
+            cls.p = min(cls.capacity, cls.p + min(inc, step_cap))
+            cls.last_ghost_hit_access = cache_snapshot.access_count
+            cls.B1.pop(key, None)
+            cls.B2.pop(key, None)  # keep ghosts disjoint
+            # On return, insert to T2 (has shown reuse)
+            cls.move_to_mru(cls.T2, key)
+        elif key in cls.B2:
+            # Favor frequency: decrease p
+            dec = max(1, len(cls.B1) // max(1, len(cls.B2)))
+            cls.p = max(0, cls.p - min(dec, step_cap))
+            cls.last_ghost_hit_access = cache_snapshot.access_count
+            cls.B2.pop(key, None)
+            cls.B1.pop(key, None)  # keep ghosts disjoint
+            cls.move_to_mru(cls.T2, key)
+        else:
+            # Brand-new: insert into T1 (probationary)
+            cls.move_to_mru(cls.T1, key)
+            # Ensure ghosts are disjoint from residents
+            cls.B1.pop(key, None)
+            cls.B2.pop(key, None)
+
+        cls.ts[key] = cache_snapshot.access_count
+        cls.trim_ghosts()
+        # Light consistency guard
+        if (len(cls.T1) + len(cls.T2)) != len(cache_snapshot.cache):
+            cls.resync(cache_snapshot)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    ARCPlus.ensure_capacity(cache_snapshot)
+    # Keep metadata consistent and apply p-decay
+    if (len(ARCPlus.T1) + len(ARCPlus.T2)) != len(cache_snapshot.cache):
+        ARCPlus.resync(cache_snapshot)
+    ARCPlus.decay_p_if_idle(cache_snapshot)
+
+    candidate = ARCPlus.choose_victim(obj.key)
+    if candidate is not None:
+        return candidate
+    # Try to repair metadata and retry ARC replacement before falling back
+    ARCPlus.resync(cache_snapshot)
+    candidate = ARCPlus.choose_victim(obj.key)
+    if candidate is not None:
+        return candidate
+    # Fallback path
+    return ARCPlus.fallback_victim(cache_snapshot)
+=======
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    ARCPlus.ensure_capacity(cache_snapshot)
+    # Keep metadata consistent
+    if (len(ARCPlus.T1) + len(ARCPlus.T2)) != len(cache_snapshot.cache):
+        ARCPlus.resync(cache_snapshot)
+
+    candidate = ARCPlus.choose_victim(obj.key)
+    if candidate is not None:
+        return candidate
+    # Try to repair metadata and retry ARC replacement before falling back
+    ARCPlus.resync(cache_snapshot)
+    candidate = ARCPlus.choose_victim(obj.key)
+    if candidate is not None:
+        return candidate
+    # Fallback path
+    return ARCPlus.fallback_victim(cache_snapshot)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    ARCPlus.ensure_capacity(cache_snapshot)
+    ARCPlus.decay_p_if_idle(cache_snapshot)
+    ARCPlus.on_hit(cache_snapshot, obj.key)
+    # Post-condition consistency (rare)
+    if (len(ARCPlus.T1) + len(ARCPlus.T2)) != len(cache_snapshot.cache):
+        ARCPlus.resync(cache_snapshot)
+=======
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    ARCPlus.ensure_capacity(cache_snapshot)
+    ARCPlus.on_hit(cache_snapshot, obj.key)
+    # Post-condition consistency (rare)
+    if (len(ARCPlus.T1) + len(ARCPlus.T2)) != len(cache_snapshot.cache):
+        ARCPlus.resync(cache_snapshot)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    ARCPlus.ensure_capacity(cache_snapshot)
+    ARCPlus.decay_p_if_idle(cache_snapshot)
+    ARCPlus.on_insert(cache_snapshot, obj.key)
+=======
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    ARCPlus.ensure_capacity(cache_snapshot)
+    ARCPlus.on_insert(cache_snapshot, obj.key)
+>>>>>>> REPLACE
+
+</DIFF>

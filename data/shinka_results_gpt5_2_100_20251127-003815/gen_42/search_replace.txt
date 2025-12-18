@@ -1,0 +1,173 @@
+<NAME>
+conservative_tiny_lfu_and_gated_admission
+</NAME>
+
+<DESCRIPTION>
+I introduce three targeted improvements:
+
+1) Conservative TinyLFU updates: the Count-Min Sketch increment is changed to a conservative update (only counters at the current minimum are incremented). This reduces overestimation noise inherent to CMS and improves admission decisions, especially under skew and bursts.
+
+2) Capacity-aware sketch sizing: upon initialization or capacity change, the TinyLFU sketch is resized based on cache capacity (width ≈ next power-of-two of max(512, 4×capacity), d=4). This scales the sketch to the working set size and improves frequency estimation accuracy across different capacities.
+
+3) TinyLFU-gated admission from the window: when the window W exceeds its target, the LRU candidate from W is admitted into probationary M1 only if its estimated frequency is at least the sampled coldest in M1 plus a small bias (>= 1). Otherwise, the item stays in W and is refreshed. This reduces main cache pollution by recency bursts.
+
+Additionally, in eviction (choose_victim), I add small biases (+1 for M1, +2 for M2) to avoid churning main entries when the new item is not clearly hotter.
+
+These changes are minimal, consistent with the existing design, and directly target reducing unnecessary evictions and admissions that hurt hit rate.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def increment(self, key: str, amount: int = 1):
+        h = hash(key)
+        for i in range(self.d):
+            idx = self._hash(h, i)
+            v = self.tables[i][idx] + amount
+            if v > 255:
+                v = 255
+            self.tables[i][idx] = v
+        self._maybe_age()
+=======
+    def increment(self, key: str, amount: int = 1):
+        # Conservative update: increment only the minimum counters to reduce overestimation.
+        h = hash(key)
+        idxs = [self._hash(h, i) for i in range(self.d)]
+        vals = [self.tables[i][idxs[i]] for i in range(self.d)]
+        minv = min(vals) if vals else 0
+        for i in range(self.d):
+            if self.tables[i][idxs[i]] == minv:
+                v = self.tables[i][idxs[i]] + amount
+                if v > 255:
+                    v = 255
+                self.tables[i][idxs[i]] = v
+        self._maybe_age()
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        if self.capacity is None:
+            self.capacity = max(int(cap), 1)
+            self._sample_k = max(4, min(12, (self.capacity // 8) or 4))
+            # Age faster for smaller caches
+            try:
+                self.sketch.age_period = max(512, min(16384, self.capacity * 8))
+            except Exception:
+                pass
+            # Set adaptive tuning period relative to capacity
+            self.tune_period = max(256, self.capacity * 4)
+            self.last_tune_time = 0
+            return
+=======
+        if self.capacity is None:
+            self.capacity = max(int(cap), 1)
+            self._sample_k = max(4, min(12, (self.capacity // 8) or 4))
+            # Configure TinyLFU sketch width relative to capacity and age period
+            try:
+                target = max(512, self.capacity * 4)
+                wp = max(8, (target - 1).bit_length())
+                self.sketch = _CmSketch(width_power=wp, d=4)
+                self.sketch.age_period = max(512, min(16384, self.capacity * 8))
+            except Exception:
+                pass
+            # Set adaptive tuning period relative to capacity
+            self.tune_period = max(256, self.capacity * 4)
+            self.last_tune_time = 0
+            return
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        if self.capacity != cap:
+            # Reset segments if external capacity changes to avoid desync.
+            self.W.clear(); self.M1.clear(); self.M2.clear()
+            self.capacity = max(int(cap), 1)
+            self._sample_k = max(4, min(12, (self.capacity // 8) or 4))
+            try:
+                self.sketch.age_period = max(512, min(16384, self.capacity * 8))
+            except Exception:
+                pass
+            self.tune_period = max(256, self.capacity * 4)
+            self.last_tune_time = 0
+=======
+        if self.capacity != cap:
+            # Reset segments if external capacity changes to avoid desync.
+            self.W.clear(); self.M1.clear(); self.M2.clear()
+            self.capacity = max(int(cap), 1)
+            self._sample_k = max(4, min(12, (self.capacity // 8) or 4))
+            try:
+                target = max(512, self.capacity * 4)
+                wp = max(8, (target - 1).bit_length())
+                self.sketch = _CmSketch(width_power=wp, d=4)
+                self.sketch.age_period = max(512, min(16384, self.capacity * 8))
+            except Exception:
+                pass
+            self.tune_period = max(256, self.capacity * 4)
+            self.last_tune_time = 0
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        f_new = self.sketch.estimate(new_obj.key)
+        f_m1 = self.sketch.estimate(cand_m1) if cand_m1 is not None else -1
+        f_m2 = self.sketch.estimate(cand_m2) if cand_m2 is not None else -1
+
+        # Prefer replacing a cold M1 entry if new is hotter
+        if cand_m1 is not None and f_new > f_m1:
+            return cand_m1
+
+        # Otherwise evict from the window to preserve main
+        if cand_w is not None:
+            return cand_w
+
+        # If no window, consider replacing a cold protected entry if new is hotter
+        if cand_m2 is not None and f_new > f_m2:
+            return cand_m2
+=======
+        f_new = self.sketch.estimate(new_obj.key)
+        f_m1 = self.sketch.estimate(cand_m1) if cand_m1 is not None else -1
+        f_m2 = self.sketch.estimate(cand_m2) if cand_m2 is not None else -1
+        bias_m1 = 1
+        bias_m2 = 2
+
+        # Prefer replacing a cold M1 entry if new is clearly hotter
+        if cand_m1 is not None and f_new > (f_m1 + bias_m1):
+            return cand_m1
+
+        # Otherwise evict from the window to preserve main
+        if cand_w is not None:
+            return cand_w
+
+        # If no window, consider replacing a cold protected entry if new is clearly hotter
+        if cand_m2 is not None and f_new > (f_m2 + bias_m2):
+            return cand_m2
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        if len(self.W) > w_tgt:
+            w_lru = self._lru(self.W)
+            if w_lru is not None and w_lru != key:
+                self.W.pop(w_lru, None)
+                # Move into M1 probationary
+                self._touch(self.M1, w_lru)
+=======
+        if len(self.W) > w_tgt:
+            w_lru = self._lru(self.W)
+            if w_lru is not None and w_lru != key:
+                # TinyLFU-gated admission into probationary M1
+                cand_m1 = self._sample_lru_min_freq(self.M1)
+                f_w = self.sketch.estimate(w_lru)
+                f_m1 = self.sketch.estimate(cand_m1) if cand_m1 is not None else -1
+                if f_w >= (f_m1 + 1):
+                    self.W.pop(w_lru, None)
+                    self._touch(self.M1, w_lru)
+                else:
+                    # Keep in window; refresh to MRU to avoid immediate churn
+                    self._touch(self.W, w_lru)
+>>>>>>> REPLACE
+
+</DIFF>

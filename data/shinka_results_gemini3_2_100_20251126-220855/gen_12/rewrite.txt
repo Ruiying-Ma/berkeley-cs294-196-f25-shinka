@@ -1,0 +1,190 @@
+# EVOLVE-BLOCK-START
+"""Cache eviction algorithm using Simplified LIRS (Low Inter-reference Recency Set) logic."""
+
+from collections import OrderedDict
+
+# Global LIRS State
+m_stack = OrderedDict()  # S: Recency stack (Keys -> None). Tracks LIR and Ghost/HIR.
+m_q = OrderedDict()      # Q: Resident HIR blocks (Keys -> None). Eviction candidates.
+m_lir = set()            # Set of keys that are LIR (resident and 'hot')
+m_last_access_count = 0
+m_h_lir_target = 1       # Target capacity for LIR blocks
+m_s_max_size = 100       # Maximum size of Stack S
+
+def check_reset(cache_snapshot):
+    '''Reset global state if a new trace is detected or capacity changes.'''
+    global m_stack, m_q, m_lir, m_last_access_count, m_h_lir_target, m_s_max_size
+    
+    # Detect trace change via timestamp reset
+    if cache_snapshot.access_count < m_last_access_count:
+        m_stack.clear()
+        m_q.clear()
+        m_lir.clear()
+    m_last_access_count = cache_snapshot.access_count
+    
+    # Configure limits based on current capacity
+    cap = cache_snapshot.capacity
+    # LIRS typical tuning: 90-99% LIR.
+    # We use 95% to allow 5% buffer for new items (Q).
+    m_h_lir_target = max(1, int(cap * 0.95))
+    # Stack limit to prevent unbounded growth on scans. 3x cache size is usually sufficient.
+    m_s_max_size = cap * 3
+
+def prune_stack():
+    '''
+    Maintains the LIRS Stack invariant: The bottom of the stack must be a LIR block.
+    Removes any HIR (Resident or Ghost) blocks from the bottom until a LIR block is found
+    or the stack is empty.
+    '''
+    global m_stack, m_lir
+    while m_stack:
+        # Peek at bottom (first item)
+        k = next(iter(m_stack))
+        if k not in m_lir:
+            # It's HIR (resident or ghost), remove it from stack history
+            m_stack.popitem(last=False)
+        else:
+            # Found a LIR block, stop pruning
+            break
+
+def evict(cache_snapshot, obj):
+    '''
+    Determines eviction victim.
+    Strategy:
+    1. Evict from Q (Resident HIR). These are cold/probationary blocks.
+    2. If Q is empty (rare, implies cache full of LIR), evict bottom LIR from Stack.
+    '''
+    check_reset(cache_snapshot)
+    global m_q, m_stack
+    
+    if m_q:
+        return next(iter(m_q))
+    elif m_stack:
+        # Q empty, stack bottom is guaranteed LIR due to pruning
+        return next(iter(m_stack))
+    else:
+        # Fallback for safety, though stack shouldn't be empty if cache is full
+        return next(iter(cache_snapshot.cache))
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    Update LIRS metadata on cache hit.
+    '''
+    check_reset(cache_snapshot)
+    global m_stack, m_q, m_lir, m_h_lir_target, m_s_max_size
+    
+    key = obj.key
+    is_in_stack = key in m_stack
+    
+    # 1. Update Recency: Move to top of Stack S
+    if is_in_stack:
+        m_stack.move_to_end(key)
+    else:
+        m_stack[key] = None
+        
+    # 2. Update Status
+    if key in m_lir:
+        # Case: Hit on LIR
+        # Prune stack in case this LIR was at the bottom
+        prune_stack()
+        
+    elif key in m_q:
+        # Case: Hit on Resident HIR
+        if is_in_stack:
+            # It was in Stack S -> It is hot (short IRR) -> Promote to LIR
+            m_lir.add(key)
+            del m_q[key] # Remove from Q
+            
+            # If LIR set exceeds target, demote the coldest LIR
+            if len(m_lir) > m_h_lir_target:
+                prune_stack() # Ensure bottom is LIR
+                if m_stack:
+                    bottom_lir = next(iter(m_stack))
+                    m_lir.remove(bottom_lir)
+                    # Move demoted LIR to Q (becomes Resident HIR)
+                    m_q[bottom_lir] = None
+                    m_q.move_to_end(bottom_lir) # MRU in Q
+                    # Note: It will be pruned from stack in next prune_stack call/loop
+            prune_stack()
+        else:
+            # Not in Stack S -> Still Cold/Probation -> Keep in Q but move to MRU
+            m_q.move_to_end(key)
+            
+    # 3. Stack Size Safety Check
+    if len(m_stack) > m_s_max_size:
+        # Stack too big, force remove bottom entry
+        k, _ = m_stack.popitem(last=False)
+        if k in m_lir:
+            # If we forced out a LIR, it loses LIR status
+            m_lir.remove(k)
+            # If resident, move to Q
+            if k in cache_snapshot.cache and k not in m_q:
+                m_q[k] = None
+                m_q.move_to_end(k)
+        prune_stack()
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Update LIRS metadata on cache insert (Miss).
+    '''
+    check_reset(cache_snapshot)
+    global m_stack, m_q, m_lir, m_h_lir_target, m_s_max_size
+    
+    key = obj.key
+    is_in_stack = key in m_stack
+    
+    # Add to Stack S
+    if is_in_stack:
+        m_stack.move_to_end(key)
+    else:
+        m_stack[key] = None
+        
+    if is_in_stack:
+        # Case: Ghost Hit (Non-resident HIR found in Stack)
+        # It had a short IRR (within stack lifetime) -> Promote to LIR
+        m_lir.add(key)
+        
+        # Enforce LIR limit
+        if len(m_lir) > m_h_lir_target:
+            prune_stack()
+            if m_stack:
+                bottom_lir = next(iter(m_stack))
+                m_lir.remove(bottom_lir)
+                m_q[bottom_lir] = None
+                m_q.move_to_end(bottom_lir)
+        prune_stack()
+    else:
+        # Case: Cold Miss -> Insert as Resident HIR in Q
+        m_q[key] = None
+        m_q.move_to_end(key)
+        
+    # Stack Size Safety Check
+    if len(m_stack) > m_s_max_size:
+        k, _ = m_stack.popitem(last=False)
+        if k in m_lir:
+            m_lir.remove(k)
+            if k in cache_snapshot.cache and k not in m_q:
+                m_q[k] = None
+                m_q.move_to_end(k)
+        prune_stack()
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Update state after eviction.
+    '''
+    check_reset(cache_snapshot)
+    global m_q, m_lir
+    
+    key = evicted_obj.key
+    # Remove from Q if present
+    if key in m_q:
+        del m_q[key]
+    # Remove from LIR if present (rare, only if Q was empty)
+    if key in m_lir:
+        m_lir.remove(key)
+    
+    # Note: We do NOT remove from m_stack. 
+    # It remains as a "Ghost" (Non-resident HIR) to track recency.
+    # It will be removed from stack eventually via prune_stack or max size limit.
+
+# EVOLVE-BLOCK-END

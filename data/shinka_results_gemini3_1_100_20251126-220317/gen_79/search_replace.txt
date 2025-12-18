@@ -1,0 +1,170 @@
+<NAME>
+density_tinylfu_tuned
+</NAME>
+
+<DESCRIPTION>
+Optimizes the W-TinyLFU implementation by introducing density-aware eviction and tuning control parameters.
+1.  **Density-Aware Eviction**: Modifies the eviction policy to consider object size. Instead of comparing raw frequencies (`freq`), it compares frequency density (`freq / size`). This prioritizes keeping small, frequently accessed items over large items with similar frequency, effectively packing more "hits" into the cache capacity.
+2.  **Tuned Aging & Doorkeeper**:
+    *   **Faster Aging**: Reduces the aging interval from 10x to 5x capacity. This allows the cache to adapt more quickly to changing workload phases.
+    *   **Frequent Doorkeeper Reset**: Resets the Doorkeeper bloom filter every 2x capacity (down from 5x). This clears noise and "one-hit wonder" history more aggressively, improving scan resistance.
+    *   **Higher Frequency Resolution**: Increases the maximum frequency count from 15 to 31, providing finer granularity for the density-based comparison.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def _update_freq(key, capacity):
+    state = algo_state
+
+    # Aging Mechanism
+    state['aging_counter'] += 1
+    # Age frequencies every 10x capacity to adapt to phase changes (slower decay)
+    if state['aging_counter'] >= capacity * 10:
+        state['aging_counter'] = 0
+        # Halve frequencies
+        rem = []
+        for k, v in state['freq'].items():
+            nv = v // 2
+            if nv == 0: rem.append(k)
+            else: state['freq'][k] = nv
+        for k in rem: del state['freq'][k]
+
+    # Doorkeeper Management
+    # Reset Doorkeeper when it grows too large to maintain filter effectiveness
+    if len(state['doorkeeper']) > capacity * 5:
+        state['doorkeeper'].clear()
+
+    # Frequency Update
+    if key in state['freq']:
+        state['freq'][key] = min(state['freq'][key] + 1, 15)
+    elif key in state['doorkeeper']:
+        state['doorkeeper'].remove(key)
+        state['freq'][key] = 2
+    else:
+        state['doorkeeper'].add(key)
+=======
+def _update_freq(key, capacity):
+    state = algo_state
+
+    # Aging Mechanism
+    state['aging_counter'] += 1
+    # Age frequencies every 5x capacity for faster adaptation
+    if state['aging_counter'] >= capacity * 5:
+        state['aging_counter'] = 0
+        # Halve frequencies
+        rem = []
+        for k, v in state['freq'].items():
+            nv = v // 2
+            if nv == 0: rem.append(k)
+            else: state['freq'][k] = nv
+        for k in rem: del state['freq'][k]
+
+    # Doorkeeper Management
+    # Reset Doorkeeper frequently to reduce noise and scan impact
+    if len(state['doorkeeper']) > capacity * 2:
+        state['doorkeeper'].clear()
+
+    # Frequency Update
+    if key in state['freq']:
+        state['freq'][key] = min(state['freq'][key] + 1, 31)
+    elif key in state['doorkeeper']:
+        state['doorkeeper'].remove(key)
+        state['freq'][key] = 2
+    else:
+        state['doorkeeper'].add(key)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    _check_reset(cache_snapshot)
+    state = algo_state
+    capacity = cache_snapshot.capacity
+    w_cap = max(1, int(capacity * 0.01))
+
+    # Identify Candidates (LRU is at the beginning of OrderedDict)
+    cand_w_key = next(iter(state['window'])) if state['window'] else None
+    cand_m_key = None
+    if state['probation']:
+        cand_m_key = next(iter(state['probation']))
+    elif state['protected']:
+        cand_m_key = next(iter(state['protected']))
+
+    # Fail-safe
+    if cand_w_key is None and cand_m_key is None:
+        return None
+    if cand_w_key is None:
+        return cand_m_key
+    if cand_m_key is None:
+        return cand_w_key
+
+    fw = _get_freq(cand_w_key)
+    fm = _get_freq(cand_m_key)
+
+    # 1. Window Growing Phase
+    # Ideally, we evict Main to let Window grow.
+    # Exception: If Main victim is valuable (fm > fw), sacrifice Window instead.
+    if state['w_size'] < w_cap:
+        if fm > fw:
+            return cand_w_key
+        return cand_m_key
+
+    # 2. Window Full - Duel
+    # Bias towards Main: Evict Window unless Window candidate is strictly better + bias.
+    # This protects established Main items from churn.
+    if fw > fm + 1:
+        return cand_m_key
+    else:
+        return cand_w_key
+=======
+def evict(cache_snapshot, obj):
+    _check_reset(cache_snapshot)
+    state = algo_state
+    capacity = cache_snapshot.capacity
+    w_cap = max(1, int(capacity * 0.01))
+
+    # Identify Candidates (LRU is at the beginning of OrderedDict)
+    cand_w_key = next(iter(state['window'])) if state['window'] else None
+    cand_m_key = None
+    if state['probation']:
+        cand_m_key = next(iter(state['probation']))
+    elif state['protected']:
+        cand_m_key = next(iter(state['protected']))
+
+    # Fail-safe
+    if cand_w_key is None and cand_m_key is None:
+        return None
+    if cand_w_key is None:
+        return cand_m_key
+    if cand_m_key is None:
+        return cand_w_key
+
+    fw = _get_freq(cand_w_key)
+    fm = _get_freq(cand_m_key)
+
+    # Get sizes for density calculation
+    sw = state['window'][cand_w_key]
+    if cand_m_key in state['probation']:
+        sm = state['probation'][cand_m_key]
+    else:
+        sm = state['protected'][cand_m_key]
+
+    # Calculate Density Scores (Freq / Size)
+    # We compare fw/sw vs fm/sm <=> fw * sm vs fm * sw
+    score_w = fw * sm
+    score_m = fm * sw
+
+    # 1. Window Growing Phase
+    if state['w_size'] < w_cap:
+        # If Main victim is strictly better density, evict Window
+        if score_m > score_w:
+            return cand_w_key
+        return cand_m_key
+
+    # 2. Window Full - Duel
+    # Evict the one with lower density.
+    # Tie-breaker: Prefer evicting Window to protect Main.
+    if score_w > score_m:
+        return cand_m_key
+    else:
+        return cand_w_key
+>>>>>>> REPLACE
+</DIFF>

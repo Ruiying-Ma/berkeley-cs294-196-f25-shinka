@@ -1,0 +1,117 @@
+# INDIVIDUAL PROGRAM SUMMARIES
+
+The following are summaries of individual programs evaluated since the last meta update:
+
+**Program Name: Timestamp-based LRU Cache Eviction**
+- **Implementation**: Maintains a global map of last-access timestamps (via cache_snapshot.access_count) per key and evicts the cached key with the minimum timestamp, breaking ties by cache iteration order. Metadata is updated on hits/inserts by setting the timestamp and removed on eviction.
+- **Performance**: Combined score 0.21 across 48 traces, with hit rates ranging from 0.0000 to 0.8680.
+- **Feedback**: Behaves as a classic LRU—strong on temporal locality, weak on scans or oversized working sets. Eviction is O(n) due to scanning timestamps and has arbitrary tie-breaking, which can slightly affect consistency across workloads.
+**Program Identifier:** Generation 0 - Patch Name initial_program - Correct Program: True
+
+**Program Name: Segmented LRU with Probation/Protected**
+- **Implementation**: Two-segment LRU with a 66% protected partition and probation preferred for eviction; LRU victims are chosen by timestamp among in-cache keys. On hit, items in probation are promoted to protected, and the protected LRU is demoted when over capacity; timestamps use access_count and a legacy ledger is maintained.
+- **Performance**: Combined score 0.23 across 48 traces, with hit rates ranging 0.0–0.875 (strong on locality-heavy traces 27/28/34/38, weak on scan-like 13–16/32).
+- **Feedback**: Probation-first eviction and promotion-on-second-touch effectively preserve re-referenced items. However, the static 66/34 split, lack of probation trimming/dynamic adaptation, and auto-protect on metadata misses can lead to pollution and poor results on scans or rapidly shifting workloads.
+**Program Identifier:** Generation 1 - Patch Name slru_promotion_with_demotions - Correct Program: True
+
+**Program Name: Decayed LFU with Ghost Bias**
+- **Implementation**: Uses exponential decay of per-key frequency with a capacity-scaled half-life (~1.5× capacity), lazy score refresh on hits, and evicts the minimum decayed score with LRU tiebreak; a bounded ghost history boosts admission (base 1.2 vs 0.3) for recently evicted keys.
+- **Performance**: Combined score 0.23 across 48 traces, with hit rates spanning 0.0000–0.8778.
+- **Feedback**: Strong on locality-rich/recurring workloads but weak on scans and one-hit streams; tuning the half-life and admission base, or clearing ghost entries on re-admission, could reduce pollution and improve low-rate traces.
+**Program Identifier:** Generation 2 - Patch Name decaylfu_ghost - Correct Program: True
+
+**Program Name: ARC-based cache eviction**
+- **Implementation**: Implements ARC with T1/T2 (resident) and B1/B2 (ghost) as OrderedDict LRU lists, plus a global arc_p target for T1 size. Eviction follows ARC’s replace() rule with ghost-informed adaptation, stale-key cleanup, and ghost lists bounded to 2×capacity.
+- **Performance**: Combined score 0.13 across 48 traces, with hit rates ranging from 0.0 to 0.62 (strong on several high-locality traces, weak on others).
+- **Feedback**: arc_p is adapted on ghost hits in both evict and update_after_insert, likely double-adjusting and destabilizing the target; consolidating adaptation to a single step would improve control. Missing full ARC capacity/ghost invariant handling may limit robustness, though ghost tracking and T1→T2 promotion provide clear benefits on frequency-friendly workloads.
+**Program Identifier:** Generation 3 - Patch Name arc_adaptive_reuse - Correct Program: True
+
+**Program Name: Adaptive SLRU with dynamic protected fraction**
+- **Implementation**: Two-segment SLRU using OrderedDicts tracks probation (seen-once) and protected (hit-promoted) with LRU ordering; eviction prefers probation LRU, while rebalancing demotes protected LRU to meet a target protected fraction. The protected fraction adapts by ±0.02 (bounded 0.05–0.95), increasing on promotion hits and decreasing when evicting from protected; metadata is synced to the cache snapshot and stale entries are pruned.
+- **Performance**: Combined score 0.23 over 48 traces; per-trace hit rates varied widely (0.0–0.8874), with strong results on locality-rich traces and weak results on low-reuse/scan workloads.
+- **Feedback**: The scan-resistant probation-first eviction and promotion-on-hit help workloads with reuse, but small caches and scans suffer, partly due to integer-rounded protected targets and aggressive protected sizing. Global mutable state (segments and protected fraction) persists across runs, risking cross-trace contamination; reset metadata per run and consider gentler or workload-capped adaptation.
+**Program Identifier:** Generation 4 - Patch Name slru_with_adaptive_protected_ratio - Correct Program: True
+
+**Program Name: Segmented LRU (2Q-like) Eviction**
+- **Implementation**: Maintains probationary and protected sets with per-key last-access timestamps; new inserts start in probation and are promoted to protected on first hit. Eviction chooses the oldest by timestamp, preferring probation; metadata is pruned to match the current cache.
+- **Performance**: Combined score 0.23 over 48 traces (max 0.8874, min 0.0), strong on locality-heavy traces (e.g., 27: 0.7031, 28: 0.8874, 34: 0.7001, 38: 0.6342) but weak on many others.
+- **Feedback**: Probation-first eviction provides scan resistance and benefits repeated-locality workloads, but no explicit segment sizing or ghost queues plus promote-on-first-hit can over-protect items, harming recency-heavy/churny traces. Using oldest-by-timestamp over sets (no true LRU queues) limits adaptation, reflected by numerous sub-0.1 hit rates.
+**Program Identifier:** Generation 5 - Patch Name segmented_lru_2q - Correct Program: True
+
+**Program Name: Adaptive Segmented LRU with ARC-style ghosts**
+- **Implementation**: Two live segments (probation/protected) and two ghost lists (probation/protected) are tracked with per-key timestamps; the protected segment target size adapts via ghost hits and small promotion-driven increments. Eviction prefers the oldest in probation, then protected, with quota-enforced demotions and ghost lists trimmed to capacity.
+- **Performance**: Combined score 0.22 across 48 traces, with hit rates ranging from 0.0000 to 0.8860 (strong on reuse-heavy traces, weak on many others).
+- **Feedback**: Ghost feedback improves frequency sensitivity, but promoting unknown keys to protected and conservative adaptation can over-protect and reduce scan resistance, reflected in many low-hit traces. The set-based segments without strict per-segment LRU ordering may limit responsiveness compared to a full ARC implementation.
+**Program Identifier:** Generation 6 - Patch Name adaptive_slru_arc_ghosts - Correct Program: True
+
+**Program Name: Decayed LFU SLRU with Ghost Admission**
+- **Implementation**: Uses exponentially decayed LFU scores (half-life ≈ 1.5×capacity) with lazy per-key updates and a two-segment SLRU (80% protected). Evicts LRU from probation (tiebreak by lower decayed score) or the lowest decayed score from protected; ghost history biases recent evictees to be reinserted with higher base score directly into protected.
+- **Performance**: Combined score 0.24 over 48 traces; strong on locality-heavy traces (peaks up to 0.8872) but many traces remain low (≈0–0.1).
+- **Feedback**: Large protected ratio plus ghost-biased admission benefits bursty/repeating workloads but hurts scans and fast churn. Capacity-scaled half-life and demotion by last_update may overprotect stale items; tuning protected ratio/half-life or tightening admission could improve robustness.
+**Program Identifier:** Generation 7 - Patch Name slru_with_freq_tiebreak_and_ghost_bias - Correct Program: True
+
+**Program Name: Adaptive Segmented LRU with Ghost Histories**
+- **Implementation**: Two-segment LRU (probation/protected) with ghost histories guides an adaptive protected ratio; metadata uses timestamped dicts, LRU victim selection scans segments, and ghosts are bounded to 2×capacity. Hits promote to protected, inserts default to probation unless seen in protected-ghost, and evictions feed corresponding ghosts to steer future ratio adjustments.
+- **Performance**: Combined score 0.22; hit rates vary widely (0.00–0.88), strong on locality-rich traces (e.g., 0.8787) but weak on scan/high-churn workloads.
+- **Feedback**: The initial protected bias (0.66) plus admitting metadata-miss hits to protected likely over-favors frequency, hurting scan resistance; the capacity-scaled adaptation step may be too slow to correct under rapid pattern shifts. Strengthening probation and faster ratio adjustment could improve low-locality cases without degrading reuse-heavy workloads.
+**Program Identifier:** Generation 8 - Patch Name slru_adaptive_ghosts - Correct Program: True
+
+**Program Name: Adaptive Segmented LRU with Ghost Histories**
+- **Implementation**: ARC-inspired two-segment (probation/protected) LRU with ghost histories guides an adaptive protected ratio (clamped 0.1–0.9). Admissions send ghost hits directly to protected, hits promote probation→protected, demotions enforce segment caps, and eviction selects LRU within the chosen segment based on ghost hints or target sizes; ghost lists are bounded at 2× capacity.
+- **Performance**: Combined score 0.24, with high hit rates on repetition-heavy traces (peaks ~0.87) but poor on scan/one-timer workloads (down to 0.0–0.1).
+- **Feedback**: The strong frequency bias (initial 0.66 plus promotions and protected-on-ghost admission) benefits reuse-heavy patterns but weakens scan resistance; moderating protected bias or refining admission could improve balance. LRU-in-cache victim selection and ghost trimming are safe, though metadata/cache divergence triggers a fallback victim choice that may be suboptimal.
+**Program Identifier:** Generation 9 - Patch Name adaptive_slru_ghost_guided - Correct Program: True
+
+# GLOBAL INSIGHTS SCRATCHPAD
+
+The following are global insights about optimization approaches and their effectiveness:
+
+## Successful Algorithmic Patterns
+- Decayed-LFU + SLRU hybrid with ghost-biased admission achieved the top score (Decayed LFU SLRU with Ghost Admission, 0.24). Key ingredients:
+  - Capacity-scaled exponential decay (~1.5×capacity half-life) with lazy score refresh to balance recency and frequency.
+  - SLRU segmentation with probation-first eviction (LRU in probation, frequency-based in protected) to maintain scan resistance while preserving frequently reused items.
+  - Ghost-admission bias: re-admission with higher base score (1.2 vs 0.3) and direct placement into protected when recently evicted, improving reuse-heavy workloads (e.g., traces 27/28/34/38 with 0.7269/0.8872/0.7546/0.6342).
+- Segmented LRU (2Q/SLRU) with promotion on hit is consistently strong on locality-rich traces (several variants at 0.23: Generation 1, 4, 5, 7, 8), confirming the value of probation-first eviction and retaining items after second touch.
+- Ghost histories as admission signals help frequency sensitivity (Generation 2 at 0.23; Generation 6 at 0.22; Generation 9 at 0.24), especially when they steer protected insertions or raise initial scores.
+
+## Ineffective Approaches
+- ARC implementation issues: Double-adapting arc_p during both evict and update destabilized target sizing, producing a much lower score (ARC-based cache eviction, 0.13). Missing full ARC invariants further reduced robustness.
+- Over-aggressive protection and frequency bias can harm scan resistance:
+  - Static high protected fractions (e.g., 66% in Generation 1; 80% in current best) and protected-on-ghost admission (Generation 9, 0.24; Generation 8, 0.22) correlate with many sub-0.1 hit rates on scan/one-timer traces (e.g., 13–16/32).
+- Set-based segments with O(n) victim selection and arbitrary tie-breaking limit responsiveness:
+  - Timestamp scanning for LRU/score decisions (seen across LRU baseline at 0.21 and SLRU variants at 0.22–0.24) leads to inconsistent behavior and overhead; numerous traces show very low hit rates (e.g., current best: 13–19/22/24/29–33/37 mostly ≤0.06).
+- Global mutable state across runs risks cross-trace contamination (Generation 4 feedback), undermining result stability in multi-trace scenarios.
+
+## Implementation Insights
+- What makes the current best effective (Decayed LFU SLRU with Ghost Admission, 0.24):
+  - Lazy exponential decay keyed by access_count and stored last_update enables cheap, on-demand score computation that adapts to capacity (half-life ≈ 1.5×capacity). This balances recency/frequency and boosts repetition-heavy traces (e.g., trace_28 = 0.8872).
+  - SLRU segments use complementary selection: probation evicts by (last_update, score) to prefer oldest and secondarily lowest-frequency; protected evicts by lowest decayed score with LRU tiebreak. This preserves frequent items while keeping scans in probation where possible.
+  - Ghost admission with time threshold tied to half-life: recent evictees within the decay window get higher base scores and direct-to-protected placement, capturing beneficial reuse without fully open admission.
+  - Enforced protected cap with demotions based on oldest last_update prevents unbounded protected growth; ghost size is bounded (up to 50×capacity) to avoid metadata blow-up while retaining mid-horizon history.
+- Across programs, consistent patterns with measurable impact:
+  - Promotion-on-hit (Generation 1/5/6/7/8/9) and probation-first eviction correlate with better locality exploitation (0.22–0.24 vs pure LRU 0.21).
+  - Frequency-aware tiebreaking or protected eviction (Generation 7/2) increases peak hit rates on recurring workloads (peaks ~0.887) compared to pure recency policies.
+
+## Performance Analysis
+- Score trends:
+  - Baseline LRU (0.21) improves to 0.23 with SLRU segmentation and to 0.24 when augmented with decayed LFU scoring and ghost-biased admission (current best). ARC underperformed at 0.13 due to adaptation bugs.
+- Comparative behavior:
+  - All SLRU/2Q-like variants (0.22–0.24) excel on locality-rich traces (e.g., current best: 27=0.7269, 28=0.8872, 34=0.7546, 38=0.6342) but falter on scans and one-hit streams (e.g., 13–19 mostly ≤0.05, 14=0.0, 32=0.0266).
+  - Decayed LFU with ghosts (Generation 2, 0.23) is strengthened by adding SLRU segmentation and protected-biased admission (Generation 7 current best, 0.24), indicating complementary benefits of segment-level recency control and frequency tracking.
+  - Adaptive SLRU with ghosts (Generations 6/8/9 at 0.22–0.24) shows that ghost-guided adaptation helps but can over-favor protected admission, lowering scan resistance; the best results come from combining frequency-aware eviction within segments and conservative, time-bounded ghost admission.
+- Correlations:
+  - Higher protected bias increases peaks on reuse-heavy traces but correlates with more near-zero traces under scans/churn. Frequency-aware protected eviction mitigates some overprotection by evicting the coldest “frequent” entries.
+
+# META RECOMMENDATIONS
+
+The following are actionable recommendations for the next program generations:
+
+1. Make the protected fraction adaptive using ghost/promotion feedback. Maintain short-window counters (e.g., over the last 5–10×capacity accesses) for: ghost re-references within half-life, probation→protected promotions, and unique-insert rate. Adjust _PROTECTED_RATIO by ±0.05 per window: increase when ghost-hit-rate > 0.15 or promotion-rate > 0.25 (cap at 0.7), decrease when unique-insert-rate > 0.6 and recent hit-rate < 0.2 (floor at 0.2) to improve scan resistance without sacrificing reuse-heavy peaks.
+
+2. Tighten ghost-biased admission with segment-awareness and stricter recency thresholds. Record at eviction whether a key was in protected vs probation and increment a ghost touch count; on re-admission, place directly into protected only if it was previously protected and re-referenced within 0.5×half-life, otherwise insert into probation with a moderate boost (base ≈ 0.7 instead of 1.2). Additionally, under detected-scan mode (high unique-insert-rate), require two touches (decayed score ≥ 2.0) before promoting from probation to protected.
+
+3. Add a lightweight admission guard by comparing against the last victim’s strength. When evicting, compute and store the evicted key’s decayed score as last_victim_score; at the subsequent insert, if the incoming key lacks a recent ghost and last_victim_score is high (e.g., > 2.0), seed the new key with base = 0.0 in probation so it’s preferentially evicted next. This simulates TinyLFU-style “admit by merit” without bypassing insertion, reducing pollution from one-timers.
+
+4. Replace O(n) scans with efficient structures to stabilize decisions and reduce overhead. Use an OrderedDict (or linked-list) for probation to get true LRU in O(1) for hits/moves and eviction, and a lazy heap (heapq of (decayed_score, last_update, key)) for protected to evict the coldest by decayed score with LRU tiebreak, discarding stale heap entries on pop. This addresses the observed inconsistency from full-set scans while preserving the current decayed-LFU + SLRU behavior.
+
+5. Adapt the decay half-life and proactively cool protected on low scores. Start with half-life = 1.5×capacity, then adjust every window: shorten toward 0.8×capacity when churn (inserts/accesses) is high and hit-rate low, and lengthen toward 2.5×capacity when promotion-rate and ghost-hit-rate are high. In addition, periodically demote from protected any entries whose current decayed score falls below a small threshold (e.g., < 0.3) or below the 20th percentile of protected scores, preventing overprotection during scans without losing frequently reused items.

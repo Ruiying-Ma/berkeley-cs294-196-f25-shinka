@@ -1,0 +1,238 @@
+<NAME>
+recent_hit_second_chance
+</NAME>
+
+<DESCRIPTION>
+I introduce a lightweight “second chance” shield for recently hit items to reduce harmful evictions without hurting scan resistance. Concretely:
+
+- Track last-hit timestamps in a small map (recent_hit_marks) updated only on hits, not on inserts. This avoids protecting brand-new items during scans.
+- During eviction selection, skip items recently hit within a short window (min(8, C//8)) when choosing the LRU victim from T1 or T2, and in ghost-informed fallbacks. If all candidates are protected, we fall back to the LRU to keep progress deterministic.
+- Clean up recent-hit markers on evictions and explicitly clear any marker on insert to avoid misprotection.
+
+This adds a light CLOCK-like “ref bit” behavior layered on ARC, improving stability on recency-heavy workloads and mixed phases, while keeping the existing ARC/scan-guard logic intact. It should boost hit rates where rapid reuses were previously evicted prematurely, and not penalize scan/uniform traces since inserts don’t get protected.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+# Track which list the eviction candidate was chosen from to ensure correct ghosting
+last_replaced_from = None   # 'T1' or 'T2'
+=======
+# Track which list the eviction candidate was chosen from to ensure correct ghosting
+last_replaced_from = None   # 'T1' or 'T2'
+
+# Track only last-hit times (not inserts) to give a short second-chance protection
+recent_hit_marks = dict()
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def _guard_window(C):
+    # Short, gentle guard window length
+    return min(8, max(1, C // 16))
+=======
+def _guard_window(C):
+    # Short, gentle guard window length
+    return min(8, max(1, C // 16))
+
+
+def _recent_window(C):
+    # Protection window for recently-hit items (short, scales with C)
+    return min(8, max(1, C // 8))
+
+
+def _is_recently_hit(key, now):
+    # Only protect items that were actually hit recently; brand-new inserts are not protected
+    if not recent_hit_marks:
+        return False
+    C = arc_capacity if arc_capacity else 1
+    w = _recent_window(C)
+    ts = recent_hit_marks.get(key)
+    return ts is not None and now - ts <= w
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    key = obj.key
+    C = arc_capacity if arc_capacity else 1
+    in_B1 = key in arc_B1
+    in_B2 = key in arc_B2
+=======
+    key = obj.key
+    C = arc_capacity if arc_capacity else 1
+    now = cache_snapshot.access_count
+    in_B1 = key in arc_B1
+    in_B2 = key in arc_B2
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    candidate = None
+    last_replaced_from = None
+    if t1_sz >= 1 and (t1_sz > p_eff or (in_B2 and t1_sz == p_eff)):
+        # Evict LRU from T1
+        candidate = next(iter(arc_T1)) if arc_T1 else None
+        if candidate is not None:
+            last_replaced_from = 'T1'
+    else:
+        # Evict LRU from T2
+        candidate = next(iter(arc_T2)) if arc_T2 else None
+        if candidate is not None:
+            last_replaced_from = 'T2'
+=======
+    candidate = None
+    last_replaced_from = None
+    if t1_sz >= 1 and (t1_sz > p_eff or (in_B2 and t1_sz == p_eff)):
+        # Prefer evicting T1 LRU but skip very-recent hits
+        if arc_T1:
+            for k in arc_T1.keys():
+                if not _is_recently_hit(k, now):
+                    candidate = k
+                    last_replaced_from = 'T1'
+                    break
+            if candidate is None:
+                candidate = next(iter(arc_T1))
+                last_replaced_from = 'T1'
+    else:
+        # Prefer evicting T2 LRU but skip very-recent hits
+        if arc_T2:
+            for k in arc_T2.keys():
+                if not _is_recently_hit(k, now):
+                    candidate = k
+                    last_replaced_from = 'T2'
+                    break
+            if candidate is None:
+                candidate = next(iter(arc_T2))
+                last_replaced_from = 'T2'
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    if candidate is None:
+        # Try to avoid removing B2-hinted keys from T1
+        for k in list(arc_T1.keys()):
+            if k not in arc_B2:
+                candidate = k
+                last_replaced_from = 'T1'
+                break
+=======
+    if candidate is None:
+        # Try to avoid removing B2-hinted keys from T1, and skip very-recent hits
+        for k in list(arc_T1.keys()):
+            if k not in arc_B2 and not _is_recently_hit(k, now):
+                candidate = k
+                last_replaced_from = 'T1'
+                break
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    if candidate is None:
+        # Prefer T2 keys that appear in B1 (recency-only hint)
+        for k in list(arc_T2.keys()):
+            if k in arc_B1:
+                candidate = k
+                last_replaced_from = 'T2'
+                break
+=======
+    if candidate is None:
+        # Prefer T2 keys that appear in B1 (recency-only hint), but skip very-recent hits
+        for k in list(arc_T2.keys()):
+            if k in arc_B1 and not _is_recently_hit(k, now):
+                candidate = k
+                last_replaced_from = 'T2'
+                break
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    if candidate is None:
+        # Depth-limited peek
+        budget = min(8, max(1, C // 16))
+        cnt = 0
+        for k in arc_T1.keys():
+            if k not in arc_B2:
+                candidate = k
+                last_replaced_from = 'T1'
+                break
+            cnt += 1
+            if cnt >= budget:
+                break
+        if candidate is None:
+            cnt = 0
+            for k in arc_T2.keys():
+                if k in arc_B1:
+                    candidate = k
+                    last_replaced_from = 'T2'
+                    break
+                cnt += 1
+                if cnt >= budget:
+                    break
+=======
+    if candidate is None:
+        # Depth-limited peek
+        budget = min(8, max(1, C // 16))
+        cnt = 0
+        for k in arc_T1.keys():
+            if k not in arc_B2 and not _is_recently_hit(k, now):
+                candidate = k
+                last_replaced_from = 'T1'
+                break
+            cnt += 1
+            if cnt >= budget:
+                break
+        if candidate is None:
+            cnt = 0
+            for k in arc_T2.keys():
+                if k in arc_B1 and not _is_recently_hit(k, now):
+                    candidate = k
+                    last_replaced_from = 'T2'
+                    break
+                cnt += 1
+                if cnt >= budget:
+                    break
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    # Update timestamp for tie-breaking/fallback
+    m_key_timestamp[key] = cache_snapshot.access_count
+=======
+    # Update timestamp for tie-breaking/fallback
+    m_key_timestamp[key] = cache_snapshot.access_count
+    # Mark as recently hit to provide a short second-chance shield
+    recent_hit_marks[key] = cache_snapshot.access_count
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    _trim_ghosts()
+    m_key_timestamp[key] = cache_snapshot.access_count
+=======
+    _trim_ghosts()
+    # Insert is not a hit: clear any recent-hit shield to avoid scan misclassification
+    recent_hit_marks.pop(key, None)
+    m_key_timestamp[key] = cache_snapshot.access_count
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    last_replaced_from = None
+    m_key_timestamp.pop(k, None)
+    _trim_ghosts()
+=======
+    last_replaced_from = None
+    m_key_timestamp.pop(k, None)
+    recent_hit_marks.pop(k, None)
+    _trim_ghosts()
+>>>>>>> REPLACE
+
+</DIFF>

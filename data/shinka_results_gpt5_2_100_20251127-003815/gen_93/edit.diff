@@ -1,0 +1,611 @@
+--- a/original.py
++++ b/original.py
+@@ -1,480 +1,539 @@
+ # EVOLVE-BLOCK-START
+ """WTiny-SLRU with TinyLFU-guided competitive admission and adaptive tuning.
+ 
+ Public API:
+ - evict(cache_snapshot, obj) -> key
+ - update_after_hit(cache_snapshot, obj)
+ - update_after_insert(cache_snapshot, obj)
+ - update_after_evict(cache_snapshot, obj, evicted_obj)
+ """
+ 
+ from collections import OrderedDict
+ 
+ 
+ class _CmSketch:
+     """
+     Count-Min Sketch with conservative aging.
+     - d hash tables, width = 2^p (masking)
+     - Periodic halving maintains a decayed frequency
+     """
+     __slots__ = ("d", "w", "tables", "mask", "ops", "age_period", "seeds")
+ 
+     def __init__(self, width_power=12, d=3):
+         self.d = int(max(1, d))
+         w = 1 << int(max(8, width_power))
+         self.w = w
+         self.mask = w - 1
+         self.tables = [[0] * w for _ in range(self.d)]
+         self.ops = 0
+         self.age_period = max(1024, w)
+         self.seeds = (0x9e3779b1, 0x85ebca77, 0xc2b2ae3d, 0x27d4eb2f)
+ 
+     def _hash(self, key_hash: int, i: int) -> int:
+         h = key_hash ^ self.seeds[i % len(self.seeds)]
+         h ^= (h >> 33) & 0xFFFFFFFFFFFFFFFF
+         h *= 0xff51afd7ed558ccd
+         h &= 0xFFFFFFFFFFFFFFFF
+         h ^= (h >> 33)
+         h *= 0xc4ceb9fe1a85ec53
+         h &= 0xFFFFFFFFFFFFFFFF
+         h ^= (h >> 33)
+         return h & self.mask
+ 
+     def _maybe_age(self):
+         self.ops += 1
+         if self.ops % self.age_period == 0:
+             for t in self.tables:
+                 for i in range(self.w):
+                     t[i] >>= 1
+ 
+     def increment(self, key: str, amount: int = 1):
+         h = hash(key)
+         for i in range(self.d):
+             idx = self._hash(h, i)
+             v = self.tables[i][idx] + amount
+             if v > 255:
+                 v = 255
+             self.tables[i][idx] = v
+         self._maybe_age()
+ 
+     def estimate(self, key: str) -> int:
+         h = hash(key)
+         est = 1 << 30
+         for i in range(self.d):
+             idx = self._hash(h, i)
+             v = self.tables[i][idx]
+             if v < est:
+                 est = v
+         return est
+ 
+ 
+ class _WTinySlru:
+     """
+-    Windowed TinyLFU + SLRU:
++    Windowed TinyLFU + SLRU with tail-sampled, frequency-aware eviction and adaptive admission.
+     - W: window LRU (pure recency)
+     - M1: probationary main (admission target)
+     - M2: protected main (re-referenced)
+-    Admission and eviction use TinyLFU competitive k-sampling with M2-biased protection.
++    Admission and eviction use TinyLFU competitive sampling with M2-biased protection.
+     """
+ 
+     __slots__ = (
+         "W", "M1", "M2",
+         "capacity", "win_frac", "prot_frac",
+         "sketch", "_sample_k",
+         "ema_miss", "_alpha_ema", "_cooldown_until", "_over_miss_span",
+         "_tune_period", "_last_tune_access",
+         "hit_W", "hit_M1", "hit_M2",
+         "promotions", "demotions",
+         "_last_evicted_from",
+-        "_recent_ring", "_recent_cap"
++        "_recent_ring", "_recent_cap",
++        "_last_touch",
++        "_hot_budget_tokens", "_hot_budget_max", "_budget_epoch"
+     )
+ 
+     def __init__(self):
+         self.W = OrderedDict()
+         self.M1 = OrderedDict()
+         self.M2 = OrderedDict()
+         self.capacity = None
+         self.win_frac = 0.20
+         self.prot_frac = 0.80
+         self.sketch = _CmSketch(width_power=12, d=3)
+         self._sample_k = 6
+         self.ema_miss = 0.0
+         self._alpha_ema = 0.05
+         self._cooldown_until = 0
+         self._over_miss_span = 0
+         self._tune_period = 1024
+         self._last_tune_access = 0
+         self.hit_W = 0
+         self.hit_M1 = 0
+         self.hit_M2 = 0
+         self.promotions = 0
+         self.demotions = 0
+         self._last_evicted_from = "W"
+         self._recent_ring = OrderedDict()
+         self._recent_cap = 1024
++        self._last_touch = {}  # key -> last access_count
++        self._hot_budget_tokens = 0
++        self._hot_budget_max = 0
++        self._budget_epoch = 0
+ 
+     # ---------- capacity/housekeeping ----------
+ 
+     def _ensure_capacity(self, snapshot):
+         cap = max(int(snapshot.capacity), 1)
+         if self.capacity is None:
+             self.capacity = cap
+             self._sample_k = max(4, min(12, (cap // 8) or 4))
+             self._tune_period = max(512, cap)
+             self._recent_cap = max(64, cap)
+             try:
+                 self.sketch.age_period = max(512, min(16384, cap * 8))
+             except Exception:
+                 pass
++            # hot-bypass budget
++            self._hot_budget_max = max(0, min(8, int(0.02 * cap)))
++            self._hot_budget_tokens = self._hot_budget_max
++            self._budget_epoch = snapshot.access_count // max(1, self._tune_period)
+             return
+         if self.capacity != cap:
+             # Reset cleanly on capacity changes to avoid corruption
+             self.W.clear(); self.M1.clear(); self.M2.clear()
++            self._last_touch.clear()
+             self.capacity = cap
+             self._sample_k = max(4, min(12, (cap // 8) or 4))
+             self._tune_period = max(512, cap)
+             self._recent_cap = max(64, cap)
+             try:
+                 self.sketch.age_period = max(512, min(16384, cap * 8))
+             except Exception:
+                 pass
++            self._hot_budget_max = max(0, min(8, int(0.02 * cap)))
++            self._hot_budget_tokens = self._hot_budget_max
++            self._budget_epoch = snapshot.access_count // max(1, self._tune_period)
+ 
+     def _targets(self):
+         win_target = max(1, int(self.capacity * self.win_frac))
+         main_target = max(1, self.capacity - win_target)
+         prot_target = max(1, int(main_target * self.prot_frac))
+         return win_target, prot_target
+ 
+     def _refresh_recent(self, key: str):
+         self._recent_ring[key] = None
+         self._recent_ring.move_to_end(key)
+         if len(self._recent_ring) > self._recent_cap:
+             self._recent_ring.popitem(last=False)
+ 
+     def _prune_desync(self, snapshot):
+         # Drop keys not in the actual cache; add any unknown cache keys to W to resync.
+         cache_keys = set(snapshot.cache.keys())
+         for od in (self.W, self.M1, self.M2):
+             for k in list(od.keys()):
+                 if k not in cache_keys:
+                     od.pop(k, None)
++                    self._last_touch.pop(k, None)
+         # Repair: any cache key not tracked -> place into W
+         tracked = set(self.W.keys()) | set(self.M1.keys()) | set(self.M2.keys())
+         for k in cache_keys - tracked:
+             self.W[k] = None
+             self.W.move_to_end(k)
++            # last_touch unknown; leave absent
+ 
+     # ---------- LRU helpers ----------
+ 
+     def _touch(self, od: OrderedDict, key: str):
+         od[key] = None
+         od.move_to_end(key)
+ 
+     def _pop_lru(self, od: OrderedDict):
+         if not od:
+             return None
+         k, _ = od.popitem(last=False)
+         return k
+ 
+-    def _sample_tail_min_freq(self, od: OrderedDict):
++    # ---------- sampling helpers ----------
++
++    def _score(self, key: str):
++        # Lower is colder. Tie-break by older recency (smaller last_touch).
++        est = self.sketch.estimate(key)
++        ts = self._last_touch.get(key, 0)
++        return est, ts
++
++    def _tail_min_candidate(self, od: OrderedDict, tail_mult: int = 4):
++        """
++        Return the coldest candidate from the LRU tail of a segment.
++        Scans first tail_len = min(4k, len(od)) keys from LRU to MRU.
++        """
+         if not od:
+-            return None, None
+-        k = min(self._sample_k, len(od))
+-        it = iter(od.keys())  # from LRU to MRU
+-        min_key, min_freq = None, None
+-        for _ in range(k):
++            return None, None, None
++        tail_len = min(len(od), max(4, self._sample_k * tail_mult))
++        it = iter(od.keys())
++        best_k, best_est, best_ts = None, None, None
++        for _ in range(tail_len):
+             try:
+-                key = next(it)
++                k = next(it)
+             except StopIteration:
+                 break
+-            f = self.sketch.estimate(key)
+-            if min_freq is None or f < min_freq:
+-                min_key, min_freq = key, f
+-        if min_key is None:
+-            key = next(iter(od))
+-            return key, self.sketch.estimate(key)
+-        return min_key, min_freq
++            est, ts = self._score(k)
++            if best_k is None or est < best_est or (est == best_est and ts < best_ts):
++                best_k, best_est, best_ts = k, est, ts
++        if best_k is None:
++            k = next(iter(od))
++            est, ts = self._score(k)
++            return k, est, ts
++        return best_k, best_est, best_ts
+ 
+     # ---------- adaptation ----------
+ 
+     def _update_ema_on_hit(self):
+         self.ema_miss = (1.0 - self._alpha_ema) * self.ema_miss + self._alpha_ema * 0.0
+         self._over_miss_span = 0
+ 
+     def _update_ema_on_miss(self, now):
+         self.ema_miss = (1.0 - self._alpha_ema) * self.ema_miss + self._alpha_ema * 1.0
+         if self.ema_miss > 0.8:
+             self._over_miss_span += 1
+             if self._over_miss_span > max(1, self.capacity // 4):
+                 # Trigger scan cooldown
+                 self._cooldown_until = now + self.capacity
+-                # Raise admission barrier during cooldown
+                 self._over_miss_span = 0
+         else:
+             self._over_miss_span = 0
+ 
+     def _maybe_tune(self, snapshot):
+         now = snapshot.access_count
+         if (now - self._last_tune_access) < self._tune_period:
+             return
+         self._last_tune_access = now
+ 
+         total_hits = max(1, self.hit_W + self.hit_M1 + self.hit_M2)
++        frac_W = self.hit_W / total_hits
+         frac_M2 = self.hit_M2 / total_hits
+         frac_M1 = self.hit_M1 / total_hits
+ 
+-        # Adjust protected fraction
++        # Adjust protected fraction to favor stability when M2 dominates
+         if frac_M2 > 0.70 and self.promotions >= self.demotions:
+             self.prot_frac = min(0.90, self.prot_frac + 0.05)
+         elif frac_M1 > 0.60:
+             self.prot_frac = max(0.60, self.prot_frac - 0.05)
+ 
+-        # Adjust window size slightly based on churn
+-        if self.ema_miss > 0.6 or frac_M1 + (self.hit_W / total_hits) > 0.7:
+-            self.win_frac = min(0.35, self.win_frac + 0.05)
++        # Adjust window size based on churn and EMA_miss
++        if self.ema_miss > 0.6 or (frac_W + frac_M1) > 0.7:
++            self.win_frac = min(0.40, self.win_frac + 0.05)
+         else:
+             self.win_frac = max(0.10, self.win_frac - 0.05)
+ 
+-        # Adjust sampling and sketch aging
+-        if frac_M2 > 0.70:
+-            self._sample_k = min(12, self._sample_k + 2)
++        # Adaptive TinyLFU aging and sampling
++        # Push toward longer memory when M2 is dominant, else shorter memory under churn
++        if frac_M2 > 0.70 and self.ema_miss < 0.5:
++            self._sample_k = min(12, max(6, self._sample_k + 1))
+             self.sketch.age_period = max(512, min(16384, self.capacity * 16))
++        elif self.ema_miss > 0.7 or frac_W > 0.5:
++            self._sample_k = max(4, min(8, self._sample_k - 1))
++            self.sketch.age_period = max(512, min(16384, self.capacity * 4))
+         else:
+-            self._sample_k = max(4, self._sample_k - 1)
+-            self.sketch.age_period = max(512, min(16384, self.capacity * 8))
+-
+-        # During cooldown, temporarily bias towards larger window and smaller M2
++            # Middle ground
++            self._sample_k = max(4, min(10, self._sample_k))
++
++        # During cooldown, bias toward larger window and smaller M2
+         if snapshot.access_count < self._cooldown_until:
+             self.win_frac = min(0.45, self.win_frac + 0.10)
+             self.prot_frac = max(0.60, self.prot_frac - 0.05)
+ 
+         # Reset counters
+         self.hit_W = self.hit_M1 = self.hit_M2 = 0
+         self.promotions = self.demotions = 0
+ 
++        # Replenish hot-bypass budget each epoch (per tune period)
++        epoch = snapshot.access_count // max(1, self._tune_period)
++        if epoch != self._budget_epoch:
++            self._budget_epoch = epoch
++            self._hot_budget_tokens = self._hot_budget_max
++
+     def _rebalance_after_hit_or_insert(self):
+         win_target, prot_target = self._targets()
+-        # Demote M2 overflow to M1 (frequency-aware demotion: sample tail min)
++        # Demote M2 overflow to M1 (frequency-aware demotion: tail min with recency tie-break)
+         while len(self.M2) > prot_target:
+-            k, _ = self._sample_tail_min_freq(self.M2)
++            k, _, _ = self._tail_min_candidate(self.M2)
+             if k is None:
+                 break
+             self.M2.pop(k, None)
+             self.M1[k] = None
+             self.M1.move_to_end(k)
+             self.demotions += 1
+-        # No need to strictly bound W or M1 here; eviction will free space.
++        # Window overflows will be handled by eviction; we avoid pre-evictions here.
+ 
+     # ---------- public API ----------
+ 
+     def choose_victim(self, snapshot, new_obj) -> str:
+         self._ensure_capacity(snapshot)
+         self._prune_desync(snapshot)
+ 
+         now = snapshot.access_count
+         in_cooldown = now < self._cooldown_until
+ 
+         win_target, prot_target = self._targets()
+ 
+-        # If window oversized, evict from W first
++        # If window oversized, evict from W first (coldest in tail)
+         if len(self.W) > win_target and len(self.W) > 0:
+-            kW, _ = self._sample_tail_min_freq(self.W)
++            kW, _, _ = self._tail_min_candidate(self.W)
+             if kW is not None and kW in snapshot.cache:
+                 self._last_evicted_from = "W"
+                 return kW
+ 
+-        # Sample candidates
+-        kW, fW = self._sample_tail_min_freq(self.W) if self.W else (None, None)
+-        k1, f1 = self._sample_tail_min_freq(self.M1) if self.M1 else (None, None)
+-        k2, f2 = self._sample_tail_min_freq(self.M2) if self.M2 else (None, None)
+-        f2b = (f2 + 1) if f2 is not None else None  # protect M2 with +1 bias
++        # Sample tail candidates per segment
++        kW, fW, tW = self._tail_min_candidate(self.W) if self.W else (None, None, None)
++        k1, f1, t1 = self._tail_min_candidate(self.M1) if self.M1 else (None, None, None)
++        k2, f2, t2 = self._tail_min_candidate(self.M2) if self.M2 else (None, None, None)
++        # Protect M2: +1 bias to its frequency score (harder to evict)
++        f2b = (f2 + 1) if f2 is not None else None
+         f_new = self.sketch.estimate(new_obj.key)
+ 
+         # Cooldown (scan) bias: prefer evicting from W if possible
+         if in_cooldown and kW is not None and kW in snapshot.cache:
+             self._last_evicted_from = "W"
+             return kW
+ 
+-        # Decide among segments using competitive TinyLFU
+-        # 1) If new is cold compared to main, evict from W if available, else from M1
+-        main_cold = min([v for v in [f1, f2b] if v is not None], default=None)
++        # Decide among segments using competitive TinyLFU (with M2 bias):
++        main_cold = min([v for v in (f1, f2b) if v is not None], default=None)
++        # If new is cold vs main, try evicting from W first, else from M1
+         if main_cold is not None and f_new <= main_cold:
+             if kW is not None and kW in snapshot.cache:
+                 self._last_evicted_from = "W"
+                 return kW
+             if k1 is not None and k1 in snapshot.cache:
+                 self._last_evicted_from = "M1"
+                 return k1
+ 
+-        # 2) Otherwise, evict from the colder of M1 and M2 (with M2 bias)
++        # Otherwise, evict from the colder of M1 and M2 (with M2 bias), tie-break by older recency
+         if k1 is not None and k2 is not None:
+-            # Compare adjusted freqs
+-            f1a = f1
+-            f2a = f2b
+-            if f1a <= f2a:
+-                victim = k1
+-                seg = "M1"
++            # Compare (freq, ts) ascending
++            c1 = (f1, t1)
++            c2 = (f2b, t2)
++            if c1 <= c2:
++                victim, seg = k1, "M1"
+             else:
+-                victim = k2
+-                seg = "M2"
++                victim, seg = k2, "M2"
+             if victim in snapshot.cache:
+                 self._last_evicted_from = seg
+                 return victim
+ 
+-        # 3) Fall back to any available segment by priority: M1 -> W -> M2
++        # Fallbacks by priority: M1 -> W -> M2
+         for seg_name, cand in (("M1", k1), ("W", kW), ("M2", k2)):
+             if cand is not None and cand in snapshot.cache:
+                 self._last_evicted_from = seg_name
+                 return cand
+ 
+         # Final fallback: return any key present in cache
+         self._last_evicted_from = "W"
+         return next(iter(snapshot.cache))
+ 
+     def on_hit(self, snapshot, obj):
+         self._ensure_capacity(snapshot)
+         key = obj.key
++        now = snapshot.access_count
+         self.sketch.increment(key, 1)
+         self._update_ema_on_hit()
+         self._refresh_recent(key)
++        self._last_touch[key] = now
+ 
+         # Update recency/frequency placement
++        in_cooldown = now < self._cooldown_until
++
+         if key in self.W:
+-            # Promote from W to M1 on second chance by TinyLFU
+-            if self.sketch.estimate(key) >= (3 if snapshot.access_count < self._cooldown_until else 2):
++            # Promote from W to M1 when sufficiently frequent
++            threshold = 3 if in_cooldown else 2
++            # Provide small recent-ring boost for phase-shift keys
++            est = self.sketch.estimate(key) + (1 if key in self._recent_ring else 0)
++            if est >= threshold:
+                 self.W.pop(key, None)
+                 self._touch(self.M1, key)
+                 self.promotions += 1
+             else:
+                 self._touch(self.W, key)
+             self.hit_W += 1
+         elif key in self.M1:
++            # Re-reference -> protected
+             self.M1.pop(key, None)
+-            self._touch(self.M2, key)  # re-reference -> protected
++            self._touch(self.M2, key)
+             self.promotions += 1
+             self.hit_M1 += 1
+         elif key in self.M2:
+             self._touch(self.M2, key)
+             self.hit_M2 += 1
+         else:
+-            # Desync/repair: assume frequent
++            # Desync/repair: place into protected to avoid losing frequent items
+             self._touch(self.M2, key)
+             self.hit_M2 += 1
+ 
+         self._rebalance_after_hit_or_insert()
+         self._maybe_tune(snapshot)
+ 
+     def on_insert(self, snapshot, obj):
+         self._ensure_capacity(snapshot)
+         key = obj.key
+         now = snapshot.access_count
+ 
+         # Update TinyLFU on miss
+         self.sketch.increment(key, 1)
+         self._update_ema_on_miss(now)
+         self._refresh_recent(key)
++        self._last_touch[key] = now
+ 
+         in_cooldown = now < self._cooldown_until
+ 
+         # Competitive admission: compare f(new) versus W and M1 representatives
+         f_new = self.sketch.estimate(key)
+         if key in self._recent_ring:
+             f_new += 1  # small phase-shift boost
+ 
+-        kW, fW = self._sample_tail_min_freq(self.W) if self.W else (None, -1)
+-        k1, f1 = self._sample_tail_min_freq(self.M1) if self.M1 else (None, -1)
++        kW, fW, _ = self._tail_min_candidate(self.W) if self.W else (None, -1, None)
++        k1, f1, _ = self._tail_min_candidate(self.M1) if self.M1 else (None, -1, None)
+         gate = max(fW, f1)
+ 
+-        # During cooldown, avoid direct M1 admissions unless clearly hot
+-        if in_cooldown:
+-            if f_new >= gate + 2:
+-                self._touch(self.M1, key)
++        # Optional hot bypass: direct M2 admission if clearly hot versus M2 tail
++        k2, f2, _ = self._tail_min_candidate(self.M2) if self.M2 else (None, -1, None)
++        # M2 biased comparator (+1)
++        f2b = (f2 + 1) if f2 >= 0 else -1
++
++        hot_bypass_allowed = (self._hot_budget_tokens > 0) and (not in_cooldown)
++        if hot_bypass_allowed and f2b >= 0 and f_new >= f2b + 2:
++            # Consume a token and admit directly to M2
++            self._touch(self.M2, key)
++            self._hot_budget_tokens -= 1
++        else:
++            # During cooldown, avoid M1 admission unless clearly above gate
++            if in_cooldown:
++                if f_new >= gate + 1:
++                    self._touch(self.M1, key)
++                else:
++                    self._touch(self.W, key)
+             else:
+-                self._touch(self.W, key)
+-        else:
+-            if f_new > gate:
+-                self._touch(self.M1, key)
+-            else:
+-                self._touch(self.W, key)
++                if f_new > gate:
++                    self._touch(self.M1, key)
++                else:
++                    self._touch(self.W, key)
+ 
+         self._rebalance_after_hit_or_insert()
+         self._maybe_tune(snapshot)
+ 
+     def on_evict(self, snapshot, obj, evicted_obj):
+         self._ensure_capacity(snapshot)
+         evk = evicted_obj.key
+         # Remove from whichever segment it belongs to
+         if evk in self.W:
+             self.W.pop(evk, None)
+         elif evk in self.M1:
+             self.M1.pop(evk, None)
+         elif evk in self.M2:
+             self.M2.pop(evk, None)
+         else:
+             # Use last decision as a hint if desynced
+             if self._last_evicted_from == "M1":
+                 self.M1.pop(evk, None)
+             elif self._last_evicted_from == "M2":
+                 self.M2.pop(evk, None)
+             else:
+                 self.W.pop(evk, None)
+ 
+-        # Keep recent ring bounded
++        # Keep recent ring and timestamps bounded/clean
+         self._recent_ring.pop(evk, None)
++        self._last_touch.pop(evk, None)
+ 
+         # Occasional tune after eviction as well
+         self._maybe_tune(snapshot)
+ 
+ 
+ # Single policy instance reused across calls
+ _policy = _WTinySlru()
+ 
+ 
+ def evict(cache_snapshot, obj):
+     """
+     Choose eviction victim key for the incoming obj.
+     """
+     return _policy.choose_victim(cache_snapshot, obj)
+ 
+ 
+ def update_after_hit(cache_snapshot, obj):
+     """
+     Update policy state after a cache hit on obj.
+     """
+     _policy.on_hit(cache_snapshot, obj)
+ 
+ 
+ def update_after_insert(cache_snapshot, obj):
+     """
+     Update policy state after a new obj is inserted into the cache.
+     """
+     _policy.on_insert(cache_snapshot, obj)
+ 
+ 
+ def update_after_evict(cache_snapshot, obj, evicted_obj):
+     """
+     Update policy state after evicting evicted_obj to make room for obj.
+     """
+     _policy.on_evict(cache_snapshot, obj, evicted_obj)
+ 
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

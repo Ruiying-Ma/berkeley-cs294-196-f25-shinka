@@ -1,0 +1,230 @@
+<NAME>
+w-tinylfu_competitive_eviction_and_adaptive_aging
+</NAME>
+
+<DESCRIPTION>
+I introduce three targeted improvements inspired by state-of-the-art caching (TinyLFU and ARC/LeCaR ideas) to reduce miss rates:
+
+1) Competitive eviction using TinyLFU in choose_victim:
+   - When the window (T1) is not oversized, we compare the incoming object's TinyLFU estimate against a sampled LRU candidate from T2. If the new object’s frequency is not higher, we protect main (T2) and evict from T1; otherwise, we evict from T2. This approximates TinyLFU’s admission logic without explicit rejection and better shields hot entries.
+
+2) Adaptive TinyLFU aging based on cache capacity:
+   - Count-Min sketch’s decay period is now scaled with capacity (8x) and clamped, so small caches age faster (more responsive to changes) and large caches avoid over-aging. This reduces stale history bias across varying workloads and cache sizes.
+
+3) Dynamic admission threshold on insert:
+   - For keys without ghost history, admission to T2 is no longer governed by a hard threshold (>=2). Instead, we compare the new key’s estimated frequency to the minimal-frequency sample from T2’s LRU side. Only if the new key is at least as hot do we hot-admit to T2; otherwise, we start in T1. This yields better adaptive admission than a fixed threshold.
+
+These changes preserve ARC’s adaptive window (p) via ghost hits, retain eviction sampling within each segment, and keep the metadata robust to desynchronization. The modifications are minimal and consistent with existing code, focusing on eviction decision quality and frequency estimation freshness.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def _ensure_capacity(self, cap: int):
+        if self.capacity is None:
+            self.capacity = max(int(cap), 1)
+            # Size sample proportional to capacity (clamp)
+            self._sample_k = max(3, min(8, self.capacity // 16 or 3))
+            return
+        if self.capacity != cap:
+            # Capacity changed: reset ARC structures to stay consistent.
+            self.T1.clear(); self.T2.clear(); self.B1.clear(); self.B2.clear()
+            self.p = 0
+            self.capacity = max(int(cap), 1)
+            self._sample_k = max(3, min(8, self.capacity // 16 or 3))
+=======
+    def _ensure_capacity(self, cap: int):
+        if self.capacity is None:
+            self.capacity = max(int(cap), 1)
+            # Size sample proportional to capacity (clamp)
+            self._sample_k = max(4, min(12, (self.capacity // 8) or 4))
+            # Make sketch aging responsive to capacity (faster aging for small caches)
+            try:
+                self.sketch.age_period = max(512, min(16384, self.capacity * 8))
+            except Exception:
+                pass
+            return
+        if self.capacity != cap:
+            # Capacity changed: reset ARC structures to stay consistent.
+            self.T1.clear(); self.T2.clear(); self.B1.clear(); self.B2.clear()
+            self.p = 0
+            self.capacity = max(int(cap), 1)
+            self._sample_k = max(4, min(12, (self.capacity // 8) or 4))
+            try:
+                self.sketch.age_period = max(512, min(16384, self.capacity * 8))
+            except Exception:
+                pass
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def choose_victim(self, cache_snapshot, new_obj) -> str:
+        """
+        ARC victim selection with frequency-aware sampling from chosen segment.
+        """
+        self._ensure_capacity(cache_snapshot.capacity)
+        self._prune_stale_residents(cache_snapshot)
+
+        in_B2 = (new_obj.key in self.B2)
+        # ARC-based choice of resident list to evict from
+        choose_T1 = len(self.T1) > 0 and (len(self.T1) > self.p or (in_B2 and len(self.T1) == self.p))
+
+        victim_key = None
+        if choose_T1 and len(self.T1) > 0:
+            victim_key = self._sample_lru_min_freq(self.T1)
+            self._last_evicted_from = 'T1'
+        elif len(self.T2) > 0:
+            victim_key = self._sample_lru_min_freq(self.T2)
+            self._last_evicted_from = 'T2'
+        elif len(self.T1) > 0:
+            victim_key = self._sample_lru_min_freq(self.T1)
+            self._last_evicted_from = 'T1'
+        else:
+            # Fallback: state cold; pick any key from actual cache
+            victim_key = next(iter(cache_snapshot.cache))
+            self._last_evicted_from = 'T1'
+
+        return victim_key
+=======
+    def choose_victim(self, cache_snapshot, new_obj) -> str:
+        """
+        ARC + TinyLFU competitive victim selection:
+        - If T1 exceeds its target p, evict from T1 (sampled LRU-min-freq).
+        - Otherwise, compare TinyLFU(new) vs TinyLFU(candidate_T2) to decide:
+          * If new <= candidate_T2, evict from T1 (protect hot main).
+          * Else evict from T2 (admit a hotter object).
+        - Robust fallbacks if segments are empty or state is desynced.
+        """
+        self._ensure_capacity(cache_snapshot.capacity)
+        self._prune_stale_residents(cache_snapshot)
+
+        # Candidates from segments (min-freq among first k LRU items)
+        cand_T1 = self._sample_lru_min_freq(self.T1) if len(self.T1) > 0 else None
+        cand_T2 = self._sample_lru_min_freq(self.T2) if len(self.T2) > 0 else None
+
+        # If T1 exceeds target p, prefer evicting from T1 (ARC rule)
+        if len(self.T1) > 0 and len(self.T1) > self.p:
+            self._last_evicted_from = 'T1'
+            return cand_T1 if cand_T1 is not None else next(iter(cache_snapshot.cache))
+
+        # If only one segment has candidates, evict from that segment
+        if cand_T1 is None and cand_T2 is not None:
+            self._last_evicted_from = 'T2'
+            return cand_T2
+        if cand_T2 is None and cand_T1 is not None:
+            self._last_evicted_from = 'T1'
+            return cand_T1
+
+        # Both candidates exist: apply TinyLFU competitive admission heuristic
+        if cand_T1 is not None and cand_T2 is not None:
+            f_new = self.sketch.estimate(new_obj.key)
+            f_t2 = self.sketch.estimate(cand_T2)
+
+            # If incoming is not hotter than T2 candidate, protect main and evict from T1
+            if f_new <= f_t2:
+                self._last_evicted_from = 'T1'
+                return cand_T1
+            else:
+                self._last_evicted_from = 'T2'
+                return cand_T2
+
+        # Fallbacks
+        if len(self.T2) > 0:
+            self._last_evicted_from = 'T2'
+            return self._sample_lru_min_freq(self.T2)
+        if len(self.T1) > 0:
+            self._last_evicted_from = 'T1'
+            return self._sample_lru_min_freq(self.T1)
+
+        # Final resort: pick any key from the actual cache
+        self._last_evicted_from = 'T1'
+        return next(iter(cache_snapshot.cache))
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def on_insert(self, cache_snapshot, obj):
+        """
+        Insert handling (called on miss after space made):
+        - Increment frequency estimate (counts misses too).
+        - If in B1: increase p (bias to recency) and insert into T2.
+        - If in B2: decrease p (bias to frequency) and insert into T2.
+        - Else: new key: estimate frequency; hot-admit to T2 if above threshold, else T1.
+        """
+        self._ensure_capacity(cache_snapshot.capacity)
+        key = obj.key
+
+        # Count this access in sketch (misses included)
+        self.sketch.increment(key, 1)
+
+        if key in self.B1:
+            # Increase p toward recency; ARC rule
+            delta = max(1, len(self.B2) // max(1, len(self.B1)))
+            self.p = min(self.capacity, self.p + delta)
+            self.B1.pop(key, None)
+            self._touch_T2(key)
+        elif key in self.B2:
+            # Decrease p toward frequency; ARC rule
+            delta = max(1, len(self.B1) // max(1, len(self.B2)))
+            self.p = max(0, self.p - delta)
+            self.B2.pop(key, None)
+            self._touch_T2(key)
+        else:
+            # No ghost history: consult TinyLFU estimate to bias admission location
+            # First access yields est ~1; require >=2 to hot-admit.
+            if self.sketch.estimate(key) >= 2:
+                self._touch_T2(key)
+            else:
+                self._touch_T1(key)
+
+        self._prune_ghosts()
+=======
+    def on_insert(self, cache_snapshot, obj):
+        """
+        Insert handling (called on miss after space made):
+        - Increment frequency estimate (counts misses too).
+        - If in B1: increase p (bias to recency) and insert into T2.
+        - If in B2: decrease p (bias to frequency) and insert into T2.
+        - Else: dynamic TinyLFU-based admission:
+            Compare f(new) to a sampled LRU-min-freq candidate from T2.
+            Hot-admit to T2 only if f(new) > f(candidate_T2); otherwise insert into T1.
+        """
+        self._ensure_capacity(cache_snapshot.capacity)
+        key = obj.key
+
+        # Count this access in sketch (misses included)
+        self.sketch.increment(key, 1)
+
+        if key in self.B1:
+            # Increase p toward recency; ARC rule
+            delta = max(1, len(self.B2) // max(1, len(self.B1)))
+            self.p = min(self.capacity, self.p + delta)
+            self.B1.pop(key, None)
+            self._touch_T2(key)
+        elif key in self.B2:
+            # Decrease p toward frequency; ARC rule
+            delta = max(1, len(self.B1) // max(1, len(self.B2)))
+            self.p = max(0, self.p - delta)
+            self.B2.pop(key, None)
+            self._touch_T2(key)
+        else:
+            # No ghost history: use dynamic TinyLFU admission threshold
+            f_new = self.sketch.estimate(key)
+            if len(self.T2) > 0:
+                k2 = self._sample_lru_min_freq(self.T2)
+                f_k2 = self.sketch.estimate(k2) if k2 is not None else 0
+                if f_new > f_k2:
+                    self._touch_T2(key)
+                else:
+                    self._touch_T1(key)
+            else:
+                # If T2 is empty, fall back to mild threshold
+                if f_new >= 2:
+                    self._touch_T2(key)
+                else:
+                    self._touch_T1(key)
+
+        self._prune_ghosts()
+>>>>>>> REPLACE
+</DIFF>

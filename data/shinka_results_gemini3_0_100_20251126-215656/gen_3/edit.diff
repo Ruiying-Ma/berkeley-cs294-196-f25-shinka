@@ -1,0 +1,186 @@
+--- a/original.py
++++ b/original.py
+@@ -1,79 +1,138 @@
+ # EVOLVE-BLOCK-START
+-"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
++"""S3-FIFO Cache Eviction Algorithm"""
+ 
+-m_key_timestamp = dict()
++# Global state for S3-FIFO
++# using dicts as ordered sets (insertion order preserved)
++_s3_small = {}  
++_s3_main = {}   
++_s3_freq = {}   
++_last_ts = -1   
++
++def _check_reset(snapshot):
++    global _s3_small, _s3_main, _s3_freq, _last_ts
++    # If access count drops, it indicates a new trace has started
++    if snapshot.access_count < _last_ts:
++        _s3_small.clear()
++        _s3_main.clear()
++        _s3_freq.clear()
++    _last_ts = snapshot.access_count
+ 
+ def evict(cache_snapshot, obj):
+     '''
+-    This function defines how the algorithm chooses the eviction victim.
+-    - Args:
+-        - `cache_snapshot`: A snapshot of the current cache state.
+-        - `obj`: The new object that needs to be inserted into the cache.
+-    - Return:
+-        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
++    S3-FIFO eviction policy implementation.
+     '''
+-    candid_obj_key = None
+-    min_ts = min(m_key_timestamp.values())
+-    candid_obj_keys = list(key for key in cache_snapshot.cache if m_key_timestamp[key] == min_ts)
+-    candid_obj_key = candid_obj_keys[0]
+-    return candid_obj_key
++    global _s3_small, _s3_main, _s3_freq
++    _check_reset(cache_snapshot)
++    
++    # Calculate target size for small queue (10% of total items)
++    # We use current cache size as proxy for capacity count
++    curr_size = len(cache_snapshot.cache)
++    s_target = max(1, int(curr_size * 0.1))
++    
++    while True:
++        # Strategy: Evict from Small FIFO if it's larger than target.
++        # Otherwise evict from Main FIFO.
++        
++        # 1. Check Small FIFO (Probation)
++        if len(_s3_small) > s_target:
++            if not _s3_small: 
++                pass # Should not happen given check, but fall through safely
++            else:
++                candidate = next(iter(_s3_small))
++                
++                # Consistency check: if key not in actual cache, clean up and skip
++                if candidate not in cache_snapshot.cache:
++                    _s3_small.pop(candidate, None)
++                    _s3_freq.pop(candidate, None)
++                    continue
++                
++                # S3-FIFO Logic:
++                # If accessed while in small queue, promote to main queue
++                if _s3_freq.get(candidate, 0) > 0:
++                    _s3_small.pop(candidate)
++                    _s3_main[candidate] = None # Insert at tail (MRU)
++                    _s3_freq[candidate] = 0    # Reset frequency/visited bit
++                    continue
++                else:
++                    # Not visited: Evict
++                    return candidate
++        
++        # 2. Check Main FIFO (Protected)
++        if not _s3_main:
++            # If Main is empty, force evict from Small (if any)
++            if _s3_small:
++                candidate = next(iter(_s3_small))
++                if candidate not in cache_snapshot.cache:
++                    _s3_small.pop(candidate, None)
++                    _s3_freq.pop(candidate, None)
++                    continue
++                return candidate
++            else:
++                # Fallback for empty/inconsistent state
++                if cache_snapshot.cache:
++                    return next(iter(cache_snapshot.cache))
++                return None 
++
++        candidate = next(iter(_s3_main))
++        
++        # Consistency check
++        if candidate not in cache_snapshot.cache:
++            _s3_main.pop(candidate, None)
++            _s3_freq.pop(candidate, None)
++            continue
++            
++        # S3-FIFO Logic for Main:
++        # If visited, give second chance (re-insert)
++        if _s3_freq.get(candidate, 0) > 0:
++            _s3_main.pop(candidate)
++            _s3_main[candidate] = None
++            _s3_freq[candidate] = 0
++            continue
++        else:
++            return candidate
+ 
+ def update_after_hit(cache_snapshot, obj):
+-    '''
+-    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+-    - Args:
+-        - `cache_snapshot`: A snapshot of the current cache state.
+-        - `obj`: The object accessed during the cache hit.
+-    - Return: `None`
+-    '''
+-    global m_key_timestamp
+-    assert obj.key in m_key_timestamp
+-    m_key_timestamp[obj.key] = cache_snapshot.access_count
++    global _s3_freq
++    _check_reset(cache_snapshot)
++    # Mark as visited. Saturation at 3 is arbitrary but standard for some clock variants.
++    # >0 is enough for the logic used in evict.
++    current = _s3_freq.get(obj.key, 0)
++    _s3_freq[obj.key] = min(current + 1, 3)
+ 
+ def update_after_insert(cache_snapshot, obj):
+-    '''
+-    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+-    - Args:
+-        - `cache_snapshot`: A snapshot of the current cache state.
+-        - `obj`: The object that was just inserted into the cache.
+-    - Return: `None`
+-    '''
+-    global m_key_timestamp
+-    assert obj.key not in m_key_timestamp
+-    m_key_timestamp[obj.key] = cache_snapshot.access_count
++    global _s3_small, _s3_freq, _s3_main
++    _check_reset(cache_snapshot)
++    # New objects go to Small FIFO (Probation)
++    if obj.key not in _s3_small and obj.key not in _s3_main:
++        _s3_small[obj.key] = None
++        _s3_freq[obj.key] = 0
+ 
+ def update_after_evict(cache_snapshot, obj, evicted_obj):
+-    '''
+-    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+-    - Args:
+-        - `cache_snapshot`: A snapshot of the current cache state.
+-        - `obj`: The object to be inserted into the cache.
+-        - `evicted_obj`: The object that was just evicted from the cache.
+-    - Return: `None`
+-    '''
+-    global m_key_timestamp
+-    assert obj.key not in m_key_timestamp
+-    assert evicted_obj.key in m_key_timestamp
+-    m_key_timestamp.pop(evicted_obj.key)
++    global _s3_small, _s3_main, _s3_freq
++    _check_reset(cache_snapshot)
++    # Cleanup state for evicted object
++    _s3_small.pop(evicted_obj.key, None)
++    _s3_main.pop(evicted_obj.key, None)
++    _s3_freq.pop(evicted_obj.key, None)
+ 
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

@@ -1,0 +1,60 @@
+<NAME>
+freq_boost_and_ghost_expansion
+</NAME>
+
+<DESCRIPTION>
+1.  **Frequency Boost on Promotion/Ghost Hit**: When an item enters the Main queue (either via promotion from Small or via Ghost hit), initialize its frequency to 1 instead of 0. This gives the item a "grace period" of one full iteration through the Main queue before it is candidate for demotion. This aligns better with the concept of a protected segment, preventing premature demotion of items that have demonstrated value (by being hit in Small or Ghost).
+2.  **Expand Ghost Registry**: Increase the ghost registry capacity from 3x to 10x cache capacity. This improves the algorithm's ability to detect and recover from large cyclic patterns (loops) that exceed the short-term history, addressing low hit rates on loop-heavy traces.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+            freq = _s3_freq.get(candidate, 0)
+            if freq > 0:
+                # Promotion: Small -> Main
+                _s3_small.pop(candidate)
+                _s3_main[candidate] = None
+                # Reset frequency to 0 upon promotion (standard S3-FIFO)
+                _s3_freq[candidate] = 0
+                continue
+            else:
+=======
+            freq = _s3_freq.get(candidate, 0)
+            if freq > 0:
+                # Promotion: Small -> Main
+                _s3_small.pop(candidate)
+                _s3_main[candidate] = None
+                # Give a grace period in Main (freq=1) to prevent immediate demotion
+                _s3_freq[candidate] = 1
+                continue
+            else:
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    if key in _s3_ghost:
+        # Ghost Hit: Promote to Main
+        # Reset freq to 0 ensures we don't pollute Main with "weak" ghosts
+        if key not in _s3_main and key not in _s3_small:
+            _s3_main[key] = None
+            _s3_freq[key] = 0
+        _s3_ghost.pop(key)
+    else:
+=======
+    if key in _s3_ghost:
+        # Ghost Hit: Promote to Main
+        # Grant grace period (freq=1) for ghost hits as they are strong signals
+        if key not in _s3_main and key not in _s3_small:
+            _s3_main[key] = None
+            _s3_freq[key] = 1
+        _s3_ghost.pop(key)
+    else:
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Cap Ghost Size: Increased to 3x to better capture large loops
+    if len(_s3_ghost) > cache_snapshot.capacity * 3:
+        _s3_ghost.pop(next(iter(_s3_ghost)), None)
+=======
+    # Cap Ghost Size: Increased to 10x to better capture large loops
+    if len(_s3_ghost) > cache_snapshot.capacity * 10:
+        _s3_ghost.pop(next(iter(_s3_ghost)), None)
+>>>>>>> REPLACE
+</DIFF>

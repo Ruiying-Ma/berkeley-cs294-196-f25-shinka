@@ -1,0 +1,163 @@
+<NAME>
+s3_fifo_enhanced_ghost_and_demotion
+</NAME>
+
+<DESCRIPTION>
+This update enhances the S3-FIFO algorithm to address weaknesses in handling large loops (Trace 14) and improve retention of popular items.
+1.  **Extended Ghost Registry**: Increases the ghost cache capacity from 1x to 3x the main cache size. This allows the algorithm to "remember" items in loops that are significantly larger than the cache, preventing them from being treated as new items upon return.
+2.  **Universal Ghost Tracking**: Modifies `update_after_evict` to track victims from the Main queue in the Ghost registry, not just victims from the Small queue. This is crucial for loops where items are promoted to Main but then evicted due to the loop size exceeding cache capacity. Tracking them allows them to be recalled to Main immediately upon return.
+3.  **Gradual Demotion**: Implements a gradual frequency decay (`freq - 1`) in the Main queue instead of an immediate reset to 0. This provides "second chances" proportional to the item's historical popularity, improving retention for hot items.
+4.  **Probabilistic Promotion**: Re-introduces a 1% random promotion from Small to Main. This helps populate the Main queue with potentially useful items during scans or when frequency data is sparse, increasing the diversity of the protected set.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO Eviction Policy:
+    - Keeps a small FIFO queue (S) for new items and a large FIFO queue (M) for popular items.
+    - Uses a Ghost queue (G) to track evicted items from S.
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+
+    capacity = cache_snapshot.capacity
+    # Target size for Small queue (10% of capacity)
+    s_capacity = max(1, int(capacity * 0.1))
+
+    # Lazy cleanup of ghost
+    while len(s3_ghost) > capacity:
+        s3_ghost.pop(next(iter(s3_ghost)))
+
+    while True:
+        # Decision: Evict from Small or Main?
+        # If Small is larger than target, evict from Small.
+        # Also if Main is empty, we must evict from Small.
+        if len(s3_small) >= s_capacity or not s3_main:
+            if not s3_small:
+                # Should not happen if cache is full and Main is empty
+                return None
+
+            candidate = next(iter(s3_small))
+            freq = s3_freq.get(candidate, 0)
+
+            if freq > 0:
+                # Second Chance: Move to Main
+                s3_small.pop(candidate)
+                s3_main[candidate] = None
+                s3_freq[candidate] = 0
+                continue
+            else:
+                # Victim found in Small
+                return candidate
+
+        else:
+            # Evict from Main
+            candidate = next(iter(s3_main))
+            freq = s3_freq.get(candidate, 0)
+
+            if freq > 0:
+                # Second Chance: Reinsert to Main tail
+                s3_main.pop(candidate)
+                s3_main[candidate] = None
+                s3_freq[candidate] = 0
+                continue
+            else:
+                # Victim found in Main
+                return candidate
+=======
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO Enhanced Eviction Policy:
+    - Extended Ghost (3x) for loop resistance.
+    - Probabilistic Promotion from Small to Main to handle scans/loops better.
+    - Gradual Demotion in Main to retain hot items longer.
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+
+    capacity = cache_snapshot.capacity
+    # Target size for Small queue (10% of capacity)
+    s_capacity = max(1, int(capacity * 0.1))
+
+    # Lazy cleanup of ghost - Extended to 3x capacity
+    while len(s3_ghost) > 3 * capacity:
+        s3_ghost.pop(next(iter(s3_ghost)))
+
+    while True:
+        # Decision: Evict from Small or Main?
+        if len(s3_small) >= s_capacity or not s3_main:
+            if not s3_small:
+                return None
+
+            candidate = next(iter(s3_small))
+            freq = s3_freq.get(candidate, 0)
+
+            if freq > 0:
+                # Promotion: Move to Main
+                s3_small.pop(candidate)
+                s3_main[candidate] = None
+                s3_freq[candidate] = 0
+                continue
+
+            # Probabilistic Promotion (1% chance)
+            if (cache_snapshot.access_count ^ hash(candidate)) % 100 == 0:
+                s3_small.pop(candidate)
+                s3_main[candidate] = None
+                s3_freq[candidate] = 0
+                continue
+
+            # Victim found in Small
+            return candidate
+
+        else:
+            # Evict from Main
+            candidate = next(iter(s3_main))
+            freq = s3_freq.get(candidate, 0)
+
+            if freq > 0:
+                # Gradual Demotion: Reinsert with decayed frequency
+                s3_main.pop(candidate)
+                s3_main[candidate] = None
+                s3_freq[candidate] = freq - 1
+                continue
+            else:
+                # Victim found in Main
+                return candidate
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    S3-FIFO Update on Evict:
+    - Remove from queues. If evicted from Small, add to Ghost.
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+    key = evicted_obj.key
+
+    if key in s3_small:
+        s3_small.pop(key)
+        s3_ghost[key] = None
+    elif key in s3_main:
+        s3_main.pop(key)
+
+    if key in s3_freq:
+        s3_freq.pop(key)
+=======
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    S3-FIFO Update on Evict:
+    - Remove from queues.
+    - Add ALL victims (Small and Main) to Ghost to track history across larger loops.
+    '''
+    global s3_small, s3_main, s3_ghost, s3_freq
+    key = evicted_obj.key
+
+    if key in s3_small:
+        s3_small.pop(key)
+        s3_ghost[key] = None
+    elif key in s3_main:
+        s3_main.pop(key)
+        s3_ghost[key] = None
+
+    if key in s3_freq:
+        s3_freq.pop(key)
+>>>>>>> REPLACE
+</DIFF>

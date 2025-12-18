@@ -1,0 +1,461 @@
+<NAME>
+arc_freq_aware_sampling_and_adaptive_p
+</NAME>
+
+<DESCRIPTION>
+I enhance the ARC-based policy with lightweight frequency awareness and more stable, context-sensitive adaptation of the balancing parameter p. Concretely:
+
+1) Frequency-aware victim selection: Within each resident list (T1/T2), choose the eviction victim using a small LRU-sample and pick the lowest-frequency key among the oldest few. This preserves truly hot items and reduces misses under mixed workloads. There is also a cross-steer safeguard that, when an about-to-be-evicted T2 item is clearly hot, switches to a T1 victim instead.
+
+2) Adaptive p with momentum and throttle: Introduce a throttled, momentum-based p updater to avoid oscillations. ARC-style ghost hits still adjust p immediately (force), but normal hits make smaller, smoothed adjustments. Additionally, we gently increase p on streams of new items (no ghost), helping resist scans by giving more room to T1 probationary space.
+
+3) Global hit EWMA and periodic frequency decay: Maintain a hit EWMA and periodically decay tiny per-key frequency counters to avoid stale bias. During low-hit phases (scan-like), new items are kept probationary and p nudges upward to protect T2.
+
+4) Safer metadata on hits: Unknown tracked hits default to T1 instead of T2 to avoid over-protecting items due to metadata desync.
+
+These changes preserve ARC’s core design (T1/T2/B1/B2 with REPLACE) while improving victim selection and p adaptation under diverse traces, aiming to reduce miss rate across both scan-heavy and locality-rich workloads.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+class ARCPolicy:
+    def __init__(self):
+        # Resident LRU lists
+        self.T1 = OrderedDict()  # probationary (seen once)
+        self.T2 = OrderedDict()  # protected (reused)
+        # Ghost (non-resident) LRU lists
+        self.B1 = OrderedDict()  # evicted from T1
+        self.B2 = OrderedDict()  # evicted from T2
+
+        # Adaptive target for T1 size [0, c]
+        self.p = 0.0
+
+        # Metadata
+        self.ts = {}            # key -> last access timestamp (for fallback)
+        self.freq = {}          # key -> tiny frequency counter (optional boost)
+        self.last_capacity = None
+=======
+class ARCPolicy:
+    def __init__(self):
+        # Resident LRU lists
+        self.T1 = OrderedDict()  # probationary (seen once)
+        self.T2 = OrderedDict()  # protected (reused)
+        # Ghost (non-resident) LRU lists
+        self.B1 = OrderedDict()  # evicted from T1
+        self.B2 = OrderedDict()  # evicted from T2
+
+        # Adaptive target for T1 size [0, c]
+        self.p = 0.0
+        self.p_momentum = 0.0
+
+        # Metadata
+        self.ts = {}            # key -> last access timestamp (for fallback)
+        self.freq = {}          # key -> tiny frequency counter (optional boost)
+        self.last_capacity = None
+
+        # Global signals and decay control
+        self.hit_ewma = 0.0     # running estimate of hit ratio
+        self.ewma_alpha = 0.05
+        self.last_decay_tick = 0
+        self.decay_interval = 128
+        self._p_last_update_tick = 0
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def _lru_key(self, odict: OrderedDict):
+        # Return LRU key (oldest) if exists, else None
+        try:
+            return next(iter(odict))
+        except StopIteration:
+            return None
+=======
+    def _lru_key(self, odict: OrderedDict):
+        # Return LRU key (oldest) if exists, else None
+        try:
+            return next(iter(odict))
+        except StopIteration:
+            return None
+
+    def _sampled_victim(self, odict: OrderedDict, sample_n: int = 4):
+        # Among the oldest 'sample_n' keys, choose the one with the lowest tiny frequency.
+        if not odict:
+            return None
+        n = max(1, sample_n)
+        cand_keys = []
+        it = iter(odict)
+        for _ in range(n):
+            try:
+                cand_keys.append(next(it))
+            except StopIteration:
+                break
+        if not cand_keys:
+            return None
+        # Prefer smallest (freq, original order); if tie, oldest stays first
+        def key_score(k):
+            return (self.freq.get(k, 0), self.ts.get(k, -1))
+        best = min(cand_keys, key=key_score)
+        return best
+
+    def _adjust_p(self, delta: float, c: int, now: int, force: bool = False):
+        # Throttled, momentum-based adjust; on ghost hits (force=True), adjust immediately.
+        if force:
+            self.p = max(0.0, min(float(c), self.p + float(delta)))
+            self._p_last_update_tick = now
+            return
+        throttle = max(1, c // 20)
+        if (now - self._p_last_update_tick) < throttle:
+            return
+        # Friction if direction flips relative to momentum
+        if self.p_momentum != 0.0 and (delta * self.p_momentum) < 0.0:
+            self.p_momentum = 0.0
+            delta *= 0.5
+        # Update momentum
+        self.p_momentum = 0.7 * self.p_momentum + 0.3 * float(delta)
+        # Bound per-step magnitude to avoid oscillations
+        step_bound = max(1.0, 0.15 * c)
+        applied = max(-step_bound, min(step_bound, float(delta)))
+        self.p = max(0.0, min(float(c), self.p + applied))
+        self._p_last_update_tick = now
+
+    def _decay_counters(self, now: int, c: int):
+        # Periodically decay tiny frequency counters to avoid stale protection
+        interval = max(64, c)
+        if (now - self.last_decay_tick) >= interval:
+            if self.freq:
+                for k in list(self.freq.keys()):
+                    v = self.freq.get(k, 0)
+                    if v > 0:
+                        self.freq[k] = v >> 1
+            self.last_decay_tick = now
+            # Also decay momentum to let p settle
+            self.p_momentum *= 0.5
+
+    def _update_ewma(self, hit: bool):
+        a = self.ewma_alpha
+        self.hit_ewma = (1.0 - a) * self.hit_ewma + a * (1.0 if hit else 0.0)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def evict(self, cache_snapshot, obj):
+        self._init_or_update(cache_snapshot)
+        c = self._capacity(cache_snapshot)
+
+        # Choose victim according to ARC REPLACE, but ensure we pick a key actually in cache
+        keys_in_cache = set(cache_snapshot.cache.keys())
+
+        # If both resident lists empty (should not happen often), fallback to global oldest
+        if not self.T1 and not self.T2:
+            # Fallback: evict globally oldest (by timestamp) among actual cache keys
+            if not keys_in_cache:
+                return None
+            # If we have timestamps, use them; else arbitrary
+            candidates = list(keys_in_cache)
+            if self.ts:
+                return min(candidates, key=lambda k: self.ts.get(k, -1))
+            return next(iter(candidates))
+
+        side = self._replace_side(obj.key, c)
+        victim = None
+        if side == 'T1' and self.T1:
+            victim = self._lru_key(self.T1)
+        elif side == 'T2' and self.T2:
+            victim = self._lru_key(self.T2)
+        else:
+            # If chosen side empty (edge case), pick from the other; else any cached key
+            if self.T1:
+                victim = self._lru_key(self.T1)
+            elif self.T2:
+                victim = self._lru_key(self.T2)
+
+        # Defensive: ensure victim is in actual cache; otherwise fallback to any cached key
+        if victim is None or victim not in keys_in_cache:
+            # Try other list
+            alt = self._lru_key(self.T2 if side == 'T1' else self.T1)
+            if alt and alt in keys_in_cache:
+                victim = alt
+            else:
+                # Fallback: evict globally oldest
+                if not keys_in_cache:
+                    return None
+                candidates = list(keys_in_cache)
+                if self.ts:
+                    victim = min(candidates, key=lambda k: self.ts.get(k, -1))
+                else:
+                    victim = next(iter(candidates))
+        return victim
+=======
+    def evict(self, cache_snapshot, obj):
+        self._init_or_update(cache_snapshot)
+        c = self._capacity(cache_snapshot)
+        now = cache_snapshot.access_count
+        # Periodically decay tiny counters to avoid stale stickiness
+        self._decay_counters(now, c)
+
+        # Choose victim according to ARC REPLACE, but ensure we pick a key actually in cache
+        keys_in_cache = set(cache_snapshot.cache.keys())
+
+        # If both resident lists empty (should not happen often), fallback to global oldest
+        if not self.T1 and not self.T2:
+            # Fallback: evict globally oldest (by timestamp) among actual cache keys
+            if not keys_in_cache:
+                return None
+            candidates = list(keys_in_cache)
+            if self.ts:
+                return min(candidates, key=lambda k: self.ts.get(k, -1))
+            return next(iter(candidates))
+
+        side = self._replace_side(obj.key, c)
+        victim = None
+        if side == 'T1' and self.T1:
+            victim = self._sampled_victim(self.T1, sample_n=3)
+        elif side == 'T2' and self.T2:
+            victim = self._sampled_victim(self.T2, sample_n=3)
+        else:
+            # If chosen side empty (edge case), pick from the other; else any cached key
+            if self.T1:
+                victim = self._sampled_victim(self.T1, sample_n=3)
+            elif self.T2:
+                victim = self._sampled_victim(self.T2, sample_n=3)
+
+        # Frequency-aware cross-steer: avoid evicting clearly hot T2 items if a cold T1 exists
+        if victim is not None and victim in keys_in_cache:
+            if side == 'T2' and self.freq.get(victim, 0) >= 3 and self.T1:
+                alt = self._sampled_victim(self.T1, sample_n=3)
+                if alt and alt in keys_in_cache:
+                    victim = alt
+            elif side == 'T1' and self.freq.get(victim, 0) >= 2 and self.T2:
+                alt = self._sampled_victim(self.T2, sample_n=3)
+                if alt and alt in keys_in_cache and self.freq.get(alt, 0) < self.freq.get(victim, 0):
+                    victim = alt
+
+        # Defensive: ensure victim is in actual cache; otherwise fallback to any cached key
+        if victim is None or victim not in keys_in_cache:
+            # Try other list
+            alt = self._lru_key(self.T2 if side == 'T1' else self.T1)
+            if alt and alt in keys_in_cache:
+                victim = alt
+            else:
+                # Fallback: evict globally oldest
+                if not keys_in_cache:
+                    return None
+                candidates = list(keys_in_cache)
+                if self.ts:
+                    victim = min(candidates, key=lambda k: self.ts.get(k, -1))
+                else:
+                    victim = next(iter(candidates))
+        return victim
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def update_after_hit(self, cache_snapshot, obj):
+        self._init_or_update(cache_snapshot)
+        now, key = cache_snapshot.access_count, obj.key
+        self._record_access(key, now)
+
+        # If in T1, promote to T2 MRU
+        if key in self.T1:
+            self.T1.pop(key, None)
+            self.T2[key] = True
+        elif key in self.T2:
+            # Refresh recency
+            self.T2.move_to_end(key, last=True)
+        else:
+            # Not tracked (metadata loss or sync), treat as protected to avoid premature eviction
+            self.T2[key] = True
+        # Keep resident sizes reasonable; if we somehow exceeded, demote from T2 to T1
+        c = self._capacity(cache_snapshot)
+        if (len(self.T1) + len(self.T2)) > c and self.T2:
+            # Demote oldest of T2 to T1 to preserve capacity accounting symmetry
+            demote = self._lru_key(self.T2)
+            if demote is not None:
+                self.T2.pop(demote, None)
+                self.T1[demote] = True
+=======
+    def update_after_hit(self, cache_snapshot, obj):
+        self._init_or_update(cache_snapshot)
+        now, key = cache_snapshot.access_count, obj.key
+        c = self._capacity(cache_snapshot)
+        self._update_ewma(True)
+        self._decay_counters(now, c)
+        self._record_access(key, now)
+
+        # If in T1, promote to T2 MRU
+        if key in self.T1:
+            self.T1.pop(key, None)
+            self.T2[key] = True
+            # Favor recency slightly when T1 gets hits
+            self._adjust_p(+0.5, c, now, force=False)
+        elif key in self.T2:
+            # Refresh recency and slightly favor frequency split
+            self.T2.move_to_end(key, last=True)
+            # Boost tiny frequency a bit more for protected hits
+            self.freq[key] = min(self.freq.get(key, 0) + 1, 7)
+            self._adjust_p(-1.0, c, now, force=False)
+        else:
+            # Not tracked (metadata loss or sync), keep conservative in T1
+            self.T1[key] = True
+
+        # Keep resident sizes reasonable; if we somehow exceeded, demote from T2 to T1
+        if (len(self.T1) + len(self.T2)) > c and self.T2:
+            demote = self._lru_key(self.T2)
+            if demote is not None:
+                self.T2.pop(demote, None)
+                self.T1[demote] = True
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def update_after_insert(self, cache_snapshot, obj):
+        self._init_or_update(cache_snapshot)
+        now, key = cache_snapshot.access_count, obj.key
+        self._record_access(key, now)
+
+        c = self._capacity(cache_snapshot)
+
+        # If key was in ghost lists, adapt p and place into T2 (ARC)
+        if key in self.B1:
+            # Increase p
+            delta = max(1.0, len(self.B2) / float(max(1, len(self.B1))))
+            self.p = min(float(c), self.p + delta)
+            # Move from B1 to resident protected
+            self.B1.pop(key, None)
+            self.T2[key] = True
+        elif key in self.B2:
+            # Decrease p
+            delta = max(1.0, len(self.B1) / float(max(1, len(self.B2))))
+            self.p = max(0.0, self.p - delta)
+            # Move from B2 to resident protected
+            self.B2.pop(key, None)
+            self.T2[key] = True
+        else:
+            # New key: insert into T1 (probationary)
+            self.T1[key] = True
+
+        # Ensure |T1| + |T2| <= c by demoting if needed (defensive)
+        if (len(self.T1) + len(self.T2)) > c:
+            side = 'T1' if len(self.T1) > int(round(self.p)) else 'T2'
+            if side == 'T1' and self.T1:
+                k = self._lru_key(self.T1)
+                if k is not None:
+                    self.T1.pop(k, None)
+                    self.B1[k] = True
+            elif self.T2:
+                k = self._lru_key(self.T2)
+                if k is not None:
+                    self.T2.pop(k, None)
+                    self.B2[k] = True
+
+        # Trim ghosts: |T1| + |T2| + |B1| + |B2| <= 2c
+        self._trim_ghosts_to(2 * c)
+=======
+    def update_after_insert(self, cache_snapshot, obj):
+        self._init_or_update(cache_snapshot)
+        now, key = cache_snapshot.access_count, obj.key
+        c = self._capacity(cache_snapshot)
+        self._update_ewma(False)
+        self._decay_counters(now, c)
+        self._record_access(key, now)
+
+        # If key was in ghost lists, adapt p and place into T2 (ARC)
+        if key in self.B1:
+            # Increase p (favor recency)
+            delta = max(1.0, len(self.B2) / float(max(1, len(self.B1))))
+            self._adjust_p(+delta, c, now, force=True)
+            # Move from B1 to resident protected
+            self.B1.pop(key, None)
+            self.T2[key] = True
+        elif key in self.B2:
+            # Decrease p (favor frequency)
+            delta = max(1.0, len(self.B1) / float(max(1, len(self.B2))))
+            self._adjust_p(-delta, c, now, force=True)
+            # Move from B2 to resident protected
+            self.B2.pop(key, None)
+            self.T2[key] = True
+        else:
+            # New key: insert into T1 (probationary)
+            self.T1[key] = True
+            # If hits are currently rare (scan-like), bias p upward to protect T2
+            if self.hit_ewma < 0.15:
+                self._adjust_p(+0.5, c, now, force=False)
+
+        # Ensure |T1| + |T2| <= c by demoting if needed (defensive)
+        if (len(self.T1) + len(self.T2)) > c:
+            side = 'T1' if len(self.T1) > int(round(self.p)) else 'T2'
+            if side == 'T1' and self.T1:
+                k = self._lru_key(self.T1)
+                if k is not None:
+                    self.T1.pop(k, None)
+                    self.B1[k] = True
+            elif self.T2:
+                k = self._lru_key(self.T2)
+                if k is not None:
+                    self.T2.pop(k, None)
+                    self.B2[k] = True
+
+        # Trim ghosts: |T1| + |T2| + |B1| + |B2| <= 2c
+        self._trim_ghosts_to(2 * c)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def update_after_evict(self, cache_snapshot, obj, evicted_obj):
+        # Move evicted resident to appropriate ghost list
+        evk = evicted_obj.key
+
+        # Remove from resident lists if present and add to respective ghost
+        if evk in self.T1:
+            self.T1.pop(evk, None)
+            self.B1[evk] = True
+        elif evk in self.T2:
+            self.T2.pop(evk, None)
+            self.B2[evk] = True
+        else:
+            # If not in resident lists, just clear from ghosts to avoid overgrowth
+            self.B1.pop(evk, None)
+            self.B2.pop(evk, None)
+
+        # Cleanup tiny metadata; keep timestamp for ghosts only if we want, but keep simple
+        self.freq.pop(evk, None)
+        # Bound ghosts
+        c = self._capacity(cache_snapshot)
+        self._trim_ghosts_to(2 * c)
+=======
+    def update_after_evict(self, cache_snapshot, obj, evicted_obj):
+        # Move evicted resident to appropriate ghost list
+        evk = evicted_obj.key
+
+        # Remove from resident lists if present and add to respective ghost
+        if evk in self.T1:
+            self.T1.pop(evk, None)
+            self.B1[evk] = True
+        elif evk in self.T2:
+            self.T2.pop(evk, None)
+            self.B2[evk] = True
+        else:
+            # If not in resident lists, just clear from ghosts to avoid overgrowth
+            self.B1.pop(evk, None)
+            self.B2.pop(evk, None)
+
+        # Retain a faded memory of frequency to guide potential readmission
+        if evk in self.freq:
+            self.freq[evk] = max(0, self.freq.get(evk, 0) // 2)
+
+        # Bound ghosts
+        c = self._capacity(cache_snapshot)
+        self._trim_ghosts_to(2 * c)
+>>>>>>> REPLACE
+
+</DIFF>

@@ -1,0 +1,344 @@
+<NAME>
+wtinylfu_slru_random_tail_and_guarded_admission
+</NAME>
+
+<DESCRIPTION>
+This edit strengthens the W-TinyLFU + SLRU hybrid by:
+- Improving victim sampling with a randomized tail window of the LRU segment to reduce deterministic tail bias and better surface stale items.
+- Refining the choose_victim decision to implement a stronger TinyLFU admission gate: evict from M1 when the incoming item is hotter; otherwise evict from the window W; only consider M2 when it is oversized or when W is empty and the incoming item is clearly hotter than the cold M2 candidate. This protects true hot items while avoiding protected pollution.
+- Making W-hit early promotions adaptive to the current protected target size: more aggressive when M2 is under target, conservative otherwise, with thresholds considering both TinyLFU estimates and LRFU-decayed scores.
+- Allowing limited early promotion on insert for clearly hot items, especially when protected is underfilled, to reduce window churn and accelerate phase adjustment.
+
+These targeted changes aim to increase hit rates across diverse workloads by better guarding the protected segment, enhancing admission decisions, and reducing pathological eviction patterns in the LRU tail.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def _sample_cold_candidate(self, od: OrderedDict, now: int):
+        """
+        Return (key, tiny_est, decayed) for the coldest among the k LRU keys,
+        using lexicographic min on (tiny_est, decayed_score).
+        """
+        if not od:
+            return None, None, None
+        k = min(self._sample_k, len(od))
+        it = iter(od.keys())  # from LRU to MRU
+        best_k, best_est, best_dec = None, None, None
+        for _ in range(k):
+            key = next(it)
+            est = self.sketch.estimate(key)
+            dec = self._decayed_score(key, now)
+            if (best_est is None
+                or est < best_est
+                or (est == best_est and dec < best_dec)):
+                best_k, best_est, best_dec = key, est, dec
+        return best_k, best_est, best_dec
+=======
+    def _sample_cold_candidate(self, od: OrderedDict, now: int):
+        """
+        Return (key, tiny_est, decayed) for the coldest among a randomized
+        slice of the LRU tail. We consider up to 4K oldest entries and sample
+        K contiguous keys from a pseudo-random offset to avoid deterministic
+        tail bias. Choose lexicographic min on (tiny_est, decayed_score).
+        """
+        if not od:
+            return None, None, None
+        # Determine sampling window within the LRU tail
+        k = min(self._sample_k, len(od))
+        tail_len = min(len(od), k * 4)
+        # Collect the tail keys (LRU->MRU up to tail_len)
+        tail_keys = []
+        it = iter(od.keys())
+        for _ in range(tail_len):
+            try:
+                tail_keys.append(next(it))
+            except StopIteration:
+                break
+        if not tail_keys:
+            return None, None, None
+        # Pseudo-random offset based on time to diversify selection
+        span = max(1, tail_len - k + 1)
+        off = (now * 1103515245 + 12345) & 0x7FFFFFFF
+        off %= span
+        # Evaluate candidates in the sampled window
+        best_k, best_est, best_dec = None, None, None
+        for idx in range(off, off + k):
+            key = tail_keys[idx]
+            est = self.sketch.estimate(key)
+            dec = self._decayed_score(key, now)
+            if (best_est is None
+                or est < best_est
+                or (est == best_est and dec < best_dec)):
+                best_k, best_est, best_dec = key, est, dec
+                if best_est == 0 and best_dec == 0.0:
+                    break
+        return best_k, best_est, best_dec
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def choose_victim(self, cache_snapshot, new_obj) -> str:
+        """
+        Hybrid eviction:
+        - TinyLFU admission: compare f(new) to a sampled cold candidate from M1.
+          * If f(new) > f(cand_M1) + bias: evict cand_M1 (admit new).
+          * Else: evict W's LRU (reject new from main this round).
+        - If M1 is empty, optionally compare against a cold candidate from M2
+          when protected is oversized or W is empty.
+        - Demotions/victim choices within segments rely on decayed scores.
+        """
+        self._ensure_capacity(cache_snapshot.capacity)
+        self._self_heal(cache_snapshot)
+
+        now = cache_snapshot.access_count
+
+        # Candidates
+        cand_w = self._lru(self.W)
+        cand_m1, f_m1, d_m1 = self._sample_cold_candidate(self.M1, now)
+        cand_m2, f_m2, d_m2 = (None, None, None)
+        if cand_m1 is None:
+            cand_m2, f_m2, d_m2 = self._sample_cold_candidate(self.M2, now)
+
+        f_new = self.sketch.estimate(new_obj.key)
+
+        # Prefer replacing a cold M1 entry if new is hotter (with slight bias)
+        if cand_m1 is not None and f_new > (f_m1 or 0) + 1:
+            return cand_m1
+
+        # Otherwise evict from the window to preserve main
+        if cand_w is not None:
+            return cand_w
+
+        # If no window/M1 option, consider replacing a cold protected entry
+        if cand_m2 is not None and f_new > (f_m2 or 0) + 2:
+            return cand_m2
+
+        # Fallbacks: evict coldest in M1 else M2 by decayed score
+        if self.M1:
+            k, _, _ = self._sample_cold_candidate(self.M1, now)
+            if k is not None:
+                return k
+            return self._lru(self.M1)
+        if self.M2:
+            k, _, _ = self._sample_cold_candidate(self.M2, now)
+            if k is not None:
+                return k
+            return self._lru(self.M2)
+
+        # Last resort: pick any key from cache
+        return next(iter(cache_snapshot.cache))
+=======
+    def choose_victim(self, cache_snapshot, new_obj) -> str:
+        """
+        Hybrid eviction with guarded admission:
+        - Prefer evicting a cold M1 entry if the incoming item is hotter.
+        - Else evict from window W (to protect main).
+        - Only consider evicting from M2 when it is oversized or W is empty,
+          and only if the incoming item is clearly hotter than the cold M2 candidate.
+        - Fall back to the colder of M1/M2 with a protection bias.
+        """
+        self._ensure_capacity(cache_snapshot.capacity)
+        self._self_heal(cache_snapshot)
+
+        now = cache_snapshot.access_count
+        _, _, prot_tgt = self._targets()
+
+        # Candidates
+        cand_w = self._lru(self.W)
+        cand_m1, f_m1, d_m1 = self._sample_cold_candidate(self.M1, now)
+        cand_m2, f_m2, d_m2 = self._sample_cold_candidate(self.M2, now)
+
+        f_new = self.sketch.estimate(new_obj.key)
+
+        # Admission gate against M1: if new is hotter than a cold M1, replace it
+        if cand_m1 is not None and f_new >= (f_m1 or 0) + 1:
+            return cand_m1
+
+        # Guarded check against M2: only when M2 oversized or no window to shed
+        if cand_m2 is not None:
+            if len(self.M2) > prot_tgt or cand_w is None:
+                if f_new >= (f_m2 or 0) + 2:
+                    return cand_m2
+
+        # Otherwise, evict from the window to preserve main
+        if cand_w is not None:
+            return cand_w
+
+        # No window; choose between M1 and M2 with protective bias
+        if cand_m1 is None and cand_m2 is None:
+            # Last resort: any key from cache
+            return next(iter(cache_snapshot.cache))
+        if cand_m1 is None:
+            return cand_m2
+        if cand_m2 is None:
+            return cand_m1
+
+        # Compute adjusted scores (lower is colder); bias protects M2
+        score_m1 = (f_m1 or 0)
+        score_m2 = (f_m2 or 0) + 1
+        if score_m1 < score_m2:
+            return cand_m1
+        if score_m2 < score_m1:
+            return cand_m2
+        # Tie-break with decayed score (LRFU)
+        if (d_m1 or 0.0) <= (d_m2 or 0.0):
+            return cand_m1
+        return cand_m2
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        if key in self.W:
+            self.hits_w += 1
+            # Early promotion if strong frequency to avoid window churn
+            est = self.sketch.estimate(key)
+            dec = self._decayed_score(key, now)
+            if est >= 3 or dec >= 1.5:
+                # Move from window to protected
+                self.W.pop(key, None)
+                self._touch(self.M2, key)
+                # Keep protected region within target using decayed-aware demotion
+                _, _, prot_tgt = self._targets()
+                if len(self.M2) > prot_tgt:
+                    demote, _, _ = self._sample_cold_candidate(self.M2, now)
+                    if demote is not None:
+                        self.M2.pop(demote, None)
+                        self._touch(self.M1, demote)
+            else:
+                self._touch(self.W, key)
+            self._maybe_tune(now)
+            return
+=======
+        if key in self.W:
+            self.hits_w += 1
+            # Early promotion if strong frequency to avoid window churn
+            est = self.sketch.estimate(key)
+            dec = self._decayed_score(key, now)
+            _, _, prot_tgt = self._targets()
+            promote = False
+            if len(self.M2) < prot_tgt:
+                # Underfilled protected: promote more aggressively
+                if est >= 2 or dec >= 1.0:
+                    promote = True
+            else:
+                # Normal thresholds
+                if est >= 3 or dec >= 1.5:
+                    promote = True
+            if promote:
+                # Move from window to protected
+                self.W.pop(key, None)
+                self._touch(self.M2, key)
+                # Keep protected region within target using decayed-aware demotion
+                if len(self.M2) > prot_tgt:
+                    demote, _, _ = self._sample_cold_candidate(self.M2, now)
+                    if demote is not None:
+                        self.M2.pop(demote, None)
+                        self._touch(self.M1, demote)
+            else:
+                self._touch(self.W, key)
+            self._maybe_tune(now)
+            return
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def on_insert(self, cache_snapshot, obj):
+        """
+        Insert (on miss) processing:
+        - Initialize LRFU metadata modestly (to reduce scan pollution).
+        - Increment TinyLFU.
+        - Insert new key into window W (MRU).
+        - If W exceeds target, move W's LRU to main probationary (M1).
+        - Keep protected region within target by demoting a decayed-cold entry if needed.
+        """
+        self._ensure_capacity(cache_snapshot.capacity)
+        now = cache_snapshot.access_count
+        key = obj.key
+        self.sketch.increment(key, 1)
+
+        # Initialize decayed metadata
+        self.last_time[key] = now
+        self.score[key] = 0.5
+
+        # Ensure it's not tracked elsewhere
+        self.W.pop(key, None)
+        self.M1.pop(key, None)
+        self.M2.pop(key, None)
+
+        # Insert into window
+        self._touch(self.W, key)
+
+        # Rebalance: if W is beyond target, move W's LRU to M1 (admission path)
+        w_tgt, _, prot_tgt = self._targets()
+        if len(self.W) > w_tgt:
+            w_lru = self._lru(self.W)
+            if w_lru is not None and w_lru != key:
+                self.W.pop(w_lru, None)
+                # Move into M1 probationary
+                self._touch(self.M1, w_lru)
+
+        # Keep protected region within target (decayed-aware demotion)
+        if len(self.M2) > prot_tgt:
+            demote, _, _ = self._sample_cold_candidate(self.M2, now)
+            if demote is not None:
+                self.M2.pop(demote, None)
+                self._touch(self.M1, demote)
+
+        # Periodically tune window size
+        self._maybe_tune(now)
+=======
+    def on_insert(self, cache_snapshot, obj):
+        """
+        Insert (on miss) processing:
+        - Initialize LRFU metadata modestly (to reduce scan pollution).
+        - Increment TinyLFU.
+        - Insert new key into window W (MRU) or directly into protected if clearly hot.
+        - If W exceeds target, move W's LRU to main probationary (M1).
+        - Keep protected region within target by demoting a decayed-cold entry if needed.
+        """
+        self._ensure_capacity(cache_snapshot.capacity)
+        now = cache_snapshot.access_count
+        key = obj.key
+        self.sketch.increment(key, 1)
+
+        # Initialize decayed metadata
+        self.last_time[key] = now
+        self.score[key] = 0.5
+
+        # Ensure it's not tracked elsewhere
+        self.W.pop(key, None)
+        self.M1.pop(key, None)
+        self.M2.pop(key, None)
+
+        # Decide placement: allow early protected admission for clearly hot keys
+        w_tgt, _, prot_tgt = self._targets()
+        est = self.sketch.estimate(key)
+        if est >= 5 or (len(self.M2) < prot_tgt and est >= 3):
+            # Early promotion to protected to avoid window churn
+            self._touch(self.M2, key)
+        else:
+            # Insert into window
+            self._touch(self.W, key)
+
+        # Rebalance: if W is beyond target, move W's LRU to M1 (admission path)
+        if len(self.W) > w_tgt:
+            w_lru = self._lru(self.W)
+            if w_lru is not None and w_lru != key:
+                self.W.pop(w_lru, None)
+                # Move into M1 probationary
+                self._touch(self.M1, w_lru)
+
+        # Keep protected region within target (decayed-aware demotion)
+        if len(self.M2) > prot_tgt:
+            demote, _, _ = self._sample_cold_candidate(self.M2, now)
+            if demote is not None:
+                self.M2.pop(demote, None)
+                self._touch(self.M1, demote)
+
+        # Periodically tune window size
+        self._maybe_tune(now)
+>>>>>>> REPLACE
+</DIFF>

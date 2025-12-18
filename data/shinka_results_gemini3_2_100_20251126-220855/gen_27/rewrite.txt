@@ -1,0 +1,153 @@
+# EVOLVE-BLOCK-START
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+from collections import OrderedDict
+import random
+
+# S3-FIFO + Randomization Global State
+m_small = OrderedDict() # S: Small FIFO queue (probation)
+m_main = OrderedDict()  # M: Main LRU queue (protected)
+m_ghost = OrderedDict() # G: Ghost FIFO queue (history)
+m_freq = {}             # Frequency tracking
+m_last_access_count = -1
+
+def _check_reset(cache_snapshot):
+    """Resets global state if a new trace is detected."""
+    global m_small, m_main, m_ghost, m_freq, m_last_access_count
+    if cache_snapshot.access_count < m_last_access_count:
+        m_small.clear()
+        m_main.clear()
+        m_ghost.clear()
+        m_freq.clear()
+    m_last_access_count = cache_snapshot.access_count
+
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO Eviction Policy with Randomization:
+    - Maintains Small (10%) and Main (90%) queues.
+    - Promotes from Small to Main if accessed (lazy promotion).
+    - Evicts from Small using a randomized window to break loops.
+    - Evicts from Main using Second Chance + LRU.
+    '''
+    _check_reset(cache_snapshot)
+    capacity = cache_snapshot.capacity
+    target_s = max(1, int(capacity * 0.1))
+    
+    # We iterate until we find a victim
+    while True:
+        # 1. Decide which queue to evict from
+        # Prefer Small if it's larger than target, or if Main is empty
+        evict_from_small = len(m_small) > target_s or len(m_main) == 0
+        
+        if evict_from_small:
+            if not m_small:
+                # Should not happen unless capacity is 0
+                return next(iter(m_main)) if m_main else None
+            
+            # Check the head of Small
+            candidate_key = next(iter(m_small))
+            freq = m_freq.get(candidate_key, 0)
+            
+            if freq > 0:
+                # Promotion: Move to Main
+                del m_small[candidate_key]
+                m_main[candidate_key] = 1
+                m_main.move_to_end(candidate_key) # Insert at tail (MRU)
+                m_freq[candidate_key] = 0 # Reset freq
+                continue # Loop again to find real victim
+            else:
+                # Victim found in Small (freq == 0)
+                # Randomization: Inspect first k items to avoid lock-step with loops
+                k = 5
+                candidates = []
+                it = iter(m_small)
+                for _ in range(k):
+                    try:
+                        k_key = next(it)
+                        if m_freq.get(k_key, 0) == 0:
+                            candidates.append(k_key)
+                    except StopIteration:
+                        break
+                
+                # If we found valid candidates, pick one randomly
+                if candidates:
+                    victim_key = random.choice(candidates)
+                else:
+                    # Fallback to head if all checked have freq > 0 (should get promoted next loop)
+                    victim_key = candidate_key 
+                
+                return cache_snapshot.cache[victim_key]
+        
+        else:
+            # Evict from Main
+            if not m_main:
+                 return next(iter(m_small)) if m_small else None
+
+            # Check head of Main (LRU/FIFO)
+            candidate_key = next(iter(m_main))
+            freq = m_freq.get(candidate_key, 0)
+            
+            if freq > 0:
+                # Second Chance: Reinsert at tail
+                m_main.move_to_end(candidate_key)
+                m_freq[candidate_key] = 0 # Reset freq (giving one more chance)
+                continue
+            else:
+                # Victim found in Main
+                return cache_snapshot.cache[candidate_key]
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    On Hit:
+    - Update frequency.
+    - If in Main, move to MRU (LRU behavior).
+    - If in Small, do NOT move (lazy promotion).
+    '''
+    _check_reset(cache_snapshot)
+    key = obj.key
+    m_freq[key] = min(3, m_freq.get(key, 0) + 1)
+    
+    if key in m_main:
+        m_main.move_to_end(key)
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On Insert:
+    - If in Ghost, insert to Main (recall).
+    - Else insert to Small (probation).
+    '''
+    _check_reset(cache_snapshot)
+    key = obj.key
+    
+    if key in m_ghost:
+        del m_ghost[key]
+        m_main[key] = 1
+        m_main.move_to_end(key)
+        m_freq[key] = 0 # Start clean in Main
+    else:
+        m_small[key] = 1
+        m_small.move_to_end(key)
+        m_freq[key] = 0
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    On Eviction:
+    - Remove from internal queues.
+    - Add to Ghost.
+    '''
+    key = evicted_obj.key
+    
+    if key in m_small:
+        del m_small[key]
+    elif key in m_main:
+        del m_main[key]
+        
+    if key in m_freq:
+        del m_freq[key]
+        
+    # Add to Ghost
+    m_ghost[key] = 1
+    m_ghost.move_to_end(key)
+    
+    if len(m_ghost) > cache_snapshot.capacity:
+        m_ghost.popitem(last=False)
+# EVOLVE-BLOCK-END

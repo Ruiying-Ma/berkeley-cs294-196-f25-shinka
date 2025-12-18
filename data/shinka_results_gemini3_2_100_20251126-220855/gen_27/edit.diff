@@ -1,0 +1,284 @@
+--- a/original.py
++++ b/original.py
+@@ -1,164 +1,173 @@
+ # EVOLVE-BLOCK-START
+ """Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+ from collections import OrderedDict
+ import random
+ 
+-# ARC Global State
+-m_t1 = OrderedDict() # T1: Recent cache entries
+-m_t2 = OrderedDict() # T2: Frequent cache entries
+-m_b1 = OrderedDict() # B1: Ghost entries evicted from T1
+-m_b2 = OrderedDict() # B2: Ghost entries evicted from T2
+-m_p = 0              # Target size for T1
++# S3-FIFO + Randomization Global State
++m_small = OrderedDict() # S: Small FIFO queue (probation)
++m_main = OrderedDict()  # M: Main LRU queue (protected)
++m_ghost = OrderedDict() # G: Ghost FIFO queue (history)
++m_freq = {}             # Frequency tracking
+ m_last_access_count = -1
+ 
+ def _check_reset(cache_snapshot):
+-    """Resets global state if a new trace is detected based on access count rollback."""
+-    global m_t1, m_t2, m_b1, m_b2, m_p, m_last_access_count
++    """Resets global state if a new trace is detected."""
++    global m_small, m_main, m_ghost, m_freq, m_last_access_count
+     if cache_snapshot.access_count < m_last_access_count:
+-        m_t1.clear()
+-        m_t2.clear()
+-        m_b1.clear()
+-        m_b2.clear()
+-        m_p = 0
++        m_small.clear()
++        m_main.clear()
++        m_ghost.clear()
++        m_freq.clear()
+     m_last_access_count = cache_snapshot.access_count
+ 
+ def evict(cache_snapshot, obj):
+     '''
+-    ARC Eviction Policy:
+-    Selects a victim from T1 or T2 based on the target size 'p'.
+-    Adjusts 'p' if the incoming object was observed in ghost lists B1/B2.
++    S3-FIFO Eviction Policy with Randomization:
++    - Maintains Small (10%) and Main (90%) queues.
++    - Promotes from Small to Main if accessed (lazy promotion).
++    - Evicts from Small using a randomized window to break loops.
++    - Evicts from Main using Second Chance + LRU.
+     '''
+     _check_reset(cache_snapshot)
+-    global m_p
++    capacity = cache_snapshot.capacity
++    target_s = max(1, int(capacity * 0.1))
++    
++    # We iterate until we find a victim
++    while True:
++        # 1. Decide which queue to evict from
++        # Prefer Small if it's larger than target, or if Main is empty
++        evict_from_small = len(m_small) > target_s or len(m_main) == 0
++        
++        if evict_from_small:
++            if not m_small:
++                # Should not happen unless capacity is 0
++                return next(iter(m_main)) if m_main else None
++            
++            # Check the head of Small
++            candidate_key = next(iter(m_small))
++            freq = m_freq.get(candidate_key, 0)
++            
++            if freq > 0:
++                # Promotion: Move to Main
++                del m_small[candidate_key]
++                m_main[candidate_key] = 1
++                m_main.move_to_end(candidate_key) # Insert at tail (MRU)
++                m_freq[candidate_key] = 0 # Reset freq
++                continue # Loop again to find real victim
++            else:
++                # Victim found in Small (freq == 0)
++                # Randomization: Inspect first k items to avoid lock-step with loops
++                k = 5
++                candidates = []
++                it = iter(m_small)
++                for _ in range(k):
++                    try:
++                        k_key = next(it)
++                        if m_freq.get(k_key, 0) == 0:
++                            candidates.append(k_key)
++                    except StopIteration:
++                        break
++                
++                # If we found valid candidates, pick one randomly
++                if candidates:
++                    victim_key = random.choice(candidates)
++                else:
++                    # Fallback to head if all checked have freq > 0 (should get promoted next loop)
++                    victim_key = candidate_key 
++                
++                return cache_snapshot.cache[victim_key]
++        
++        else:
++            # Evict from Main
++            if not m_main:
++                 return next(iter(m_small)) if m_small else None
+ 
+-    key = obj.key
+-    capacity = cache_snapshot.capacity
+-
+-    # 1. Adapt p (target size of T1) based on hits in ghost lists
+-    if key in m_b1:
+-        delta = 1
+-        if len(m_b1) > 0 and len(m_b2) > 0:
+-            delta = max(1, len(m_b2) / len(m_b1))
+-        m_p = min(capacity, m_p + delta)
+-    elif key in m_b2:
+-        delta = 1
+-        if len(m_b1) > 0 and len(m_b2) > 0:
+-            delta = max(1, len(m_b1) / len(m_b2))
+-        m_p = max(0, m_p - delta)
+-
+-    # 2. Select victim
+-    evict_t1 = False
+-    if len(m_t1) > 0:
+-        if len(m_t1) > m_p:
+-            evict_t1 = True
+-        elif key in m_b2 and len(m_t1) == int(m_p):
+-            evict_t1 = True
+-
+-    # If T2 is empty, we must evict from T1 (if possible)
+-    if len(m_t2) == 0:
+-        evict_t1 = True
+-
+-    if evict_t1 and m_t1:
+-        # Randomized eviction from T1 to break loops/scans
+-        # Sample first few items (LRU end) and pick one
+-        k = 5
+-        candidates = []
+-        it = iter(m_t1)
+-        try:
+-            for _ in range(k):
+-                candidates.append(next(it))
+-        except StopIteration:
+-            pass
+-        return random.choice(candidates)
+-    else:
+-        # Evict LRU from T2
+-        # Fallback to T1 if T2 is empty (shouldn't happen here if logic holds)
+-        return next(iter(m_t2)) if m_t2 else next(iter(m_t1))
++            # Check head of Main (LRU/FIFO)
++            candidate_key = next(iter(m_main))
++            freq = m_freq.get(candidate_key, 0)
++            
++            if freq > 0:
++                # Second Chance: Reinsert at tail
++                m_main.move_to_end(candidate_key)
++                m_freq[candidate_key] = 0 # Reset freq (giving one more chance)
++                continue
++            else:
++                # Victim found in Main
++                return cache_snapshot.cache[candidate_key]
+ 
+ def update_after_hit(cache_snapshot, obj):
+     '''
+-    On Cache Hit:
+-    - If in T1, move to T2 (MRU).
+-    - If in T2, move to MRU of T2.
++    On Hit:
++    - Update frequency.
++    - If in Main, move to MRU (LRU behavior).
++    - If in Small, do NOT move (lazy promotion).
+     '''
+     _check_reset(cache_snapshot)
+     key = obj.key
+-
+-    if key in m_t1:
+-        del m_t1[key]
+-        m_t2[key] = 1
+-        m_t2.move_to_end(key)
+-    elif key in m_t2:
+-        m_t2.move_to_end(key)
+-    else:
+-        # Should be in cache, but if missing from metadata, add to T2
+-        m_t2[key] = 1
+-        m_t2.move_to_end(key)
++    m_freq[key] = min(3, m_freq.get(key, 0) + 1)
++    
++    if key in m_main:
++        m_main.move_to_end(key)
+ 
+ def update_after_insert(cache_snapshot, obj):
+     '''
+-    On Cache Insert (Miss):
+-    - If previously in ghost B1/B2, promote to T2.
+-    - Otherwise, insert into T1.
++    On Insert:
++    - If in Ghost, insert to Main (recall).
++    - Else insert to Small (probation).
+     '''
+     _check_reset(cache_snapshot)
+     key = obj.key
+-
+-    if key in m_b1:
+-        del m_b1[key]
+-        m_t2[key] = 1
+-        m_t2.move_to_end(key)
+-    elif key in m_b2:
+-        del m_b2[key]
+-        m_t2[key] = 1
+-        m_t2.move_to_end(key)
++    
++    if key in m_ghost:
++        del m_ghost[key]
++        m_main[key] = 1
++        m_main.move_to_end(key)
++        m_freq[key] = 0 # Start clean in Main
+     else:
+-        # Totally new item
+-        m_t1[key] = 1
+-        m_t1.move_to_end(key)
++        m_small[key] = 1
++        m_small.move_to_end(key)
++        m_freq[key] = 0
+ 
+ def update_after_evict(cache_snapshot, obj, evicted_obj):
+     '''
+     On Eviction:
+-    - Move evicted key from T1/T2 to B1/B2.
+-    - Maintain capacity of ghost lists.
++    - Remove from internal queues.
++    - Add to Ghost.
+     '''
+     key = evicted_obj.key
+-    capacity = cache_snapshot.capacity
+-
+-    if key in m_t1:
+-        del m_t1[key]
+-        m_b1[key] = 1
+-        m_b1.move_to_end(key)
+-    elif key in m_t2:
+-        del m_t2[key]
+-        m_b2[key] = 1
+-        m_b2.move_to_end(key)
+-
+-    # Restrict size of ghost lists to capacity (simplification of ARC)
+-    if len(m_b1) > capacity:
+-        m_b1.popitem(last=False)
+-    if len(m_b2) > capacity:
+-        m_b2.popitem(last=False)
+-
++    
++    if key in m_small:
++        del m_small[key]
++    elif key in m_main:
++        del m_main[key]
++        
++    if key in m_freq:
++        del m_freq[key]
++        
++    # Add to Ghost
++    m_ghost[key] = 1
++    m_ghost.move_to_end(key)
++    
++    if len(m_ghost) > cache_snapshot.capacity:
++        m_ghost.popitem(last=False)
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

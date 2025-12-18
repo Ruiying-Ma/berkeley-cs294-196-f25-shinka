@@ -1,0 +1,154 @@
+<NAME>
+S3FIFO_GhostBonus_Decay
+</NAME>
+
+<DESCRIPTION>
+This edit implements several improvements to the S3-FIFO algorithm to minimize miss rate:
+1.  **Extended Ghost Registry**: Increases the ghost registry capacity from 1x to 2x the cache capacity. This helps in detecting loops and working sets that are larger than the physical cache, preventing premature eviction of recurrent items (addressing Traces 27, 34).
+2.  **Tenancy Bonus**: When an object is promoted from the ghost registry (indicating it is a recurrent item), it is given a frequency bonus (starting at 2 instead of 0). This protects these valuable items in the Main queue from immediate eviction.
+3.  **Frequency Decay in Main**: Modifies the Main queue eviction logic to use a decay mechanism (`freq - 1`) instead of resetting frequency to 0. This allows "hotter" items (with higher accumulated frequency) to stay in the cache longer, surviving multiple passes through the queue.
+4.  **Higher Frequency Cap**: Increases the maximum frequency cap from 3 to 5 in `update_after_hit` to support the decay strategy and better differentiate hot items.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        # 1. Prefer evicting from Small if it exceeds target OR Main is empty
+        if len(_s3_small) > s_target or not _s3_main:
+            if not _s3_small:
+                # Fallback if both empty (should imply cache empty)
+                if cache_snapshot.cache:
+                    return next(iter(cache_snapshot.cache))
+                return None
+
+            candidate, _ = _s3_small.popitem(last=False) # FIFO head
+
+            # Sync check
+            if candidate not in cache_snapshot.cache:
+                _s3_freq.pop(candidate, None)
+                continue
+
+            freq = _s3_freq.get(candidate, 0)
+            if freq > 0:
+                # Promotion: Small -> Main
+                _s3_main[candidate] = None
+                _s3_freq[candidate] = 0
+                continue
+            else:
+                # Eviction: Small -> Ghost -> Out
+                _s3_ghost[candidate] = None
+                if len(_s3_ghost) > capacity:
+                    _s3_ghost.popitem(last=False)
+                _s3_freq.pop(candidate, None)
+                return candidate
+
+        # 2. Process Main
+        else:
+            if not _s3_main:
+                 continue
+
+            candidate, _ = _s3_main.popitem(last=False)
+
+            if candidate not in cache_snapshot.cache:
+                _s3_freq.pop(candidate, None)
+                continue
+
+            freq = _s3_freq.get(candidate, 0)
+            if freq > 0:
+                # Reinsertion: Main -> Main (Second Chance)
+                _s3_main[candidate] = None
+                _s3_freq[candidate] = 0
+                continue
+            else:
+=======
+        # 1. Prefer evicting from Small if it exceeds target OR Main is empty
+        if len(_s3_small) > s_target or not _s3_main:
+            if not _s3_small:
+                # Fallback if both empty (should imply cache empty)
+                if cache_snapshot.cache:
+                    return next(iter(cache_snapshot.cache))
+                return None
+
+            candidate, _ = _s3_small.popitem(last=False) # FIFO head
+
+            # Sync check
+            if candidate not in cache_snapshot.cache:
+                _s3_freq.pop(candidate, None)
+                continue
+
+            freq = _s3_freq.get(candidate, 0)
+            if freq > 0:
+                # Promotion: Small -> Main
+                _s3_main[candidate] = None
+                _s3_freq[candidate] = 0
+                continue
+            else:
+                # Eviction: Small -> Ghost -> Out
+                _s3_ghost[candidate] = None
+                # Expanded ghost capacity (2x) for better loop detection
+                if len(_s3_ghost) > capacity * 2:
+                    _s3_ghost.popitem(last=False)
+                _s3_freq.pop(candidate, None)
+                return candidate
+
+        # 2. Process Main
+        else:
+            if not _s3_main:
+                 continue
+
+            candidate, _ = _s3_main.popitem(last=False)
+
+            if candidate not in cache_snapshot.cache:
+                _s3_freq.pop(candidate, None)
+                continue
+
+            freq = _s3_freq.get(candidate, 0)
+            if freq > 0:
+                # Reinsertion: Main -> Main (Decay)
+                _s3_main[candidate] = None
+                _s3_freq[candidate] = freq - 1
+                continue
+            else:
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def update_after_hit(cache_snapshot, obj):
+    global _s3_freq
+    _check_reset(cache_snapshot)
+    curr = _s3_freq.get(obj.key, 0)
+    # Cap frequency to avoid integer overflow issues
+    _s3_freq[obj.key] = min(curr + 1, 3)
+
+def update_after_insert(cache_snapshot, obj):
+    global _s3_small, _s3_main, _s3_ghost, _s3_freq
+    _check_reset(cache_snapshot)
+
+    key = obj.key
+    # Ghost check for quick promotion
+    if key in _s3_ghost:
+        if key not in _s3_main and key not in _s3_small:
+            _s3_main[key] = None
+            _s3_freq[key] = 0
+        del _s3_ghost[key]
+    else:
+=======
+def update_after_hit(cache_snapshot, obj):
+    global _s3_freq
+    _check_reset(cache_snapshot)
+    curr = _s3_freq.get(obj.key, 0)
+    # Cap frequency higher to support Decay strategy
+    _s3_freq[obj.key] = min(curr + 1, 5)
+
+def update_after_insert(cache_snapshot, obj):
+    global _s3_small, _s3_main, _s3_ghost, _s3_freq
+    _check_reset(cache_snapshot)
+
+    key = obj.key
+    # Ghost check for quick promotion
+    if key in _s3_ghost:
+        if key not in _s3_main and key not in _s3_small:
+            _s3_main[key] = None
+            # Tenancy bonus: give it some buffer in Main
+            _s3_freq[key] = 2
+        del _s3_ghost[key]
+    else:
+>>>>>>> REPLACE
+</DIFF>

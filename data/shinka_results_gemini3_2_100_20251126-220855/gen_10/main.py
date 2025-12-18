@@ -1,0 +1,134 @@
+# EVOLVE-BLOCK-START
+from collections import OrderedDict
+
+# S3-FIFO Implementation State
+# m_small: Small FIFO queue (Probationary)
+# m_main: Main FIFO queue (Protected)
+# m_ghost: Ghost FIFO queue (History for Small eviction)
+# m_freq: Set of keys accessed while in cache (Visited bit)
+
+m_small = OrderedDict()
+m_main = OrderedDict()
+m_ghost = OrderedDict()
+m_freq = set()
+
+def evict(cache_snapshot, obj):
+    '''
+    S3-FIFO Eviction Policy.
+    - Maintains a Small queue (10%) and Main queue (90%).
+    - New items enter Small. If accessed in Small, they move to Main on eviction.
+    - Main queue operates with a Second-Chance (SIEVE) policy.
+    - Ghost list rescues items evicted from Small if seen again quickly.
+    '''
+    capacity = cache_snapshot.capacity
+    # Target size for the small queue (10% of capacity, minimum 1)
+    small_target = max(1, int(capacity * 0.1))
+
+    # Loop until a victim is chosen and removed from internal queues
+    while True:
+        # Determine if we should evict from Small or Main
+        # Primary rule: Evict from Small if it exceeds its target size.
+        # Fallback: If Main is empty, we must evict from Small.
+        evict_from_small = len(m_small) > small_target or not m_main
+
+        if evict_from_small:
+            if not m_small:
+                # Should not happen if cache is full and m_main is empty, 
+                # but safety break to avoid infinite loop.
+                return None 
+            
+            # Peek at the candidate (LRU of Small)
+            key = next(iter(m_small))
+            
+            if key in m_freq:
+                # Hit in Small: Promote to Main (Second Chance)
+                m_freq.discard(key)
+                m_small.move_to_end(key, last=True) # Optional: move to end before popping? 
+                # Actually, standard S3-FIFO moves to Main immediately.
+                m_small.popitem(last=False)
+                m_main[key] = None
+                # Did not reduce cache size, continue loop
+            else:
+                # Miss in Small: Evict and add to Ghost
+                m_small.popitem(last=False)
+                m_ghost[key] = None
+                # Limit ghost size (usually equal to capacity)
+                if len(m_ghost) > capacity:
+                    m_ghost.popitem(last=False)
+                return key
+        else:
+            # Evict from Main
+            if not m_main:
+                # Should not happen
+                return None
+            
+            key = next(iter(m_main))
+            
+            if key in m_freq:
+                # Hit in Main: Keep in Main (Second Chance)
+                m_freq.discard(key)
+                m_main.move_to_end(key, last=True) # Reinsert at MRU
+                # Did not reduce cache size, continue loop
+            else:
+                # Miss in Main: Evict
+                # Items evicted from Main are not added to Ghost in S3-FIFO
+                m_main.popitem(last=False)
+                return key
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    On hit, mark the object as accessed. 
+    This is a lightweight operation compared to LRU promotion.
+    '''
+    m_freq.add(obj.key)
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On insert:
+    - If in Ghost, insert to Main (rescue).
+    - Else, insert to Small.
+    '''
+    key = obj.key
+    # New insertion resets access bit
+    m_freq.discard(key)
+    
+    if key in m_ghost:
+        # Rescued from Ghost -> Main
+        del m_ghost[key]
+        m_main[key] = None
+    else:
+        # New -> Small
+        m_small[key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Cleanup access bits and ensure consistency.
+    '''
+    m_freq.discard(evicted_obj.key)
+    # Ensure removed from internal queues (safety)
+    if evicted_obj.key in m_small:
+        del m_small[evicted_obj.key]
+    if evicted_obj.key in m_main:
+        del m_main[evicted_obj.key]
+
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

@@ -1,0 +1,217 @@
+--- a/original.py
++++ b/original.py
+@@ -1,121 +1,139 @@
+ # EVOLVE-BLOCK-START
+ """
+-S3-FIFO Cache Eviction Algorithm Implementation.
+-Inspired by S3-FIFO (Simple, Scalable, Static) which uses a small FIFO queue (S)
+-and a main FIFO queue (M) with re-insertion to approximate LRU with scan resistance
+-and frequency awareness.
++Advanced S3-FIFO (AdvS3FIFO)
++Enhancements:
++- Conditional Demotion: M->S demotion only when S is not full. Prevents S pollution.
++- Expanded Ghost: Ghost registry size set to 4x capacity to catch larger loops.
++- Frequency Counters: Uses counters (0-3) for finer granularity.
++- Origin Tracking: Implicitly handles M-evicts by adding to Ghost, ensuring quick recovery.
+ """
+ 
+ from collections import OrderedDict
+ 
+-# Global metadata structures
+-# s_queue: Small FIFO queue (probationary)
+-# m_queue: Main FIFO queue (protected)
+-# ghost_registry: Ghost FIFO queue (history of evicted probationary items)
+-# accessed_bits: Set of keys accessed while in cache (simulating reference bits)
++# Global State
++# s_queue: Small/Probationary Queue
++# m_queue: Main/Protected Queue
++# ghost_registry: History of evictions (both S and M)
++# freq_map: Frequency counter (0-3) for items in cache
+ 
+ s_queue = OrderedDict()
+ m_queue = OrderedDict()
+ ghost_registry = OrderedDict()
+-accessed_bits = set()
++freq_map = {}
+ 
+ def evict(cache_snapshot, obj):
+     '''
+-    Selects a victim using S3-FIFO policy.
+-    Iterates through S and M queues to find a candidate without an active access bit.
+-    Promotes/Re-inserts items with access bits.
++    Selects a victim with conditional demotion and strict S3-FIFO logic.
+     '''
+-    # Target size for the small queue (10% of capacity)
+-    s_capacity = max(int(cache_snapshot.capacity * 0.1), 1)
++    capacity = cache_snapshot.capacity
++    # S target: 10% of capacity.
++    s_target = max(int(capacity * 0.1), 1)
++    
++    # Ghost limit: 4x capacity (aggressive history)
++    ghost_limit = capacity * 4
+ 
+     while True:
+-        # Check S queue first if it exceeds capacity or if M is empty
+-        if len(s_queue) > s_capacity or (len(s_queue) > 0 and len(m_queue) == 0):
+-            candidate_key, _ = s_queue.popitem(last=False) # Pop from head (FIFO)
++        # Determine which queue to process
++        # Prioritize S if it's overflowing OR if M is empty (need to maintain fullness)
++        # Note: If M is empty, we MUST evict from S to make space (if S has items).
++        clean_s = len(s_queue) > s_target or len(m_queue) == 0
++        
++        if clean_s:
++            if not s_queue:
++                # M must be non-empty here if cache is full, so flip to M
++                if m_queue:
++                    clean_s = False
++                else:
++                    # Cache is empty? Should not happen in evict.
++                    # Or logic error. Fallback.
++                    return next(iter(cache_snapshot.cache))
+ 
+-            if candidate_key in accessed_bits:
+-                # Second chance: Move to M
+-                accessed_bits.discard(candidate_key)
+-                m_queue[candidate_key] = None
++            if clean_s:
++                # Process S Queue
++                candidate, _ = s_queue.popitem(last=False) # FIFO head
++                cnt = freq_map.get(candidate, 0)
++                
++                if cnt > 0:
++                    # Accessed in S -> Promote to M
++                    m_queue[candidate] = None
++                    freq_map[candidate] = 0 # Reset frequency
++                else:
++                    # Not accessed -> Evict
++                    ghost_registry[candidate] = None
++                    if len(ghost_registry) > ghost_limit:
++                        ghost_registry.popitem(last=False) # Remove oldest ghost
++                    return candidate
++        
++        if not clean_s:
++            # Process M Queue
++            candidate, _ = m_queue.popitem(last=False)
++            cnt = freq_map.get(candidate, 0)
++            
++            if cnt > 0:
++                # Accessed in M -> Reinsert to M tail (Second Chance)
++                m_queue[candidate] = None
++                freq_map[candidate] = 0 # Reset frequency
+             else:
+-                # Victim found in S
+-                # Add to ghost registry
+-                ghost_registry[candidate_key] = None
+-                # Cap ghost size to 2x cache capacity for better history coverage
+-                if len(ghost_registry) > cache_snapshot.capacity * 2:
+-                    ghost_registry.popitem(last=False)
+-                return candidate_key
+-
+-        else:
+-            # Check M queue
+-            if not m_queue:
+-                # Should not be reached if cache is not empty
+-                # Fallback to S if M is empty
+-                if s_queue:
+-                        k, _ = s_queue.popitem(last=False)
+-                        return k
+-                # Extreme fallback
+-                return next(iter(cache_snapshot.cache))
+-
+-            candidate_key, _ = m_queue.popitem(last=False) # Pop from head
+-
+-            if candidate_key in accessed_bits:
+-                # Second chance: Re-insert at tail of M
+-                accessed_bits.discard(candidate_key)
+-                m_queue[candidate_key] = None
+-            else:
+-                # Victim found in M
+-                # Demote to S queue (tail) to give one final chance
+-                s_queue[candidate_key] = None
+-                # We haven't found a victim yet, so continue the loop
+-                continue
++                # Cold in M. Decide destination.
++                # Conditional Demotion: Only if S has space.
++                if len(s_queue) < s_target:
++                    s_queue[candidate] = None
++                    # frequency remains 0
++                else:
++                    # S is full. Do not demote. Evict directly.
++                    # Add to Ghost to rescue if it comes back soon.
++                    ghost_registry[candidate] = None
++                    if len(ghost_registry) > ghost_limit:
++                        ghost_registry.popitem(last=False)
++                    return candidate
+ 
+ def update_after_hit(cache_snapshot, obj):
+-    '''
+-    Mark the object as accessed.
+-    '''
+-    accessed_bits.add(obj.key)
++    '''Increment frequency, cap at 3.'''
++    key = obj.key
++    curr = freq_map.get(key, 0)
++    freq_map[key] = min(curr + 1, 3)
+ 
+ def update_after_insert(cache_snapshot, obj):
+-    '''
+-    Insert new object into S or M based on ghost history.
+-    '''
+-    if obj.key in ghost_registry:
+-        # Promote directly to Main queue
+-        m_queue[obj.key] = None
+-        del ghost_registry[obj.key]
++    '''Insert based on Ghost history.'''
++    key = obj.key
++    freq_map[key] = 0 # Init frequency
++    
++    if key in ghost_registry:
++        # Ghost hit -> Insert to M (skip probation)
++        m_queue[key] = None
++        del ghost_registry[key]
+     else:
+-        # Insert into Small queue
+-        s_queue[obj.key] = None
+-
+-    # Reset access bit on insert (usually assumed 0 freq initially)
+-    accessed_bits.discard(obj.key)
++        # New -> Insert to S
++        s_queue[key] = None
+ 
+ def update_after_evict(cache_snapshot, obj, evicted_obj):
+-    '''
+-    Cleanup. Most logic handled in evict, but ensure consistency.
+-    '''
+-    # The evicted object was already removed from our queues in `evict`.
+-    # Just ensure it's cleared from accessed bits if it lingered.
+-    accessed_bits.discard(evicted_obj.key)
++    '''Cleanup metadata.'''
++    key = evicted_obj.key
++    if key in freq_map:
++        del freq_map[key]
++    # Ensure removed from queues (already done in evict, but safe practice)
++    if key in s_queue:
++        del s_queue[key]
++    if key in m_queue:
++        del m_queue[key]
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

@@ -1,0 +1,190 @@
+<NAME>
+segment_aware_duel_and_fast_promotion
+</NAME>
+
+<DESCRIPTION>
+1.  **Segment-Aware Eviction Duel**: Modified `evict` to differentiate the eviction logic based on the segment of the victim (Probation vs. Protected).
+    - If the victim is in **Probation**, it is evicted if the Window candidate has equal or greater frequency (`freq_w >= freq_m`). This prefers admitting new items over keeping weak probation items.
+    - If the victim is in **Protected**, it is evicted only if the Window candidate has strictly greater frequency (`freq_w > freq_m`). This safeguards the core working set.
+    - This replaces the previous blanket bias (`freq_w > freq_m + 1`) which was overly protective of all Main items.
+
+2.  **Frequency-Accelerated Promotion**: Modified `update_after_hit` to allow immediate promotion from **Probation** to **Protected** if the item's frequency in the sketch is high (>= 5), even if it hasn't satisfied the standard "two-hit" probation requirement. This utilizes the persistent frequency history to quickly restore items that were recently popular but momentarily evicted, mitigating cache churn.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    """
+    Determine eviction victim.
+    If Window is full, duel Window LRU vs Main Probation LRU.
+    Otherwise, evict from Main to make room for Window growth.
+    """
+    state = get_state(cache_snapshot)
+
+    # Consistency Check (Reset if cache was cleared externally)
+    if not cache_snapshot.cache and (state.window or state.probation):
+        state.window.clear()
+        state.probation.clear()
+        state.protected.clear()
+        state.freq.clear()
+        state.doorkeeper.clear()
+        state.probation_hits.clear()
+
+    # If Window is full (or overfull), we must duel or evict from Window
+    if len(state.window) >= state.window_size:
+        w_victim_key = next(iter(state.window))
+
+        # If Main is empty, Window victim must go
+        if not state.probation and not state.protected:
+            return w_victim_key
+
+        # Identify Main victim (Probation LRU preferred, else Protected LRU)
+        if state.probation:
+            m_victim_key = next(iter(state.probation))
+        else:
+            m_victim_key = next(iter(state.protected))
+
+        # TinyLFU Duel
+        freq_w = state.get_freq(w_victim_key)
+        freq_m = state.get_freq(m_victim_key)
+
+        # Bias towards Main: only evict Main if Window item is significantly better
+        if freq_w > freq_m + 1:
+            return m_victim_key
+        else:
+            return w_victim_key
+    else:
+        # Window not full: Prefer evicting from Main to grow Window
+        if state.probation:
+            return next(iter(state.probation))
+        elif state.protected:
+            return next(iter(state.protected))
+        elif state.window:
+            return next(iter(state.window))
+        else:
+            # Fallback
+            return next(iter(cache_snapshot.cache))
+
+def update_after_hit(cache_snapshot, obj):
+    state = get_state(cache_snapshot)
+    key = obj.key
+    state.record_access(key)
+
+    if key in state.window:
+        state.window.move_to_end(key)
+
+    elif key in state.probation:
+        # Promote to Protected if it has proved itself (2 hits in probation)
+        if key in state.probation_hits:
+            del state.probation[key]
+            del state.probation_hits[key]
+            state.protected[key] = True
+
+            # Handle Protected Overflow: Move LRU to Probation
+            if len(state.protected) > state.protected_size:
+                victim, _ = state.protected.popitem(last=False)
+                state.probation[victim] = True
+                # Grant second chance credit to demoted items
+                state.probation_hits[victim] = True
+                state.probation.move_to_end(victim)
+        else:
+            state.probation_hits[key] = True
+            state.probation.move_to_end(key)
+
+    elif key in state.protected:
+        state.protected.move_to_end(key)
+=======
+def evict(cache_snapshot, obj):
+    """
+    Determine eviction victim.
+    If Window is full, duel Window LRU vs Main Probation LRU.
+    Otherwise, evict from Main to make room for Window growth.
+    """
+    state = get_state(cache_snapshot)
+
+    # Consistency Check (Reset if cache was cleared externally)
+    if not cache_snapshot.cache and (state.window or state.probation):
+        state.window.clear()
+        state.probation.clear()
+        state.protected.clear()
+        state.freq.clear()
+        state.doorkeeper.clear()
+        state.probation_hits.clear()
+
+    # If Window is full (or overfull), we must duel or evict from Window
+    if len(state.window) >= state.window_size:
+        w_victim_key = next(iter(state.window))
+
+        # If Main is empty, Window victim must go
+        if not state.probation and not state.protected:
+            return w_victim_key
+
+        # Identify Main victim (Probation LRU preferred, else Protected LRU)
+        is_probation_victim = False
+        if state.probation:
+            m_victim_key = next(iter(state.probation))
+            is_probation_victim = True
+        else:
+            m_victim_key = next(iter(state.protected))
+
+        # TinyLFU Duel
+        freq_w = state.get_freq(w_victim_key)
+        freq_m = state.get_freq(m_victim_key)
+
+        # Segment-Aware Duel
+        if is_probation_victim:
+            # For Probation: Evict Main if Window is at least as good (ties favor Window/Admission)
+            if freq_w >= freq_m:
+                return m_victim_key
+            else:
+                return w_victim_key
+        else:
+            # For Protected: Evict Main only if Window is strictly better (ties favor Main/Retention)
+            if freq_w > freq_m:
+                return m_victim_key
+            else:
+                return w_victim_key
+    else:
+        # Window not full: Prefer evicting from Main to grow Window
+        if state.probation:
+            return next(iter(state.probation))
+        elif state.protected:
+            return next(iter(state.protected))
+        elif state.window:
+            return next(iter(state.window))
+        else:
+            # Fallback
+            return next(iter(cache_snapshot.cache))
+
+def update_after_hit(cache_snapshot, obj):
+    state = get_state(cache_snapshot)
+    key = obj.key
+    state.record_access(key)
+
+    if key in state.window:
+        state.window.move_to_end(key)
+
+    elif key in state.probation:
+        # Promote to Protected if it has proved itself (2 hits in probation)
+        # OR if it has high historical frequency
+        if key in state.probation_hits or state.get_freq(key) >= 5:
+            del state.probation[key]
+            if key in state.probation_hits:
+                del state.probation_hits[key]
+            state.protected[key] = True
+
+            # Handle Protected Overflow: Move LRU to Probation
+            if len(state.protected) > state.protected_size:
+                victim, _ = state.protected.popitem(last=False)
+                state.probation[victim] = True
+                # Grant second chance credit to demoted items
+                state.probation_hits[victim] = True
+                state.probation.move_to_end(victim)
+        else:
+            state.probation_hits[key] = True
+            state.probation.move_to_end(key)
+
+    elif key in state.protected:
+        state.protected.move_to_end(key)
+>>>>>>> REPLACE
+</DIFF>

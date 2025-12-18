@@ -1,0 +1,165 @@
+<NAME>
+slru_eviction
+</NAME>
+
+<DESCRIPTION>
+Implement Segmented LRU (SLRU) eviction algorithm.
+SLRU divides the cache into two segments: a probationary segment and a protected segment.
+New items are inserted into the probationary segment.
+If an item in the probationary segment is accessed, it is promoted to the protected segment.
+The protected segment has a capacity limit (e.g., 80% of total cache). If it exceeds this limit, the least recently used item is demoted back to the probationary segment.
+Eviction happens from the probationary segment first (LRU), then from the protected segment.
+This algorithm provides scan resistance (scans flush through probation without affecting protected items) and keeps frequently used items in the protected segment.
+We use Python's `dict` to maintain ordered LRU lists for O(1) operations.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+
+m_key_timestamp = dict()
+
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    candid_obj_key = None
+    min_ts = min(m_key_timestamp.values())
+    candid_obj_keys = list(key for key in cache_snapshot.cache if m_key_timestamp[key] == min_ts)
+    candid_obj_key = candid_obj_keys[0]
+    return candid_obj_key
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_key_timestamp
+    assert obj.key in m_key_timestamp
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp
+    assert obj.key not in m_key_timestamp
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp
+    assert obj.key not in m_key_timestamp
+    assert evicted_obj.key in m_key_timestamp
+    m_key_timestamp.pop(evicted_obj.key)
+=======
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+
+# Segmented LRU (SLRU) Metadata
+# slru_probation: dict for probationary segment (ordered by access/insertion)
+# slru_protected: dict for protected segment (ordered by access)
+slru_probation = {}
+slru_protected = {}
+
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    SLRU Strategy: Evict from Probation (LRU) first. If empty, evict from Protected (LRU).
+    '''
+    global slru_probation, slru_protected
+
+    # Check consistency: if global state is misaligned with cache_snapshot (e.g. due to restart), clean up
+    # However, iterating to clean up is costly. We assume consistent environment or handle missing keys gracefully.
+
+    # Priority 1: Evict from Probation
+    if slru_probation:
+        # The dictionary preserves insertion order.
+        # Since we re-insert on access (in update_after_hit/insert),
+        # the first item is the Least Recently Used/Inserted.
+        return next(iter(slru_probation))
+
+    # Priority 2: Evict from Protected
+    if slru_protected:
+        return next(iter(slru_protected))
+
+    # Fallback if both empty (should imply cache is empty, but evict called means full?)
+    if cache_snapshot.cache:
+        return next(iter(cache_snapshot.cache))
+    return None
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    SLRU Update on Hit:
+    - If in Probation: Promote to Protected. Enforce Protected capacity.
+    - If in Protected: Update LRU (move to MRU).
+    '''
+    global slru_probation, slru_protected
+
+    key = obj.key
+    if key in slru_probation:
+        # Remove from Probation
+        slru_probation.pop(key)
+        # Add to Protected (MRU)
+        slru_protected[key] = None
+
+        # Enforce Protected Capacity (e.g., 80% of total capacity)
+        # Using 80% is a common heuristic for SLRU
+        protected_limit = int(cache_snapshot.capacity * 0.8)
+        if len(slru_protected) > protected_limit:
+            # Demote LRU of Protected to Probation (MRU)
+            demoted_key = next(iter(slru_protected))
+            slru_protected.pop(demoted_key)
+            slru_probation[demoted_key] = None
+
+    elif key in slru_protected:
+        # Move to MRU in Protected
+        slru_protected.pop(key)
+        slru_protected[key] = None
+
+    else:
+        # Consistency recovery: if hit but not in our records, treat as inserted in probation?
+        # Or maybe it was just inserted?
+        # For safety, add to probation if not present.
+        slru_probation[key] = None
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    SLRU Update on Insert:
+    - New objects go to Probation (MRU).
+    '''
+    global slru_probation, slru_protected
+    slru_probation[obj.key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    SLRU Update on Evict:
+    - Remove evicted object from metadata.
+    '''
+    global slru_probation, slru_protected
+    key = evicted_obj.key
+    if key in slru_probation:
+        slru_probation.pop(key)
+    elif key in slru_protected:
+        slru_protected.pop(key)
+>>>>>>> REPLACE
+
+</DIFF>

@@ -1,0 +1,52 @@
+<NAME>
+extended_ghost_and_demotion
+</NAME>
+
+<DESCRIPTION>
+This modification introduces two key improvements to the S3-FIFO implementation to minimize cache misses:
+
+1.  **Extended Ghost Registry**: The ghost registry size is increased from 1x to 2x the cache capacity. This allows the algorithm to track the history of evicted items for a longer period, which is particularly beneficial for workloads with looping patterns that exceed the cache size slightly (e.g., "loop-twice" patterns). By recognizing these items upon re-access, the algorithm can rescue them directly into the protected Main queue.
+
+2.  **Demotion-Based Eviction**: Instead of immediately evicting victims from the protected Main queue (`m_queue`), they are "demoted" to the tail of the probationary Small queue (`s_queue`). This gives formerly hot items a final "survival lap" in the probationary queue. If they are accessed again while in `s_queue`, they are promoted back to `m_queue`. If not, they are eventually evicted from `s_queue`. This mimics the behavior of Segmented LRU (SLRU) and prevents the premature eviction of valuable data that has temporarily cooled down, while prioritizing the eviction of truly cold data from the Small queue.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+                # Victim found in S
+                # Add to ghost registry
+                ghost_registry[candidate_key] = None
+                # Cap ghost size to cache capacity
+                if len(ghost_registry) > cache_snapshot.capacity:
+                    ghost_registry.popitem(last=False)
+                return candidate_key
+=======
+                # Victim found in S
+                # Add to ghost registry
+                ghost_registry[candidate_key] = None
+                # Cap ghost size to 2x cache capacity for better history coverage
+                if len(ghost_registry) > cache_snapshot.capacity * 2:
+                    ghost_registry.popitem(last=False)
+                return candidate_key
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+            if candidate_key in accessed_bits:
+                # Second chance: Re-insert at tail of M
+                accessed_bits.discard(candidate_key)
+                m_queue[candidate_key] = None
+            else:
+                # Victim found in M
+                # Do not add to ghost (only S evictions go to ghost)
+                return candidate_key
+=======
+            if candidate_key in accessed_bits:
+                # Second chance: Re-insert at tail of M
+                accessed_bits.discard(candidate_key)
+                m_queue[candidate_key] = None
+            else:
+                # Victim found in M
+                # Demote to S queue (tail) to give one final chance
+                s_queue[candidate_key] = None
+                # We haven't found a victim yet, so continue the loop
+                continue
+>>>>>>> REPLACE
+</DIFF>

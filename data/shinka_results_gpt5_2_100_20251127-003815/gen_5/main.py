@@ -1,0 +1,207 @@
+# EVOLVE-BLOCK-START
+"""Hybrid SLRU + decayed-frequency (LRFU) eviction.
+- Two LRU segments: probationary (recency) and protected (frequency).
+- Victim within a segment chosen by minimum decayed frequency score; tie-break on older last access.
+"""
+
+from collections import OrderedDict
+
+# Configuration: half-life in number of accesses for score decay.
+# After DECAY_HALF_LIFE accesses without a hit, a key's score halves.
+DECAY_HALF_LIFE = 16
+DECAY_BASE = 2 ** (-1.0 / DECAY_HALF_LIFE)
+
+# Per-key metadata for cached objects
+_key_score = dict()      # key -> float decayed frequency score
+_key_last_time = dict()  # key -> int last access_count when we updated its score
+
+# Segmented LRU state
+_prob_od = OrderedDict()  # probationary: admitted on first insert
+_prot_od = OrderedDict()  # protected: promoted on second touch
+
+
+def _ensure_meta(k, now):
+    if k not in _key_last_time:
+        _key_last_time[k] = now
+    if k not in _key_score:
+        _key_score[k] = 0.0
+
+
+def _decay_and_get_score(k, now):
+    """Lazily decay score to 'now' and return (score_now, old_time_before_update)."""
+    _ensure_meta(k, now)
+    old_time = _key_last_time[k]
+    dt = now - old_time
+    if dt > 0:
+        _key_score[k] *= pow(DECAY_BASE, dt)
+        _key_last_time[k] = now
+    return _key_score[k], old_time
+
+
+def _min_key_by_score(keys, now):
+    """Return key with minimal decayed score; tie-break by older last access time."""
+    min_k = None
+    min_s = None
+    min_old = None
+    for k in keys:
+        s, old = _decay_and_get_score(k, now)
+        if (min_s is None) or (s < min_s) or (s == min_s and old < min_old):
+            min_k = k
+            min_s = s
+            min_old = old
+    return min_k
+
+
+def _target_protected_size(capacity: int) -> int:
+    """Fixed split: ~70% protected, clamped to [0, capacity]."""
+    if capacity <= 1:
+        return capacity  # degenerate caches keep single item in protected after promotion
+    tgt = int(round(capacity * 0.7))
+    if tgt < 1:
+        tgt = 1
+    if tgt > capacity:
+        tgt = capacity
+    return tgt
+
+
+def _self_heal_segments(cache_snapshot):
+    """Ensure segment membership matches current cache contents (robust to resets)."""
+    now = cache_snapshot.access_count
+    cache_keys = set(cache_snapshot.cache.keys())
+    # Remove any leftovers not in cache
+    for k in list(_prob_od.keys()):
+        if k not in cache_keys:
+            _prob_od.pop(k, None)
+    for k in list(_prot_od.keys()):
+        if k not in cache_keys:
+            _prot_od.pop(k, None)
+    # Add any missing cached keys into probationary
+    known = set(_prob_od.keys()) | set(_prot_od.keys())
+    missing = cache_keys - known
+    if missing:
+        for k in missing:
+            _prob_od[k] = None
+            _ensure_meta(k, now)
+
+
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    now = cache_snapshot.access_count
+    _self_heal_segments(cache_snapshot)
+
+    # Prefer evicting from probationary; if empty, evict from protected.
+    if _prob_od:
+        victim = _min_key_by_score(list(_prob_od.keys()), now)
+        return victim
+    if _prot_od:
+        victim = _min_key_by_score(list(_prot_od.keys()), now)
+        return victim
+
+    # Fallback: compute across entire cache (should be rare)
+    return _min_key_by_score(list(cache_snapshot.cache.keys()), now)
+
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    now = cache_snapshot.access_count
+    _self_heal_segments(cache_snapshot)
+
+    # LRFU score update with exponential decay
+    _ensure_meta(obj.key, now)
+    s, _ = _decay_and_get_score(obj.key, now)
+    _key_score[obj.key] = s + 1.0  # frequency boost already decayed to 'now'
+
+    # SLRU segment updates
+    if obj.key in _prot_od:
+        # Touch MRU in protected
+        _prot_od.move_to_end(obj.key, last=True)
+    elif obj.key in _prob_od:
+        # Promote to protected
+        _prob_od.pop(obj.key, None)
+        _prot_od[obj.key] = None
+        # Demote from protected if it exceeds target
+        tgt = _target_protected_size(cache_snapshot.capacity)
+        if len(_prot_od) > tgt:
+            demote_key = _min_key_by_score(list(_prot_od.keys()), now)
+            if demote_key is not None:
+                _prot_od.pop(demote_key, None)
+                _prob_od[demote_key] = None
+    else:
+        # Defensive: cache hit but not tracked; treat as protected touch
+        _prot_od[obj.key] = None
+        tgt = _target_protected_size(cache_snapshot.capacity)
+        if len(_prot_od) > tgt:
+            demote_key = _min_key_by_score(list(_prot_od.keys()), now)
+            if demote_key is not None:
+                _prot_od.pop(demote_key, None)
+                _prob_od[demote_key] = None
+
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    now = cache_snapshot.access_count
+    # Initialize metadata with modest score to reduce scan pollution
+    _key_last_time[obj.key] = now
+    _key_score[obj.key] = 0.5
+
+    # Insert into probationary MRU
+    _prob_od.pop(obj.key, None)
+    _prot_od.pop(obj.key, None)
+    _prob_od[obj.key] = None
+
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    # Purge from segments and metadata
+    _prob_od.pop(evicted_obj.key, None)
+    _prot_od.pop(evicted_obj.key, None)
+    _key_score.pop(evicted_obj.key, None)
+    _key_last_time.pop(evicted_obj.key, None)
+
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

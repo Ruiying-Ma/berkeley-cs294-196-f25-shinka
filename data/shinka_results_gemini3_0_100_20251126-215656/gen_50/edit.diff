@@ -1,0 +1,291 @@
+--- a/original.py
++++ b/original.py
+@@ -1,182 +1,146 @@
+ # EVOLVE-BLOCK-START
+ from collections import OrderedDict
+ 
+-# Advanced S3-FIFO Algorithm
+-# Implements S3-FIFO with demotion (soft eviction from Main) and ghost queues.
+-# q_small: FIFO queue for new items (Probation).
+-# q_main: LRU queue for popular items (Protected).
+-# q_ghost: FIFO queue for history of evicted items.
+-# meta_freq: Dictionary tracking access counts for items in cache.
++# Tiered S3-FIFO with Ghost-Guided Promotion
++# s_q: Small Queue (FIFO) - Probation for new items
++# m_q: Main Queue (LRU) - Protected for popular items
++# g_q: Ghost Registry (FIFO) - History of evicted items
++# counts: Frequency tracking
+ 
+-q_small = OrderedDict()
+-q_main = OrderedDict()
+-q_ghost = OrderedDict()
+-meta_freq = {}
+-last_access_count = -1
++q_s = OrderedDict()
++q_m = OrderedDict()
++q_g = OrderedDict()
++counts = {}
++last_ts = -1
+ 
+-def _reset_if_needed(snapshot):
+-    """Resets state if a new trace is detected."""
+-    global q_small, q_main, q_ghost, meta_freq, last_access_count
+-    if snapshot.access_count < last_access_count:
+-        q_small.clear()
+-        q_main.clear()
+-        q_ghost.clear()
+-        meta_freq.clear()
+-
+-    # Safety reset if cache is physically empty but we have state
+-    if not snapshot.cache and (q_small or q_main):
+-        q_small.clear()
+-        q_main.clear()
+-        q_ghost.clear()
+-        meta_freq.clear()
+-
+-    last_access_count = snapshot.access_count
++def _reset(snapshot):
++    global q_s, q_m, q_g, counts, last_ts
++    if snapshot.access_count < last_ts:
++        q_s.clear(); q_m.clear(); q_g.clear(); counts.clear()
++    if not snapshot.cache and (q_s or q_m):
++        q_s.clear(); q_m.clear(); q_g.clear(); counts.clear()
++    last_ts = snapshot.access_count
+ 
+ def evict(cache_snapshot, obj):
+     '''
+-    Selects a victim using S3-FIFO logic with Main-to-Small demotion.
++    Tiered S3-FIFO Eviction.
++    - S Queue: Requires 2 hits (freq>=2) to promote to M.
++               1 hit (freq=1) grants a second chance in S.
++               0 hits (freq=0) -> Ghost.
++    - M Queue: Hits (freq>0) -> Demote to S (with freq=1).
++               No hits -> Evict to Ghost.
+     '''
+-    global q_small, q_main, q_ghost, meta_freq
+-    _reset_if_needed(cache_snapshot)
++    global q_s, q_m, q_g, counts
++    _reset(cache_snapshot)
+ 
+-    capacity = cache_snapshot.capacity
+-    # Target size for small queue (10% of capacity)
+-    target_small = max(1, int(capacity * 0.1))
++    cap = cache_snapshot.capacity
++    s_cap = max(1, int(cap * 0.1))
++    
++    # Loop to find a victim
++    # We limit iterations to avoid potential infinite loops, though logic should converge
++    for _ in range(cap * 2 + 100):
++        # Determine which queue to scan
++        # Scan S if over capacity OR if M is empty
++        scan_s = False
++        if len(q_s) > s_cap or not q_m:
++            scan_s = True
++        
++        if scan_s:
++            if not q_s:
++                if q_m: scan_s = False # Fallback to M
++                else: break # Both empty
++            
++            if scan_s:
++                k, _ = q_s.popitem(last=False) # FIFO
++                f = counts.get(k, 0)
++                
++                if f >= 2:
++                    # Promote to Main
++                    q_m[k] = None
++                    counts[k] = 0 # Reset freq on promotion
++                elif f == 1:
++                    # Reinsert in Small (Second Chance)
++                    q_s[k] = None
++                    counts[k] = 0 # Reset freq so it needs a hit to survive again
++                else:
++                    # Evict
++                    q_g[k] = None
++                    counts.pop(k, None)
++                    # Ghost Cap (4x to capture large loops)
++                    if len(q_g) > cap * 4:
++                        q_g.popitem(last=False)
++                    return k
++        else:
++            # Scan M
++            k, _ = q_m.popitem(last=False) # LRU Head
++            
++            f = counts.get(k, 0)
++            if f > 0:
++                # Demote to Small
++                q_s[k] = None
++                counts[k] = 1 # Give freq=1 (survives 1 pass in S)
++            else:
++                # Evict
++                q_g[k] = None
++                counts.pop(k, None)
++                if len(q_g) > cap * 4:
++                    q_g.popitem(last=False)
++                return k
+ 
+-    # We loop to find a victim, processing promotions/demotions along the way.
+-    # Safety limit to prevent infinite loops (though logic should guarantee termination).
+-    loop_limit = len(cache_snapshot.cache) * 2
+-    ops = 0
+-
+-    while ops < loop_limit:
+-        ops += 1
+-
+-        # Decide which queue to evict from
+-        # If Small is over budget or Main is empty, we must evict from Small.
+-        # Otherwise, we evict from Main.
+-        evict_from_small = False
+-        if len(q_small) > target_small or len(q_main) == 0:
+-            evict_from_small = True
+-
+-        if evict_from_small:
+-            if not q_small:
+-                # Should only happen if Main is empty too (cache empty?)
+-                if q_main:
+-                    # Fallback to Main
+-                    candidate, _ = q_main.popitem(last=False)
+-                    q_ghost[candidate] = None
+-                    meta_freq.pop(candidate, None)
+-                    return candidate
+-                # Absolute fallback
+-                return next(iter(cache_snapshot.cache))
+-
+-            # FIFO eviction from Small
+-            candidate, _ = q_small.popitem(last=False)
+-
+-            # Check for promotion: if accessed while in Small
+-            freq = meta_freq.get(candidate, 0)
+-            if freq > 0:
+-                # Promote to Main
+-                q_main[candidate] = None
+-                meta_freq[candidate] = 0 # Reset frequency cost
+-                continue # Retry eviction
+-            else:
+-                # Evict candidate
+-                q_ghost[candidate] = None
+-                if len(q_ghost) > capacity:
+-                    q_ghost.popitem(last=False)
+-                meta_freq.pop(candidate, None)
+-                return candidate
+-
+-        else:
+-            # Evict from Main (LRU)
+-            candidate, _ = q_main.popitem(last=False)
+-
+-            # Check for demotion: if accessed while in Main (freq > 0)
+-            # This gives "warm" items a second chance in Small
+-            freq = meta_freq.get(candidate, 0)
+-            if freq > 0:
+-                # Demote to Small
+-                q_small[candidate] = None
+-                meta_freq[candidate] = 0 # Reset frequency
+-                continue # Retry eviction
+-            else:
+-                # Evict candidate
+-                q_ghost[candidate] = None
+-                if len(q_ghost) > capacity:
+-                    q_ghost.popitem(last=False)
+-                meta_freq.pop(candidate, None)
+-                return candidate
+-
+-    # Fallback if loop limit reached
+-    if q_small:
+-        k, _ = q_small.popitem(last=False)
+-        return k
+-    return next(iter(cache_snapshot.cache))
++    # Ultimate fallback
++    if cache_snapshot.cache:
++        return next(iter(cache_snapshot.cache))
++    return None
+ 
+ def update_after_hit(cache_snapshot, obj):
+-    '''
+-    On hit: increment frequency, maintain LRU order for Main.
+-    '''
+-    global q_small, q_main, meta_freq
+-    _reset_if_needed(cache_snapshot)
+-
+-    key = obj.key
+-    meta_freq[key] = meta_freq.get(key, 0) + 1
+-
+-    if key in q_main:
+-        q_main.move_to_end(key)
+-    # If in Small, do not move (lazy promotion)
++    global q_m, counts
++    _reset(cache_snapshot)
++    k = obj.key
++    counts[k] = min(counts.get(k, 0) + 1, 3)
++    if k in q_m:
++        q_m.move_to_end(k) # MRU update
+ 
+ def update_after_insert(cache_snapshot, obj):
+-    '''
+-    On insert: Handle Ghost hits or new insertions.
+-    '''
+-    global q_small, q_main, q_ghost, meta_freq
+-    _reset_if_needed(cache_snapshot)
+-
+-    key = obj.key
+-    # Start with 0 frequency
+-    meta_freq[key] = 0
+-
+-    if key in q_ghost:
+-        # Ghost Hit: Restore to Main
+-        del q_ghost[key]
+-        q_main[key] = None
++    global q_s, q_m, q_g, counts
++    _reset(cache_snapshot)
++    k = obj.key
++    
++    if k in q_g:
++        # Ghost Hit: Promote to Main
++        # We trust the Ghost signal (recurrence)
++        del q_g[k]
++        q_m[k] = None
++        counts[k] = 0
+     else:
+         # New Item: Insert to Small
+-        q_small[key] = None
++        q_s[k] = None
++        counts[k] = 0
+ 
+ def update_after_evict(cache_snapshot, obj, evicted_obj):
+-    '''
+-    Cleanup internal state.
+-    '''
+-    global q_small, q_main, meta_freq
+-    _reset_if_needed(cache_snapshot)
+-
+-    key = evicted_obj.key
+-    # Ensure removal
+-    q_small.pop(key, None)
+-    q_main.pop(key, None)
+-    meta_freq.pop(key, None)
++    global q_s, q_m, counts
++    _reset(cache_snapshot)
++    k = evicted_obj.key
++    q_s.pop(k, None)
++    q_m.pop(k, None)
++    counts.pop(k, None)
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

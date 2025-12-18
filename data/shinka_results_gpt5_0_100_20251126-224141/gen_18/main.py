@@ -1,0 +1,246 @@
+# EVOLVE-BLOCK-START
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+
+# Segmented LRU (SLRU): split cache into probationary and protected segments.
+# New items go to probationary; on hit they are promoted to protected.
+# Evict from probationary first (LRU), else from protected (LRU).
+# This shields reused items from scans/one-hit-wonders and typically lowers miss rate.
+
+m_key_timestamp = dict()           # recency clock (last access time)
+m_probationary = set()             # keys currently in probationary segment
+m_protected = set()                # keys currently in protected segment
+_PROTECTED_RATIO = 0.8             # initial fraction of cache for protected segment
+
+# ARC-style ghost history (store only keys with last-seen timestamps)
+m_B1_ts = dict()  # ghosts of items evicted from probationary
+m_B2_ts = dict()  # ghosts of items evicted from protected
+
+# Adaptive protected target (in items); initialized from capacity * _PROTECTED_RATIO
+m_prot_target_count = None
+
+
+def _cap(cache_snapshot):
+    """Return effective capacity in items (>=1)."""
+    try:
+        cap = int(cache_snapshot.capacity)
+    except Exception:
+        cap = 0
+    if cap <= 0:
+        cap = len(getattr(cache_snapshot, 'cache', {}) or {})
+    return max(cap, 1)
+
+
+def _ensure_targets(cache_snapshot):
+    """Initialize or clamp the protected target based on capacity."""
+    global m_prot_target_count
+    cap = _cap(cache_snapshot)
+    if m_prot_target_count is None:
+        m_prot_target_count = max(0, min(cap - 1, int(round(cap * _PROTECTED_RATIO))))
+    else:
+        # Keep target within [0, cap-1]
+        m_prot_target_count = max(0, min(cap - 1, int(m_prot_target_count)))
+
+
+def _trim_ghosts(cache_snapshot):
+    """Bound total ghost entries to at most 2x capacity by removing oldest globally."""
+    cap = _cap(cache_snapshot)
+    bound = 2 * cap
+    total = len(m_B1_ts) + len(m_B2_ts)
+    while total > bound:
+        b1_old_key = min(m_B1_ts, key=m_B1_ts.get) if m_B1_ts else None
+        b2_old_key = min(m_B2_ts, key=m_B2_ts.get) if m_B2_ts else None
+        if b1_old_key is None and b2_old_key is None:
+            break
+        if b2_old_key is None or (b1_old_key is not None and m_B1_ts[b1_old_key] <= m_B2_ts.get(b2_old_key, float('inf'))):
+            m_B1_ts.pop(b1_old_key, None)
+        else:
+            m_B2_ts.pop(b2_old_key, None)
+        total = len(m_B1_ts) + len(m_B2_ts)
+
+
+def _find_lru_key_in_set(keys):
+    """Return the key with the smallest timestamp among 'keys'. If empty, return None."""
+    lru_key = None
+    lru_ts = None
+    for k in keys:
+        ts = m_key_timestamp.get(k, -1)
+        if lru_ts is None or ts < lru_ts:
+            lru_key, lru_ts = k, ts
+    return lru_key
+
+
+def _enforce_segment_limits(cache_snapshot):
+    """Ensure protected segment does not exceed its adaptive target size; demote LRU protected if needed."""
+    _ensure_targets(cache_snapshot)
+    cap = _cap(cache_snapshot)
+    # Clamp target to available capacity (allow 0 protected if adaptation demands)
+    prot_max = max(0, min(m_prot_target_count, cap - 1))
+    # Demote LRU items from protected to probationary until within target.
+    while len(m_protected) > prot_max:
+        demote_key = _find_lru_key_in_set(m_protected)
+        if demote_key is None:
+            break
+        m_protected.discard(demote_key)
+        m_probationary.add(demote_key)
+
+
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    # Clean sets to only include keys actually present in the cache.
+    cache_keys = set(cache_snapshot.cache.keys())
+    if m_probationary:
+        m_probationary.intersection_update(cache_keys)
+    if m_protected:
+        m_protected.intersection_update(cache_keys)
+
+    # Ensure target is initialized/clamped
+    _ensure_targets(cache_snapshot)
+    prot_max = max(0, min(m_prot_target_count, _cap(cache_snapshot) - 1))
+
+    # If protected is oversized, evict from protected first to steer back to target
+    candid_obj_key = None
+    if m_protected and len(m_protected) > prot_max:
+        candid_obj_key = _find_lru_key_in_set(m_protected)
+
+    # Otherwise prefer evicting from probationary (cold) segment
+    if candid_obj_key is None and m_probationary:
+        candid_obj_key = _find_lru_key_in_set(m_probationary)
+
+    # If probationary empty, evict from protected
+    if candid_obj_key is None and m_protected:
+        candid_obj_key = _find_lru_key_in_set(m_protected)
+
+    # Fallback: global LRU among all cache keys (robustness in case of drift).
+    if candid_obj_key is None:
+        candid_obj_key = _find_lru_key_in_set(cache_keys)
+
+    # Absolute fallback: choose any key deterministically if timestamps are missing.
+    if candid_obj_key is None and cache_keys:
+        candid_obj_key = next(iter(cache_keys))
+    return candid_obj_key
+
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_key_timestamp, m_probationary, m_protected
+    _ensure_targets(cache_snapshot)
+    # Update recency clock
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+
+    # Promote from probationary to protected upon first hit; otherwise just refresh.
+    if obj.key in m_probationary:
+        m_probationary.discard(obj.key)
+        m_protected.add(obj.key)
+
+    # Keep protected segment within target size by demoting its LRU to probationary.
+    _enforce_segment_limits(cache_snapshot)
+
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp, m_probationary, m_protected, m_prot_target_count
+    _ensure_targets(cache_snapshot)
+
+    # Initialize recency
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+
+    # ARC-style adaptation using ghosts: adjust protected target and admission policy
+    cap = _cap(cache_snapshot)
+    step = max(1, cap // 8)
+    in_b1 = obj.key in m_B1_ts
+    in_b2 = obj.key in m_B2_ts
+
+    if in_b1 or in_b2:
+        if in_b1:
+            # B1 hit => increase probationary share (decrease protected target)
+            m_prot_target_count = max(0, m_prot_target_count - step)
+            m_B1_ts.pop(obj.key, None)
+        if in_b2:
+            # B2 hit => increase protected target
+            m_prot_target_count = min(cap - 1, m_prot_target_count + step)
+            m_B2_ts.pop(obj.key, None)
+        # Admit ghost hits directly to protected (frequent)
+        m_probationary.discard(obj.key)
+        m_protected.add(obj.key)
+    else:
+        # Fresh object: admit to probationary
+        m_protected.discard(obj.key)
+        m_probationary.add(obj.key)
+
+    # Keep protected segment within adaptive target
+    _enforce_segment_limits(cache_snapshot)
+    # Trim ghosts regularly
+    _trim_ghosts(cache_snapshot)
+
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp, m_probationary, m_protected
+    # Determine which segment the evicted key belonged to (before removal)
+    evicted_key = evicted_obj.key
+    was_protected = evicted_key in m_protected
+    was_probationary = evicted_key in m_probationary
+
+    # Add to appropriate ghost list with current timestamp
+    ts = cache_snapshot.access_count
+    if was_protected:
+        m_B2_ts[evicted_key] = ts
+    else:
+        # Default to B1 for unknown or probationary
+        m_B1_ts[evicted_key] = ts
+
+    # Remove evicted object from all metadata.
+    m_key_timestamp.pop(evicted_key, None)
+    m_probationary.discard(evicted_key)
+    m_protected.discard(evicted_key)
+
+    # Trim ghost history to stay within bounds
+    _trim_ghosts(cache_snapshot)
+
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

@@ -1,0 +1,231 @@
+<NAME>
+persistent_freq_eviction
+</NAME>
+
+<DESCRIPTION>
+Implement persistent frequency tracking across evictions to better handle recurring patterns (loops/scans).
+1. `update_after_evict`: Do not delete `freq_map` entry for evicted items; allows history to persist for ghosts.
+2. `evict`: Clean up `freq_map` entries only when items are removed from ghost registries (true death).
+3. `update_after_insert`: If item is in ghost, restore/increment its frequency (starts warm). If new, start at 0.
+4. `update_after_hit`: Increment frequency (up to saturation).
+This ensures that items cycling in and out of cache (ghost hits) gain frequency and protection in M, while one-time scan items remain cold in S and are evicted quickly.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    Selects a victim using Frequency-Based S3-FIFO with Demotion.
+    - Demotes cold M items to S.
+    - Tracks origin of S victims to route to correct Ghost (S or M) for adaptation.
+    '''
+    global s_dist
+
+    capacity = cache_snapshot.capacity
+    s_target = max(1, int(capacity * s_dist))
+    ghost_limit = max(capacity, int(2 * capacity))
+
+    while True:
+        # Prefer evicting from S if over target or M empty
+        evict_s = (len(small_q) > s_target) or (len(main_q) == 0)
+
+        if evict_s:
+            if not small_q:
+                evict_s = False
+            else:
+                key, _ = small_q.popitem(last=False)
+                cnt = freq_map.get(key, 0)
+
+                if cnt > 0:
+                    # Accessed in S -> Promote to Main
+                    freq_map[key] = 0
+                    main_q[key] = None
+                    demoted_set.discard(key) # Now in Main
+                else:
+                    # Cold in S -> Evict
+                    # Check origin for Ghost routing
+                    if key in demoted_set:
+                        ghost_m[key] = None
+                        if len(ghost_m) > ghost_limit:
+                            ghost_m.popitem(last=False)
+                        demoted_set.discard(key)
+                    else:
+                        ghost_s[key] = None
+                        if len(ghost_s) > ghost_limit:
+                            ghost_s.popitem(last=False)
+                    return key
+
+        if not evict_s:
+            if not main_q:
+                return next(iter(cache_snapshot.cache))
+
+            key, _ = main_q.popitem(last=False)
+            cnt = freq_map.get(key, 0)
+
+            if cnt > 0:
+                # Accessed in M -> Reinsert M
+                freq_map[key] = 0
+                main_q[key] = None
+            else:
+                # Cold in M -> Demote to S
+                freq_map[key] = 0
+                small_q[key] = None
+                demoted_set.add(key)
+                # Loop continues to find actual victim
+=======
+def evict(cache_snapshot, obj):
+    '''
+    Selects a victim using Frequency-Based S3-FIFO with Demotion and Persistent Frequency.
+    - Demotes cold M items to S.
+    - Maintains frequency in ghosts to identify recurring patterns (loops).
+    '''
+    global s_dist
+
+    capacity = cache_snapshot.capacity
+    s_target = max(1, int(capacity * s_dist))
+    ghost_limit = max(capacity, int(2 * capacity))
+
+    while True:
+        # Prefer evicting from S if over target or M empty
+        evict_s = (len(small_q) > s_target) or (len(main_q) == 0)
+
+        if evict_s:
+            if not small_q:
+                evict_s = False
+            else:
+                key, _ = small_q.popitem(last=False)
+                cnt = freq_map.get(key, 0)
+
+                if cnt > 0:
+                    # Accessed in S -> Promote to Main
+                    freq_map[key] = 0
+                    main_q[key] = None
+                    demoted_set.discard(key)
+                else:
+                    # Cold in S -> Evict
+                    if key in demoted_set:
+                        ghost_m[key] = None
+                        if len(ghost_m) > ghost_limit:
+                            k, _ = ghost_m.popitem(last=False)
+                            if k in freq_map: del freq_map[k]
+                        demoted_set.discard(key)
+                    else:
+                        ghost_s[key] = None
+                        if len(ghost_s) > ghost_limit:
+                            k, _ = ghost_s.popitem(last=False)
+                            if k in freq_map: del freq_map[k]
+                    return key
+
+        if not evict_s:
+            if not main_q:
+                return next(iter(cache_snapshot.cache))
+
+            key, _ = main_q.popitem(last=False)
+            cnt = freq_map.get(key, 0)
+
+            if cnt > 0:
+                # Accessed in M -> Reinsert M
+                freq_map[key] = 0
+                main_q[key] = None
+            else:
+                # Cold in M -> Demote to S
+                freq_map[key] = 0
+                small_q[key] = None
+                demoted_set.add(key)
+                # Loop continues
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def update_after_hit(cache_snapshot, obj):
+    check_reset(cache_snapshot)
+    curr = freq_map.get(obj.key, 0)
+    freq_map[obj.key] = min(curr + 1, 3)
+
+def update_after_insert(cache_snapshot, obj):
+    check_reset(cache_snapshot)
+
+    global s_dist
+    key = obj.key
+    capacity = cache_snapshot.capacity
+    freq_map[key] = 0
+    demoted_set.discard(key) # New or Rescued
+
+    delta = 1.0 / capacity if capacity > 0 else 0.01
+
+    if key in ghost_s:
+        # S too small
+        s_dist = min(0.9, s_dist + delta)
+        main_q[key] = None
+        del ghost_s[key]
+
+    elif key in ghost_m:
+        # M too small
+        s_dist = max(0.01, s_dist - delta)
+        main_q[key] = None
+        del ghost_m[key]
+
+    else:
+        # New -> Small
+        small_q[key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    key = evicted_obj.key
+    if key in freq_map:
+        del freq_map[key]
+    if key in demoted_set:
+        demoted_set.discard(key)
+    if key in small_q:
+        del small_q[key]
+    if key in main_q:
+        del main_q[key]
+=======
+def update_after_hit(cache_snapshot, obj):
+    check_reset(cache_snapshot)
+    curr = freq_map.get(obj.key, 0)
+    freq_map[obj.key] = min(curr + 1, 10)
+
+def update_after_insert(cache_snapshot, obj):
+    check_reset(cache_snapshot)
+
+    global s_dist
+    key = obj.key
+    capacity = cache_snapshot.capacity
+
+    # Restore frequency if in ghost, else 0
+    if key in ghost_s or key in ghost_m:
+        freq_map[key] = freq_map.get(key, 0) + 1
+    else:
+        freq_map[key] = 0
+
+    demoted_set.discard(key)
+
+    delta = 1.0 / capacity if capacity > 0 else 0.01
+
+    if key in ghost_s:
+        # S too small
+        s_dist = min(0.9, s_dist + delta)
+        # Rescue to M
+        main_q[key] = None
+        del ghost_s[key]
+
+    elif key in ghost_m:
+        # M too small
+        s_dist = max(0.01, s_dist - delta)
+        # Rescue to M
+        main_q[key] = None
+        del ghost_m[key]
+
+    else:
+        # New -> Small
+        small_q[key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    key = evicted_obj.key
+    # Persist freq_map for ghosts
+    if key in demoted_set:
+        demoted_set.discard(key)
+    if key in small_q:
+        del small_q[key]
+    if key in main_q:
+        del main_q[key]
+>>>>>>> REPLACE
+</DIFF>

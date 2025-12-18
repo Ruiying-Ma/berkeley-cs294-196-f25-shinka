@@ -1,0 +1,218 @@
+<NAME>
+implement_arc_algorithm
+</NAME>
+
+<DESCRIPTION>
+Implement Adaptive Replacement Cache (ARC).
+ARC dynamically balances between Recency (T1) and Frequency (T2) based on observed workload patterns (hits in ghost lists B1 and B2).
+- `m_t1`: Recency list.
+- `m_t2`: Frequency list.
+- `m_b1`: Ghost Recency list.
+- `m_b2`: Ghost Frequency list.
+- `p`: Adaptive parameter adjusting the target size of T1.
+- `evict`: Updates `p` based on ghost hits and selects victim (T1 vs T2) based on `p`.
+- `update_after_insert`: Handles new item insertion (T1 vs T2) and resets globals for new traces.
+- `update_after_hit`: Moves items to MRU of T2.
+- `update_after_evict`: Moves evicted items to ghost lists and enforces ghost capacity.
+This algorithm is scan-resistant and adapts to changing working sets, addressing the low hit rates on scan/loop traces while maintaining high performance on recency-friendly traces.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+# EVOLVE-BLOCK-START
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+
+m_access_time = dict()
+m_protected = set()
+
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    # SLRU: Evict LRU from Probation (not in m_protected) first.
+    # m_access_time keys are ordered by insertion (LRU first).
+    for key in m_access_time:
+        if key not in m_protected:
+            return key
+    # If no probation items, evict LRU from Protected
+    return next(iter(m_access_time))
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_access_time, m_protected
+
+    # Update LRU order: remove and re-insert
+    if obj.key in m_access_time:
+        del m_access_time[obj.key]
+    m_access_time[obj.key] = cache_snapshot.access_count
+
+    # SLRU Logic: Promote to protected
+    if obj.key not in m_protected:
+        m_protected.add(obj.key)
+
+        # Enforce Protected Segment capacity (80%)
+        protected_limit = int(cache_snapshot.capacity * 0.8)
+        if len(m_protected) > protected_limit:
+            # Demote LRU of Protected to Probation
+            # Find the first key in m_access_time (LRU) that is in m_protected
+            for key in m_access_time:
+                if key in m_protected:
+                    m_protected.remove(key)
+                    break
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_access_time
+    # New items start in Probation (not in m_protected)
+    m_access_time[obj.key] = cache_snapshot.access_count
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    global m_access_time, m_protected
+    if evicted_obj.key in m_access_time:
+        del m_access_time[evicted_obj.key]
+    m_protected.discard(evicted_obj.key)
+
+# EVOLVE-BLOCK-END
+=======
+# EVOLVE-BLOCK-START
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+
+# ARC Globals
+m_t1 = dict() # Recency (L1)
+m_t2 = dict() # Frequency (L2)
+m_b1 = dict() # Ghost Recency
+m_b2 = dict() # Ghost Frequency
+p = 0         # Adaptive parameter
+
+def evict(cache_snapshot, obj):
+    '''
+    ARC Eviction Logic:
+    - Adapt p based on hits in ghost lists (B1, B2).
+    - Decide whether to evict from T1 or T2 based on p and T1 size.
+    '''
+    global p
+
+    capacity = cache_snapshot.capacity
+
+    # Adaptation: If the incoming object (miss) is in a ghost list
+    if obj.key in m_b1:
+        delta = 1
+        if len(m_b1) < len(m_b2):
+             delta = len(m_b2) / len(m_b1)
+        p = min(capacity, p + delta)
+    elif obj.key in m_b2:
+        delta = 1
+        if len(m_b2) < len(m_b1):
+             delta = len(m_b1) / len(m_b2)
+        p = max(0, p - delta)
+
+    # Decision: Select victim
+    evict_t1 = False
+    if len(m_t1) > 0:
+        if len(m_t1) > p:
+            evict_t1 = True
+        elif obj.key in m_b2 and len(m_t1) == int(p):
+            evict_t1 = True
+        elif len(m_t2) == 0:
+            evict_t1 = True
+
+    if evict_t1:
+        return next(iter(m_t1))
+    else:
+        return next(iter(m_t2))
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    On Cache Hit:
+    - If obj in T1, move to T2 (MRU).
+    - If obj in T2, move to MRU of T2.
+    '''
+    global m_t1, m_t2
+
+    if obj.key in m_t1:
+        del m_t1[obj.key]
+        m_t2[obj.key] = None
+    elif obj.key in m_t2:
+        del m_t2[obj.key]
+        m_t2[obj.key] = None
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    On Cache Insert (Miss):
+    - Place obj in T1 or T2.
+    '''
+    global m_t1, m_t2, m_b1, m_b2, p
+
+    # Reset state at start of new trace (access_count starts at 1 usually for first miss)
+    if cache_snapshot.access_count <= 1:
+        m_t1.clear()
+        m_t2.clear()
+        m_b1.clear()
+        m_b2.clear()
+        p = 0
+
+    # Check if it was a ghost
+    is_ghost = False
+    if obj.key in m_b1:
+        del m_b1[obj.key]
+        is_ghost = True
+    if obj.key in m_b2:
+        del m_b2[obj.key]
+        is_ghost = True
+
+    if is_ghost:
+        # History hit -> promote to frequency list
+        m_t2[obj.key] = None
+    else:
+        # New item -> probation list
+        m_t1[obj.key] = None
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    After Eviction:
+    - Update ghost lists.
+    '''
+    global m_t1, m_t2, m_b1, m_b2
+
+    if evicted_obj.key in m_t1:
+        del m_t1[evicted_obj.key]
+        m_b1[evicted_obj.key] = None
+    elif evicted_obj.key in m_t2:
+        del m_t2[evicted_obj.key]
+        m_b2[evicted_obj.key] = None
+
+    # Constrain ghost list sizes to capacity
+    capacity = cache_snapshot.capacity
+    while len(m_b1) > capacity:
+        m_b1.pop(next(iter(m_b1)))
+    while len(m_b2) > capacity:
+        m_b2.pop(next(iter(m_b2)))
+
+# EVOLVE-BLOCK-END
+>>>>>>> REPLACE
+</DIFF>

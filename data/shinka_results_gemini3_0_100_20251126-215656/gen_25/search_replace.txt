@@ -1,0 +1,126 @@
+<NAME>
+evict_demotion_sizegating
+</NAME>
+
+<DESCRIPTION>
+Implement Demotion from Main to Small queue for unaccessed items, giving them a second chance in the probationary queue instead of immediate eviction. Add Size-Gating to deny promotion/protection to large items (>10% capacity), optimizing hit rate by favoring smaller objects.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def evict(cache_snapshot, obj):
+    '''
+    Selects a victim using Dynamic S3-FIFO.
+    Lazy migration: Moves items between S/M or to Ghost during eviction scan.
+    '''
+    global s_dist
+
+    capacity = cache_snapshot.capacity
+    s_target = max(1, int(capacity * s_dist))
+    ghost_limit = max(capacity, int(2 * capacity))
+
+    # Iterate until a victim is found (Scan resistant loop)
+    while True:
+        # Determine which queue to evict from
+        # Prioritize evicting from S if it's over target, or if M is empty
+        evict_s = (len(small_q) > s_target) or (len(main_q) == 0)
+
+        if evict_s:
+            if not small_q:
+                # Should not happen if logic matches cache state, fallback to M
+                evict_s = False
+            else:
+                key, _ = small_q.popitem(last=False) # Head of FIFO
+
+                if key in accessed_bits:
+                    # Second Chance: Promote to M
+                    accessed_bits.discard(key)
+                    main_q[key] = None
+                    # We moved item S->M, but cache is still full. Loop continues.
+                else:
+                    # Victim found
+                    ghost_s[key] = None
+                    if len(ghost_s) > ghost_limit:
+                        ghost_s.popitem(last=False)
+                    return key
+
+        if not evict_s:
+            if not main_q:
+                # Emergency fallback
+                return next(iter(cache_snapshot.cache))
+
+            key, _ = main_q.popitem(last=False) # Head of FIFO
+
+            if key in accessed_bits:
+                # Second Chance: Reinsert to M Tail
+                accessed_bits.discard(key)
+                main_q[key] = None
+            else:
+                # Victim found
+                ghost_m[key] = None
+                if len(ghost_m) > ghost_limit:
+                    ghost_m.popitem(last=False)
+                return key
+=======
+def evict(cache_snapshot, obj):
+    '''
+    Selects a victim using S3-FIFO with Demotion and Size-Gating.
+    - Large items (>10% cap) get no second chance (Size-Gating).
+    - Unaccessed M items are demoted to S instead of evicted (Demotion).
+    '''
+    global s_dist
+
+    capacity = cache_snapshot.capacity
+    s_target = max(1, int(capacity * s_dist))
+    ghost_limit = max(capacity, int(2 * capacity))
+    # Threshold for "Large" object: 10% of cache
+    large_thresh = int(capacity * 0.1)
+
+    while True:
+        evict_s = (len(small_q) > s_target) or (len(main_q) == 0)
+
+        if evict_s:
+            if not small_q:
+                evict_s = False
+            else:
+                key, _ = small_q.popitem(last=False)
+                # Size check
+                is_large = (cache_snapshot.cache[key].size > large_thresh)
+
+                if key in accessed_bits and not is_large:
+                    # Second Chance: Promote to M
+                    accessed_bits.discard(key)
+                    main_q[key] = None
+                else:
+                    # Evict from S
+                    ghost_s[key] = None
+                    if len(ghost_s) > ghost_limit:
+                        ghost_s.popitem(last=False)
+                    return key
+
+        if not evict_s:
+            if not main_q:
+                return next(iter(cache_snapshot.cache))
+
+            key, _ = main_q.popitem(last=False)
+            is_large = (cache_snapshot.cache[key].size > large_thresh)
+
+            if key in accessed_bits and not is_large:
+                # Second Chance: Reinsert to M Tail
+                accessed_bits.discard(key)
+                main_q[key] = None
+            else:
+                # M Eviction Logic
+                if is_large:
+                    # Large items evicted directly to Ghost M
+                    ghost_m[key] = None
+                    if len(ghost_m) > ghost_limit:
+                        ghost_m.popitem(last=False)
+                    return key
+                else:
+                    # Demote to S (Second chance in probation)
+                    accessed_bits.discard(key)
+                    small_q[key] = None
+                    # Loop continues (cache still full), likely triggers S eviction next
+>>>>>>> REPLACE
+</DIFF>

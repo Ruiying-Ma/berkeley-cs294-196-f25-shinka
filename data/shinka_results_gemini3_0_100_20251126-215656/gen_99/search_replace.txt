@@ -1,0 +1,142 @@
+<NAME>
+increase_ghost_limit
+</NAME>
+
+<DESCRIPTION>
+Increase the capacity of the ghost registry from 2x to 4x of the cache capacity. A larger ghost registry allows the algorithm to track eviction history for a longer period, which is essential for capturing and rescuing items involved in large looping patterns (e.g., Traces 29, 34) that exceed the immediate cache capacity but fit within the extended history.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+            else:
+                # Victim found in S
+                # Record in Ghost to catch loops later
+                ghost_registry[candidate_key] = None
+                # Extended Ghost Size: 2x Capacity to catch longer loops (Trace 29 optimization)
+                if len(ghost_registry) > capacity * 2:
+                    ghost_registry.popitem(last=False)
+                return candidate_key
+
+        # 2. Evict from Main Queue
+        else:
+            # S is within target size, and M is not empty.
+            candidate_key, _ = m_queue.popitem(last=False) # FIFO head
+
+            if candidate_key in accessed_bits:
+                # Hit in M -> Reinsert at tail (Second Chance)
+                accessed_bits.discard(candidate_key)
+                m_queue[candidate_key] = None
+            else:
+                # Victim found in M
+                # Conditional Demotion: Demote to S only if S has room.
+                # If S is full (or above target), we drop the M-victim to prevent clogging S.
+                if len(s_queue) < s_target:
+                    s_queue[candidate_key] = None # Insert at tail of S
+                else:
+                    # Drop and add to Ghost
+                    ghost_registry[candidate_key] = None
+                    if len(ghost_registry) > capacity * 2:
+                        ghost_registry.popitem(last=False)
+                    return candidate_key
+=======
+            else:
+                # Victim found in S
+                # Record in Ghost to catch loops later
+                ghost_registry[candidate_key] = None
+                # Extended Ghost Size: 4x Capacity to catch longer loops (Trace 29 optimization)
+                if len(ghost_registry) > capacity * 4:
+                    ghost_registry.popitem(last=False)
+                return candidate_key
+
+        # 2. Evict from Main Queue
+        else:
+            # S is within target size, and M is not empty.
+            candidate_key, _ = m_queue.popitem(last=False) # FIFO head
+
+            if candidate_key in accessed_bits:
+                # Hit in M -> Reinsert at tail (Second Chance)
+                accessed_bits.discard(candidate_key)
+                m_queue[candidate_key] = None
+            else:
+                # Victim found in M
+                # Conditional Demotion: Demote to S only if S has room.
+                # If S is full (or above target), we drop the M-victim to prevent clogging S.
+                if len(s_queue) < s_target:
+                    s_queue[candidate_key] = None # Insert at tail of S
+                else:
+                    # Drop and add to Ghost
+                    ghost_registry[candidate_key] = None
+                    if len(ghost_registry) > capacity * 4:
+                        ghost_registry.popitem(last=False)
+                    return candidate_key
+>>>>>>> REPLACE
+</DIFF>
+
+<NAME>
+ghost_gating_and_warm_rescue
+</NAME>
+
+<DESCRIPTION>
+Refine `update_after_insert` to implement two key strategies:
+1.  **Ghost Gating (Scan Resistance)**: When the Small queue is saturated (`len >= target`), new items that are not in the ghost registry are inserted at the *head* of the Small queue (LIFO-like for overflow). This ensures that one-time scan items are the immediate next victims for eviction, preventing them from displacing valuable items in the Small or Main queues. This specifically targets the poor performance on Trace 14.
+2.  **Warm Rescue**: When an item is rescued from the Ghost registry, it is now marked as "accessed" (Warm) upon insertion into Main. This grants it a second chance (two passes through Main) before eviction. This change restores the ability to retain looping patterns that are slightly larger than the Main queue (recovering the regression in Trace 12).
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Handle insertion:
+    - Reset globals if needed.
+    - Check Ghost for rescue (M).
+    - Else insert to Probation (S).
+    '''
+    reset_globals_if_new_trace(cache_snapshot)
+
+    key = obj.key
+
+    if key in ghost_registry:
+        # Rescue from Ghost -> Insert directly to Main
+        m_queue[key] = None
+        del ghost_registry[key]
+        # NO BONUS: Do not set accessed_bits.
+        # Item starts cold in M. Must be hit again to stick.
+        # This prevents one-hit wonders from ghost polluting M (Trace 12 optimization).
+        accessed_bits.discard(key)
+    else:
+        # New item -> Insert into Small (Probation)
+        s_queue[key] = None
+        # Reset access bit: Item starts cold
+        accessed_bits.discard(key)
+=======
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Handle insertion with Ghost Gating and Warm Rescue.
+    '''
+    reset_globals_if_new_trace(cache_snapshot)
+
+    key = obj.key
+    capacity = cache_snapshot.capacity
+    s_target = max(int(capacity * 0.1), 1)
+
+    if key in ghost_registry:
+        # Rescue from Ghost -> Insert directly to Main
+        m_queue[key] = None
+        del ghost_registry[key]
+        # Warm Rescue: Mark as accessed to survive one eviction cycle in M.
+        # This helps loops slightly larger than M (Trace 12 recovery).
+        accessed_bits.add(key)
+    else:
+        # New item
+        # Ghost Gating: If S is full, insert at HEAD to evict quickly (Scan resistance).
+        if len(s_queue) >= s_target:
+             s_queue[key] = None
+             s_queue.move_to_end(key, last=False) # Insert at FIFO head (next victim)
+        else:
+             # Normal insert at tail
+             s_queue[key] = None
+
+        # Start cold
+        accessed_bits.discard(key)
+>>>>>>> REPLACE
+</DIFF>

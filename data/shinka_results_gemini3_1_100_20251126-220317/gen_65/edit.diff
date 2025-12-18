@@ -1,0 +1,268 @@
+--- a/original.py
++++ b/original.py
+@@ -1,195 +1,210 @@
+ # EVOLVE-BLOCK-START
+ """
+-W-TinyLFU Optimized Implementation
++W-TinyLFU with Enhanced Incumbency Bias and Demotion Protection
+ Improvements:
+-1. Strict Incumbency Bias: Main cache victims require significant frequency advantage to be displaced.
+-2. Decoupled Doorkeeper: Resets based on size (2x capacity) rather than aging timer.
+-3. Fast Saturation: Max frequency cap reduced to 15 to adapt quickly to workload phases.
+-4. Robust SLRU: Standard promotion/demotion with correct migration logic.
++1. Strong Incumbency Bias: Window victims must beat Main victims by a margin (freq + 1).
++2. Demotion Protection: Items demoted from Protected to Probation get a 'second chance' bonus in duels.
++3. Window Promotion: Hits in Window promote directly to Main (Probation), fast-tracking successful items.
++4. Adaptive Doorkeeper & Frequency: Tuned for responsiveness and history retention.
+ """
+ 
+ from collections import OrderedDict
+ 
+ class WTinyLFUState:
+     def __init__(self, capacity):
+         self.capacity = capacity
+-        # Configuration
++        # 1% Window, but at least 1 slot
+         self.window_limit = max(1, int(capacity * 0.01))
+         self.main_limit = capacity - self.window_limit
++        # SLRU split: 80% Protected
+         self.protected_limit = int(self.main_limit * 0.8)
+         
+-        # Cache Segments
++        # Segments
+         self.window = OrderedDict()
+         self.probation = OrderedDict()
+         self.protected = OrderedDict()
++        self.demoted = set() # Set of keys demoted from Protected
+         
+         # Frequency Sketch
+         self.freq = {}
+         self.doorkeeper = set()
+         self.access_counter = 0
+         
+-        # Tuned Parameters
+-        self.max_freq = 15                 # Low cap for fast adaptation
+-        self.aging_interval = capacity * 10 # Slow aging to retain history
+-        self.doorkeeper_limit = capacity * 2 # Size-based reset
++        # Parameters
++        self.max_freq = 15
++        self.aging_interval = capacity * 10
++        self.doorkeeper_limit = capacity * 2
+         
+     def get_freq(self, key):
+-        # 1 from Doorkeeper + Value in CountMin
+         val = self.freq.get(key, 0)
+         if key in self.doorkeeper:
+             val += 1
+         return val
+     
+     def record_access(self, key):
+         self.access_counter += 1
+         
++        # Doorkeeper / Frequency logic
+         if key not in self.doorkeeper:
+             self.doorkeeper.add(key)
+         else:
+-            # Increment frequency up to cap
+             curr = self.freq.get(key, 0)
+             if curr < self.max_freq:
+                 self.freq[key] = curr + 1
+             
+-        # Aging logic (Periodic Halving)
++        # Aging
+         if self.access_counter >= self.aging_interval:
+             self.age_frequencies()
+             self.access_counter = 0
+             
+-        # Doorkeeper Maintenance (Size-based)
++        # Doorkeeper Reset
+         if len(self.doorkeeper) > self.doorkeeper_limit:
+             self.doorkeeper.clear()
+             
+     def age_frequencies(self):
+-        # Halve all frequencies
++        # Halving
+         removals = []
+         for k, v in self.freq.items():
+             new_v = v // 2
+             if new_v == 0:
+                 removals.append(k)
+             else:
+                 self.freq[k] = new_v
+         for k in removals:
+             del self.freq[k]
+             
+     def maintain_slru_invariant(self):
+-        # Enforce Protected segment size
+         while len(self.protected) > self.protected_limit:
+-            # Demote from Protected LRU to Probation MRU
+             k, _ = self.protected.popitem(last=False)
+             self.probation[k] = None
++            self.demoted.add(k)
+ 
+ _state = None
+ 
+ def get_state(cache_snapshot):
+     global _state
+     current_id = id(cache_snapshot.cache)
+     if _state is None or getattr(_state, 'cache_id', None) != current_id:
+         _state = WTinyLFUState(cache_snapshot.capacity)
+         _state.cache_id = current_id
+     
+-    # Sync Check
++    # Sync Check (Lazy rebuild if drift is too high)
+     total_len = len(_state.window) + len(_state.probation) + len(_state.protected)
+     if abs(total_len - len(cache_snapshot.cache)) > 5:
+-        # Rebuild state (fail-safe)
++        # Rebuild state from scratch to be safe
+         _state = WTinyLFUState(cache_snapshot.capacity)
+         _state.cache_id = current_id
++        # Assign all existing to probation as a fallback
+         for k in cache_snapshot.cache:
+             _state.probation[k] = None
+             
+     return _state
+ 
+ def evict(cache_snapshot, obj):
+     state = get_state(cache_snapshot)
+     
+-    # Candidates
+-    window_candidate = next(iter(state.window)) if state.window else None
+-    probation_candidate = next(iter(state.probation)) if state.probation else None
+-    if not probation_candidate and state.protected:
+-        probation_candidate = next(iter(state.protected))
+-        
+-    # Policy:
+-    # 1. Fill Window if possible (prefer evicting Main)
+-    # 2. If Window full, Duel (Window LRU vs Main LRU)
+-    
++    # Identify candidates
++    candidate_w = next(iter(state.window)) if state.window else None
++    candidate_p = next(iter(state.probation)) if state.probation else None
++    
++    # If probation is empty, borrow from protected (should differ to maintain invariant, but need a victim)
++    if not candidate_p and state.protected:
++        candidate_p = next(iter(state.protected))
++
++    # 1. Protect Window growth if it's small (evict Main to make room)
+     if len(state.window) < state.window_limit:
+-        if probation_candidate:
+-            return probation_candidate
+-        return window_candidate or next(iter(cache_snapshot.cache))
+-    else:
+-        # Window Full - Duel
+-        if window_candidate and probation_candidate:
+-            freq_w = state.get_freq(window_candidate)
+-            freq_p = state.get_freq(probation_candidate)
+-            
+-            # Incumbency Bias: Window item must be significantly better to displace Main
+-            if freq_w > freq_p + 1:
+-                return probation_candidate
+-            else:
+-                return window_candidate
+-        elif window_candidate:
+-            return window_candidate
+-        elif probation_candidate:
+-            return probation_candidate
+-            
++        if candidate_p:
++            return candidate_p
++        return candidate_w or next(iter(cache_snapshot.cache))
++    
++    # 2. Duel: Window LRU vs Main (Probation) LRU
++    if candidate_w and candidate_p:
++        freq_w = state.get_freq(candidate_w)
++        freq_p = state.get_freq(candidate_p)
++        
++        # Calculate Bias
++        # Standard bias: 1 (Incumbency)
++        # Demotion bias: +4 (If victim was recently protected)
++        bias = 1
++        if candidate_p in state.demoted:
++            bias = 5
++            
++        # Window must strictly beat Main + bias to displace it
++        if freq_w > freq_p + bias:
++            return candidate_p
++        else:
++            return candidate_w
++            
++    # Fallbacks
++    if candidate_w: return candidate_w
++    if candidate_p: return candidate_p
+     return next(iter(cache_snapshot.cache))
+ 
+ def update_after_hit(cache_snapshot, obj):
+     state = get_state(cache_snapshot)
+     key = obj.key
+     state.record_access(key)
+     
+     if key in state.window:
+-        state.window.move_to_end(key)
++        # Hit in Window -> Promote to Probation (Main)
++        del state.window[key]
++        state.probation[key] = None
+     elif key in state.probation:
+-        # Promote Probation -> Protected
++        # Hit in Probation -> Promote to Protected
+         del state.probation[key]
+         state.protected[key] = None
++        if key in state.demoted:
++            state.demoted.remove(key)
+         state.maintain_slru_invariant()
+     elif key in state.protected:
+         state.protected.move_to_end(key)
+ 
+ def update_after_insert(cache_snapshot, obj):
+     state = get_state(cache_snapshot)
+     key = obj.key
+     state.record_access(key)
+     
+-    # Insert into Window
++    # New items go to Window
+     state.window[key] = None
+     
+-    # Admission: If Window full, migrate LRU to Probation
++    # If Window full, migrate LRU to Probation
++    # This happens if we just evicted from Probation (making space), 
++    # so now Window has one extra item. We move the oldest Window item to Probation.
+     if len(state.window) > state.window_limit:
+-        migrant_key, _ = state.window.popitem(last=False)
+-        state.probation[migrant_key] = None
++        k, _ = state.window.popitem(last=False)
++        state.probation[k] = None
+ 
+ def update_after_evict(cache_snapshot, obj, evicted_obj):
+     state = get_state(cache_snapshot)
+     key = evicted_obj.key
+     
++    # Clean up state
+     if key in state.window:
+         del state.window[key]
+     elif key in state.probation:
+         del state.probation[key]
++        if key in state.demoted:
++            state.demoted.remove(key)
+     elif key in state.protected:
+         del state.protected[key]
+ # EVOLVE-BLOCK-END
+ 
+ # This part remains fixed (not evolved)
+ def run_caching(trace_path: str, copy_code_dst: str):
+     """Run the caching algorithm on a trace"""
+     import os
+     with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+         code_str = f.read()
+     with open(os.path.join(copy_code_dst), 'w') as f:
+         f.write(code_str)
+     from cache_utils import Cache, CacheConfig, CacheObj, Trace
+     trace = Trace(trace_path=trace_path)
+     cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+     cache = Cache(CacheConfig(cache_capacity))
+     for entry in trace.entries:
+         obj = CacheObj(key=str(entry.key))
+         cache.get(obj)
+     with open(copy_code_dst, 'w') as f:
+         f.write("")
+     hit_rate = round(cache.hit_count / cache.access_count, 6)
+     return hit_rate

@@ -1,0 +1,235 @@
+# EVOLVE-BLOCK-START
+"""
+S3-FIFO-Gated: Enhanced S3-FIFO with Ghost-Gated Admission and Frequency-Based Promotion.
+Features:
+- Ghost-Gated Admission: New items bypass Small queue and go to a 'Transient' (Rejected) queue if Small is full.
+- Transient items are preferred victims, effectively filtering scans.
+- Frequency awareness: Usage frequency capped at 7.
+- Strict Promotion: Requires >1 hits to move from Small to Main (configurable).
+- Demotion: Main -> Small (gives chance to prove worth again).
+"""
+
+from collections import OrderedDict
+
+# Global State
+# _q_small: Probationary queue (FIFO)
+# _q_main: Protected queue (FIFO)
+# _q_ghost: History of evicted items (OrderedDict for FIFO/LRU behavior)
+# _q_transient: Queue for items admitted under congestion (Reject-to-Ghost candidates)
+# _freq: Frequency counter for items
+# _last_ts: Timestamp for reset detection
+
+_q_small = OrderedDict()
+_q_main = OrderedDict()
+_q_ghost = OrderedDict()
+_q_transient = OrderedDict()
+_freq = {}
+_last_ts = -1
+
+def _reset_if_needed(snapshot):
+    global _q_small, _q_main, _q_ghost, _q_transient, _freq, _last_ts
+    if snapshot.access_count < _last_ts:
+        _q_small.clear()
+        _q_main.clear()
+        _q_ghost.clear()
+        _q_transient.clear()
+        _freq.clear()
+    _last_ts = snapshot.access_count
+
+def evict(cache_snapshot, obj):
+    '''
+    Eviction Policy:
+    1. Check Transient (Rejected) queue: Evict immediately.
+    2. Check Small (Probation):
+       - If freq > 1: Promote to Main.
+       - If freq == 1: Reinsert to Small (Second Chance).
+       - Else: Evict to Ghost.
+    3. Check Main (Protected):
+       - If freq > 0: Reinsert to Main (decay freq).
+       - Else: Demote to Small.
+    '''
+    global _q_small, _q_main, _q_ghost, _q_transient, _freq
+    _reset_if_needed(cache_snapshot)
+
+    capacity = cache_snapshot.capacity
+    # Target Small Size: 5% (Aggressive protection for Main)
+    target_small = max(1, int(capacity * 0.05))
+
+    while True:
+        # 1. Transient / Rejected Items (Priority Victims)
+        if _q_transient:
+            candidate, _ = _q_transient.popitem(last=False)
+            if candidate not in cache_snapshot.cache:
+                _freq.pop(candidate, None)
+                continue
+            
+            # If hit while transient, it might have freq > 0 (via update_after_hit rescue)
+            # If so, rescue it!
+            if _freq.get(candidate, 0) > 0:
+                # Rescue to Small
+                _q_small[candidate] = None
+                continue
+            
+            # Evict Transient Item
+            _q_ghost[candidate] = None
+            if len(_q_ghost) > capacity * 4: # Extended Ghost Size
+                _q_ghost.popitem(last=False)
+            _freq.pop(candidate, None)
+            return candidate
+
+        # 2. Small Queue (Probation)
+        # Process if over target or if Main is empty (must evict something)
+        if len(_q_small) > target_small or not _q_main:
+            if not _q_small:
+                # Fallback if both empty (rare edge case)
+                if _q_main: 
+                    pass # Trigger Main logic
+                else:
+                    return next(iter(cache_snapshot.cache))
+            
+            if _q_small:
+                candidate, _ = _q_small.popitem(last=False)
+                
+                if candidate not in cache_snapshot.cache:
+                    _freq.pop(candidate, None)
+                    continue
+                
+                f = _freq.get(candidate, 0)
+                if f > 1:
+                    # High frequency (>1 hits) -> Promote to Main
+                    _q_main[candidate] = None
+                    # Reset freq to 0 to require fresh proof in Main
+                    _freq[candidate] = 0
+                    continue
+                elif f == 1:
+                    # One hit -> Reinsert to Small (Second Chance)
+                    _q_small[candidate] = None
+                    _freq[candidate] = 0
+                    continue
+                else:
+                    # Zero hits -> Evict
+                    _q_ghost[candidate] = None
+                    if len(_q_ghost) > capacity * 4:
+                        _q_ghost.popitem(last=False)
+                    _freq.pop(candidate, None)
+                    return candidate
+
+        # 3. Main Queue (Protected)
+        if _q_main:
+            candidate, _ = _q_main.popitem(last=False)
+            
+            if candidate not in cache_snapshot.cache:
+                _freq.pop(candidate, None)
+                continue
+            
+            f = _freq.get(candidate, 0)
+            if f > 0:
+                # Hit in Main -> Reinsert
+                _q_main[candidate] = None
+                # Decay frequency: subtract 1 to maintain "hotness" memory
+                _freq[candidate] = f - 1
+                continue
+            else:
+                # Cold in Main -> Demote to Small
+                # This gives it one last pass through Small
+                _q_small[candidate] = None
+                _freq[candidate] = 0
+                continue
+        
+        # Fallback
+        if not _q_small and not _q_main and not _q_transient:
+             if cache_snapshot.cache:
+                 return next(iter(cache_snapshot.cache))
+             return None
+
+def update_after_hit(cache_snapshot, obj):
+    global _freq, _q_transient, _q_small
+    _reset_if_needed(cache_snapshot)
+    
+    key = obj.key
+    # Cap frequency at 7 (Increased ceiling)
+    _freq[key] = min(_freq.get(key, 0) + 1, 7)
+    
+    # Immediate rescue from Transient to Small on hit
+    if key in _q_transient:
+        _q_transient.pop(key)
+        _q_small[key] = None
+
+def update_after_insert(cache_snapshot, obj):
+    global _q_small, _q_main, _q_ghost, _q_transient, _freq
+    _reset_if_needed(cache_snapshot)
+    
+    key = obj.key
+    capacity = cache_snapshot.capacity
+    target_small = max(1, int(capacity * 0.05))
+    
+    # Check Ghost
+    if key in _q_ghost:
+        # Ghost Hit -> Promote to Main
+        # It was valuable recently.
+        if key not in _q_main and key not in _q_small and key not in _q_transient:
+             _q_main[key] = None
+             _freq[key] = 0 # Start fresh in Main
+        _q_ghost.pop(key)
+    else:
+        # New Item
+        # Gating Policy:
+        # If Small is full (at or above target), do not admit to Small. Put in Transient.
+        if len(_q_small) >= target_small:
+            if key not in _q_transient and key not in _q_main and key not in _q_small:
+                _q_transient[key] = None
+                _freq[key] = 0
+        else:
+            # Small has space
+            if key not in _q_small and key not in _q_main and key not in _q_transient:
+                _q_small[key] = None
+                _freq[key] = 0
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    global _q_small, _q_main, _q_transient, _q_ghost, _freq
+    _reset_if_needed(cache_snapshot)
+    
+    key = evicted_obj.key
+    
+    # Cleanup queues
+    if key in _q_small:
+        _q_small.pop(key)
+        if key not in _q_ghost:
+             _q_ghost[key] = None
+    
+    if key in _q_main:
+        _q_main.pop(key)
+        if key not in _q_ghost:
+            _q_ghost[key] = None
+
+    if key in _q_transient:
+        _q_transient.pop(key)
+        if key not in _q_ghost:
+             _q_ghost[key] = None
+             
+    _freq.pop(key, None)
+    
+    # Cap Ghost
+    if len(_q_ghost) > cache_snapshot.capacity * 4:
+        _q_ghost.popitem(last=False)
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

@@ -1,0 +1,59 @@
+<NAME>
+s3fifo_extended_ghost_soft_demotion
+</NAME>
+
+<DESCRIPTION>
+1.  **Extended Ghost Registry (5x Capacity):** Increases the size of the ghost registry from 2x to 5x the cache capacity. This significantly improves the algorithm's ability to detect and rescue items from large loops or working sets that exceed the cache size but are recurring (addressing poor performance on loop-heavy traces like Trace 29). Since ghost entries are metadata-only, this improves hit rate with minimal overhead.
+2.  **Soft Demotion (Frequency-Preserving Demotion):** Modifies the demotion logic when an item is evicted from the Main (M) queue. Instead of placing the demoted item at the tail (MRU) of the Small (S) queue—where it would compete with and potentially displace new incoming items—it is placed at the head (LRU) of S. This grants the item a "soft landing" only if S has spare capacity. If S is full or fills up, the demoted item is the first to be evicted. This change prioritizes new items (discovery) while still allowing M-victims to utilize slack capacity, improving scan resistance (Trace 14) and responsiveness to changing working sets.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+            else:
+                # Victim found in S
+                # Record in Ghost to catch loops later
+                ghost_registry[candidate_key] = None
+                # Extended Ghost Size: 2x Capacity to catch longer loops (Trace 29 optimization)
+                if len(ghost_registry) > capacity * 2:
+                    ghost_registry.popitem(last=False)
+                return candidate_key
+=======
+            else:
+                # Victim found in S
+                # Record in Ghost to catch loops later
+                ghost_registry[candidate_key] = None
+                # Extended Ghost Size: 5x Capacity to catch longer loops and traces with large working sets
+                if len(ghost_registry) > capacity * 5:
+                    ghost_registry.popitem(last=False)
+                return candidate_key
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+            else:
+                # Victim found in M
+                # Conditional Demotion: Demote to S only if S has room.
+                # If S is full (or above target), we drop the M-victim to prevent clogging S.
+                if len(s_queue) < s_target:
+                    s_queue[candidate_key] = None # Insert at tail of S
+                else:
+                    # Drop and add to Ghost
+                    ghost_registry[candidate_key] = None
+                    if len(ghost_registry) > capacity * 2:
+                        ghost_registry.popitem(last=False)
+                    return candidate_key
+=======
+            else:
+                # Victim found in M
+                # Conditional Demotion: Demote to S only if S has room.
+                if len(s_queue) < s_target:
+                    s_queue[candidate_key] = None
+                    # Insert at head (LRU) of S: Give it a spot but prioritize evicting it over new items
+                    s_queue.move_to_end(candidate_key, last=False)
+                else:
+                    # Drop and add to Ghost
+                    ghost_registry[candidate_key] = None
+                    # Extended Ghost Size: 5x Capacity
+                    if len(ghost_registry) > capacity * 5:
+                        ghost_registry.popitem(last=False)
+                    return candidate_key
+>>>>>>> REPLACE
+</DIFF>

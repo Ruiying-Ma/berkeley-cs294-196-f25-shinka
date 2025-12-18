@@ -1,0 +1,150 @@
+# EVOLVE-BLOCK-START
+"""Cache eviction algorithm for optimizing hit rates across multiple workloads"""
+
+# Segmented LRU (SLRU): split cache into probationary and protected segments.
+# New items go to probationary; on hit they are promoted to protected.
+# Evict from probationary first (LRU), else from protected (LRU).
+# This shields reused items from scans/one-hit-wonders and typically lowers miss rate.
+
+m_key_timestamp = dict()           # recency clock (last access time)
+m_probationary = set()             # keys currently in probationary segment
+m_protected = set()                # keys currently in protected segment
+_PROTECTED_RATIO = 0.8             # target fraction of cache for protected segment
+
+
+def _find_lru_key_in_set(keys):
+    """Return the key with the smallest timestamp among 'keys'. If empty, return None."""
+    lru_key = None
+    lru_ts = None
+    for k in keys:
+        ts = m_key_timestamp.get(k, -1)
+        if lru_ts is None or ts < lru_ts:
+            lru_key, lru_ts = k, ts
+    return lru_key
+
+
+def _enforce_segment_limits(cache_snapshot):
+    """Ensure protected segment does not exceed its target size; demote LRU protected if needed."""
+    # Determine the target maximum size for the protected segment.
+    try:
+        cap = int(cache_snapshot.capacity)
+    except Exception:
+        cap = max(len(m_key_timestamp), 1)
+    prot_max = max(int(cap * _PROTECTED_RATIO), 1)
+    # Demote LRU items from protected to probationary until within target.
+    while len(m_protected) > prot_max:
+        demote_key = _find_lru_key_in_set(m_protected)
+        if demote_key is None:
+            break
+        m_protected.discard(demote_key)
+        m_probationary.add(demote_key)
+
+
+def evict(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm chooses the eviction victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The new object that needs to be inserted into the cache.
+    - Return:
+        - `candid_obj_key`: The key of the cached object that will be evicted to make room for `obj`.
+    '''
+    # Clean sets to only include keys actually present in the cache.
+    cache_keys = set(cache_snapshot.cache.keys())
+    if m_probationary:
+        m_probationary.intersection_update(cache_keys)
+    if m_protected:
+        m_protected.intersection_update(cache_keys)
+
+    # Prefer evicting from probationary (cold) segment; otherwise, from protected.
+    candid_obj_key = None
+    if m_probationary:
+        candid_obj_key = _find_lru_key_in_set(m_probationary)
+    if candid_obj_key is None and m_protected:
+        candid_obj_key = _find_lru_key_in_set(m_protected)
+
+    # Fallback: global LRU among all cache keys (robustness in case of drift).
+    if candid_obj_key is None:
+        candid_obj_key = _find_lru_key_in_set(cache_keys)
+
+    # Absolute fallback: choose any key deterministically if timestamps are missing.
+    if candid_obj_key is None and cache_keys:
+        candid_obj_key = next(iter(cache_keys))
+    return candid_obj_key
+
+
+def update_after_hit(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm update the metadata it maintains immediately after a cache hit.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object accessed during the cache hit.
+    - Return: `None`
+    '''
+    global m_key_timestamp, m_probationary, m_protected
+    # Update recency clock
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+
+    # Promote from probationary to protected upon first hit; otherwise just refresh.
+    if obj.key in m_probationary:
+        m_probationary.discard(obj.key)
+        m_protected.add(obj.key)
+
+    # Keep protected segment within target size by demoting its LRU to probationary.
+    _enforce_segment_limits(cache_snapshot)
+
+
+def update_after_insert(cache_snapshot, obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after inserting a new object into the cache.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object that was just inserted into the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp, m_probationary, m_protected
+    # Initialize recency and place into probationary segment.
+    m_key_timestamp[obj.key] = cache_snapshot.access_count
+    m_protected.discard(obj.key)
+    m_probationary.add(obj.key)
+
+    # Keep protected segment within target size (no-op if protected not oversized).
+    _enforce_segment_limits(cache_snapshot)
+
+
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    This function defines how the algorithm updates the metadata it maintains immediately after evicting the victim.
+    - Args:
+        - `cache_snapshot`: A snapshot of the current cache state.
+        - `obj`: The object to be inserted into the cache.
+        - `evicted_obj`: The object that was just evicted from the cache.
+    - Return: `None`
+    '''
+    global m_key_timestamp, m_probationary, m_protected
+    # Remove evicted object from all metadata.
+    m_key_timestamp.pop(evicted_obj.key, None)
+    m_probationary.discard(evicted_obj.key)
+    m_protected.discard(evicted_obj.key)
+
+# EVOLVE-BLOCK-END
+
+# This part remains fixed (not evolved)
+def run_caching(trace_path: str, copy_code_dst: str):
+    """Run the caching algorithm on a trace"""
+    import os
+    with open(os.path.abspath(__file__), 'r', encoding="utf-8") as f:
+        code_str = f.read()
+    with open(os.path.join(copy_code_dst), 'w') as f:
+        f.write(code_str)
+    from cache_utils import Cache, CacheConfig, CacheObj, Trace
+    trace = Trace(trace_path=trace_path)
+    cache_capacity = max(int(trace.get_ndv() * 0.1), 1)
+    cache = Cache(CacheConfig(cache_capacity))
+    for entry in trace.entries:
+        obj = CacheObj(key=str(entry.key))
+        cache.get(obj)
+    with open(copy_code_dst, 'w') as f:
+        f.write("")
+    hit_rate = round(cache.hit_count / cache.access_count, 6)
+    return hit_rate

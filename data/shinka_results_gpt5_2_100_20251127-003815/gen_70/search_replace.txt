@@ -1,0 +1,407 @@
+<NAME>
+dual_segment_sampling_bias_and_t2_target
+</NAME>
+
+<DESCRIPTION>
+I introduce three synergistic improvements:
+
+1) Dual-segment competitive victim selection with a tiny bias to protect T2: On every eviction I now sample cold candidates from both T1 and T2 using the existing LRFU-decayed/TinyLFU lexicographic comparator, then choose the colder of the two with a +1 TinyLFU bias favoring T2. This reduces unnecessary protected evictions and aligns with state-of-the-art hybrid policies. I keep ARC’s replacement guidance but allow overriding it when the new object is clearly hotter than the T2 candidate.
+
+2) Protected-size enforcement after hits and inserts: I enforce a dynamic T2 target size of cap - p (rounded), demoting T2’s LRU to T1 when T2 exceeds the target. This keeps the protected/main split healthy and prevents T2 overgrowth that can starve T1 and degrade adaptability.
+
+3) Faster hot-item capture and smarter desync handling: On fresh inserts the early promotion threshold is reduced to 3 (5 during scan cooldown) and desync hits are admitted to T2 only if hot (TinyLFU or LRFU-decayed), otherwise to T1. This reduces churn and better captures emerging hot sets without inflating T2 during scans.
+
+These changes focus on evict, update_after_hit, update_after_insert, and update_after_evict, and are self-consistent with existing helpers and metadata. They should lower miss rates across mixed workloads by improving victim choice, stabilizing segment sizing, and accelerating hot object admission.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def evict(self, cache_snapshot, obj):
+        self._reset_if_new_run(cache_snapshot)
+        self._prune_metadata(cache_snapshot)
+        self._ensure_sketch(cache_snapshot)
+        self._seed_from_cache(cache_snapshot)
+
+        seg_name = self._replace_segment(cache_snapshot, obj.key)
+        # Scan-aware: prefer evicting from probation during cooldown
+        if self.scan_cooldown > 0 and self.T1:
+            seg_name = "T1"
+        victim = None
+
+        if seg_name == "T1" and self.T1:
+            victim = self._eviction_sample(cache_snapshot, self.T1)
+        elif seg_name == "T2" and self.T2:
+            cand_t2 = self._eviction_sample(cache_snapshot, self.T2)
+            if cand_t2 is not None:
+                # TinyLFU guard: protect much hotter T2 vs incoming
+                f_new = self._sketch_est(cache_snapshot, obj.key)
+                f_t2 = self._sketch_est(cache_snapshot, cand_t2)
+                bias = 2 if self.scan_cooldown > 0 else 1
+                if f_t2 > f_new + bias and len(self.T1) > 0:
+                    alt = self._eviction_sample(cache_snapshot, self.T1)
+                    if alt is not None:
+                        victim = alt
+                        seg_name = "T1"
+                    else:
+                        victim = cand_t2
+                else:
+                    victim = cand_t2
+
+        if victim is None:
+            # Fallback to any cached key
+            for k in cache_snapshot.cache.keys():
+                victim = k
+                seg_name = "T1" if k in self.T1 else ("T2" if k in self.T2 else None)
+                break
+
+        self.last_victim_key = victim
+        self.last_victim_from = seg_name
+        return victim
+=======
+    def evict(self, cache_snapshot, obj):
+        self._reset_if_new_run(cache_snapshot)
+        self._prune_metadata(cache_snapshot)
+        self._ensure_sketch(cache_snapshot)
+        self._seed_from_cache(cache_snapshot)
+
+        now = cache_snapshot.access_count
+        f_new = self._sketch_est(cache_snapshot, obj.key)
+
+        # ARC suggested segment to replace
+        seg_pref = self._replace_segment(cache_snapshot, obj.key)
+
+        # Scan-aware: during cooldown, prefer evicting from T1 if possible
+        if self.scan_cooldown > 0 and self.T1:
+            seg_pref = "T1"
+
+        # Sample candidates from both segments
+        cand_t1 = self._eviction_sample(cache_snapshot, self.T1) if self.T1 else None
+        cand_t2 = self._eviction_sample(cache_snapshot, self.T2) if self.T2 else None
+
+        # If one segment is empty, fall back to the other
+        if cand_t1 is None and cand_t2 is None:
+            # Fallback to any cached key
+            victim = None
+            seg_name = None
+            for k in cache_snapshot.cache.keys():
+                victim = k
+                seg_name = "T1" if k in self.T1 else ("T2" if k in self.T2 else None)
+                break
+            self.last_victim_key = victim
+            self.last_victim_from = seg_name
+            return victim
+        if cand_t1 is None:
+            self.last_victim_key = cand_t2
+            self.last_victim_from = "T2"
+            return cand_t2
+        if cand_t2 is None:
+            self.last_victim_key = cand_t1
+            self.last_victim_from = "T1"
+            return cand_t1
+
+        # Both candidates exist: choose colder by (TinyLFU, LRFU) with +1 bias favoring T2
+        f1 = self._sketch_est(cache_snapshot, cand_t1); d1 = self._decayed_score(cand_t1, now)
+        f2 = self._sketch_est(cache_snapshot, cand_t2); d2 = self._decayed_score(cand_t2, now)
+        # Bias T2 to make it slightly harder to evict
+        f2b = f2 + 1
+
+        if (f1 < f2b) or (f1 == f2b and d1 <= d2):
+            chosen_key = cand_t1
+            chosen_seg = "T1"
+            other_key, other_f, other_d = cand_t2, f2, d2
+        else:
+            chosen_key = cand_t2
+            chosen_seg = "T2"
+            other_key, other_f, other_d = cand_t1, f1, d1
+
+        # Respect ARC segment preference unless conditions justify override
+        if seg_pref == "T1" and chosen_seg == "T2":
+            # Only replace T2 if incoming is clearly hotter than T2 candidate
+            if f_new > (f2 + 1):
+                victim = chosen_key
+                seg_name = "T2"
+            else:
+                victim = cand_t1
+                seg_name = "T1"
+        elif seg_pref == "T2" and chosen_seg == "T1":
+            # Prefer T2 unless T1 is much colder
+            if (f1 + 0) < (f2 - 1) or not self.T2:
+                victim = cand_t1
+                seg_name = "T1"
+            else:
+                victim = cand_t2
+                seg_name = "T2"
+        else:
+            victim = chosen_key
+            seg_name = chosen_seg
+
+        self.last_victim_key = victim
+        self.last_victim_from = seg_name
+        return victim
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def update_after_hit(self, cache_snapshot, obj):
+        self._reset_if_new_run(cache_snapshot)
+        self._prune_metadata(cache_snapshot)
+        self._ensure_sketch(cache_snapshot)
+
+        now = cache_snapshot.access_count
+        key = obj.key
+        # Reset scan indicator and learn
+        self.miss_streak = 0
+        # Cooldown decays faster on hits
+        if self.scan_cooldown > 0:
+            self.scan_cooldown = max(0, self.scan_cooldown - 2)
+        self._sketch_add(cache_snapshot, key, 1)
+        # Bump decayed score
+        s = self._decayed_score(key, now)
+        self.score[key] = s + 1.0
+
+        if key in self.T2:
+            self._move_to_mru(self.T2, key)
+        elif key in self.T1:
+            # Promote T1 -> T2 on hit unless in scan cooldown and not hot
+            if self.scan_cooldown > 0:
+                if self._sketch_est(cache_snapshot, key) >= 2 or self._decayed_score(key, now) >= 1.0:
+                    self.T1.pop(key, None)
+                    self._move_to_mru(self.T2, key)
+                else:
+                    self._move_to_mru(self.T1, key)
+            else:
+                self.T1.pop(key, None)
+                self._move_to_mru(self.T2, key)
+        else:
+            # Metadata miss but hit in cache: conservatively place in T1
+            self._move_to_mru(self.T1, key)
+=======
+    def update_after_hit(self, cache_snapshot, obj):
+        self._reset_if_new_run(cache_snapshot)
+        self._prune_metadata(cache_snapshot)
+        self._ensure_sketch(cache_snapshot)
+
+        now = cache_snapshot.access_count
+        key = obj.key
+        # Reset scan indicator and learn
+        self.miss_streak = 0
+        # Cooldown decays faster on hits
+        if self.scan_cooldown > 0:
+            self.scan_cooldown = max(0, self.scan_cooldown - 2)
+        self._sketch_add(cache_snapshot, key, 1)
+        # Bump decayed score
+        s = self._decayed_score(key, now)
+        self.score[key] = s + 1.0
+
+        if key in self.T2:
+            self._move_to_mru(self.T2, key)
+        elif key in self.T1:
+            # Promote T1 -> T2 on hit unless in scan cooldown and not hot
+            hot = (self._sketch_est(cache_snapshot, key) >= 2) or (self._decayed_score(key, now) >= 1.0)
+            if self.scan_cooldown > 0 and not hot:
+                self._move_to_mru(self.T1, key)
+            else:
+                self.T1.pop(key, None)
+                self._move_to_mru(self.T2, key)
+        else:
+            # Metadata miss but hit in cache: place to T2 only if hot, else T1
+            if (self._sketch_est(cache_snapshot, key) >= 3) or (self._decayed_score(key, now) >= 1.0):
+                self._move_to_mru(self.T2, key)
+            else:
+                self._move_to_mru(self.T1, key)
+
+        # Enforce protected target size: |T2| <= cap - p
+        cap = self._cap(cache_snapshot)
+        p_int = int(round(max(0.0, min(float(cap), self.p))))
+        t2_target = max(0, cap - p_int)
+        while len(self.T2) > t2_target and self.T2:
+            # Demote T2 LRU to T1 MRU
+            demote_k, _ = self.T2.popitem(last=False)
+            self._move_to_mru(self.T1, demote_k)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def update_after_insert(self, cache_snapshot, obj):
+        self._reset_if_new_run(cache_snapshot)
+        self._prune_metadata(cache_snapshot)
+        self._ensure_sketch(cache_snapshot)
+
+        now = cache_snapshot.access_count
+        key = obj.key
+        self.miss_streak += 1
+        # Slow cooldown decay on continued misses
+        if self.scan_cooldown > 0:
+            self.scan_cooldown = max(0, self.scan_cooldown - 1)
+        # Trigger scan cooldown if too many consecutive misses
+        cap = self._cap(cache_snapshot)
+        if self.miss_streak >= max(32, cap // 2):
+            self.scan_cooldown = max(self.scan_cooldown, min(cap, self.miss_streak))
+
+        # Learn on admission and initialize decayed metadata
+        self._sketch_add(cache_snapshot, key, 1)
+        self.last_time[key] = now
+        # Start with small score to reduce scan pollution
+        self.score[key] = 0.5
+
+        # ARC adaptive p tuning based on ghost refaults
+        if key in self.B1:
+            delta = max(1, len(self.B2) // max(1, len(self.B1)))
+            self.p = min(float(cap), self.p + float(delta))
+            self.B1.pop(key, None)
+            # Under scan cooldown, only place into T2 if modestly hot
+            if self.scan_cooldown > 0 and self._sketch_est(cache_snapshot, key) < 2:
+                self._move_to_mru(self.T1, key)
+            else:
+                self._move_to_mru(self.T2, key)
+        elif key in self.B2:
+            delta = max(1, len(self.B1) // max(1, len(self.B2)))
+            self.p = max(0.0, self.p - float(delta))
+            self.B2.pop(key, None)
+            if self.scan_cooldown > 0 and self._sketch_est(cache_snapshot, key) < 2:
+                self._move_to_mru(self.T1, key)
+            else:
+                self._move_to_mru(self.T2, key)
+        else:
+            # Fresh miss: early promotion if clearly hot
+            thr = 6 if self.scan_cooldown > 0 else 4
+            if self._sketch_est(cache_snapshot, key) >= thr:
+                self._move_to_mru(self.T2, key)
+            else:
+                self._move_to_mru(self.T1, key)
+
+        # Bound ghosts
+        self._trim_ghosts(cache_snapshot)
+=======
+    def update_after_insert(self, cache_snapshot, obj):
+        self._reset_if_new_run(cache_snapshot)
+        self._prune_metadata(cache_snapshot)
+        self._ensure_sketch(cache_snapshot)
+
+        now = cache_snapshot.access_count
+        key = obj.key
+        self.miss_streak += 1
+        # Slow cooldown decay on continued misses
+        if self.scan_cooldown > 0:
+            self.scan_cooldown = max(0, self.scan_cooldown - 1)
+        # Trigger scan cooldown if too many consecutive misses
+        cap = self._cap(cache_snapshot)
+        if self.miss_streak >= max(32, cap // 2):
+            self.scan_cooldown = max(self.scan_cooldown, min(cap, self.miss_streak))
+
+        # Learn on admission and initialize decayed metadata
+        self._sketch_add(cache_snapshot, key, 1)
+        self.last_time[key] = now
+        # Start with small score to reduce scan pollution
+        self.score[key] = 0.5
+
+        # ARC adaptive p tuning based on ghost refaults
+        if key in self.B1:
+            delta = max(1, len(self.B2) // max(1, len(self.B1)))
+            self.p = min(float(cap), self.p + float(delta))
+            self.B1.pop(key, None)
+            # Under scan cooldown, only place into T2 if modestly hot
+            if self.scan_cooldown > 0 and self._sketch_est(cache_snapshot, key) < 2:
+                self._move_to_mru(self.T1, key)
+            else:
+                self._move_to_mru(self.T2, key)
+        elif key in self.B2:
+            delta = max(1, len(self.B1) // max(1, len(self.B2)))
+            self.p = max(0.0, self.p - float(delta))
+            self.B2.pop(key, None)
+            if self.scan_cooldown > 0 and self._sketch_est(cache_snapshot, key) < 2:
+                self._move_to_mru(self.T1, key)
+            else:
+                self._move_to_mru(self.T2, key)
+        else:
+            # Fresh miss: early promotion if clearly hot
+            thr = 5 if self.scan_cooldown > 0 else 3
+            if self._sketch_est(cache_snapshot, key) >= thr:
+                self._move_to_mru(self.T2, key)
+            else:
+                self._move_to_mru(self.T1, key)
+
+        # Enforce protected target size: |T2| <= cap - p
+        p_int = int(round(max(0.0, min(float(cap), self.p))))
+        t2_target = max(0, cap - p_int)
+        while len(self.T2) > t2_target and self.T2:
+            demote_k, _ = self.T2.popitem(last=False)
+            self._move_to_mru(self.T1, demote_k)
+
+        # Bound ghosts
+        self._trim_ghosts(cache_snapshot)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def update_after_evict(self, cache_snapshot, obj, evicted_obj):
+        self._reset_if_new_run(cache_snapshot)
+        evk = evicted_obj.key
+
+        # Remove from resident sets, track origin
+        removed_from = None
+        if evk in self.T1:
+            self.T1.pop(evk, None)
+            removed_from = "T1"
+        elif evk in self.T2:
+            self.T2.pop(evk, None)
+            removed_from = "T2"
+        else:
+            removed_from = self.last_victim_from
+
+        # Place into ghost according to origin
+        if removed_from == "T1":
+            self.B1[evk] = None
+        elif removed_from == "T2":
+            self.B2[evk] = None
+
+        # Clean up LRFU metadata
+        self.score.pop(evk, None)
+        self.last_time.pop(evk, None)
+
+        self._trim_ghosts(cache_snapshot)
+        if self.last_victim_key == evk:
+            self.last_victim_key = None
+            self.last_victim_from = None
+        # Mild cooldown decay on eviction progression
+        if self.scan_cooldown > 0:
+            self.scan_cooldown = max(0, self.scan_cooldown - 1)
+=======
+    def update_after_evict(self, cache_snapshot, obj, evicted_obj):
+        self._reset_if_new_run(cache_snapshot)
+        evk = evicted_obj.key
+
+        # Remove from resident sets, track origin
+        removed_from = None
+        if evk in self.T1:
+            self.T1.pop(evk, None)
+            removed_from = "T1"
+        elif evk in self.T2:
+            self.T2.pop(evk, None)
+            removed_from = "T2"
+        else:
+            removed_from = self.last_victim_from
+
+        # Place into ghost according to origin
+        if removed_from == "T1":
+            self.B1[evk] = None
+        elif removed_from == "T2":
+            self.B2[evk] = None
+
+        # Clean up LRFU metadata
+        self.score.pop(evk, None)
+        self.last_time.pop(evk, None)
+
+        # Bound ghosts and clear last-victim markers
+        self._trim_ghosts(cache_snapshot)
+        if self.last_victim_key == evk:
+            self.last_victim_key = None
+            self.last_victim_from = None
+        # Mild cooldown decay on eviction progression
+        if self.scan_cooldown > 0:
+            self.scan_cooldown = max(0, self.scan_cooldown - 1)
+>>>>>>> REPLACE
+</DIFF>

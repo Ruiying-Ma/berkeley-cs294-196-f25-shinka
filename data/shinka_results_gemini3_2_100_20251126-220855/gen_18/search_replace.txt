@@ -1,0 +1,38 @@
+<NAME>
+randomized_arc
+</NAME>
+
+<DESCRIPTION>
+Introduces randomized victim selection to the Adaptive Replacement Cache (ARC) implementation. Instead of strictly evicting the Least Recently Used (LRU) item, the algorithm selects a random victim from the bottom K (default 5) items of the target list (T1 or T2). This randomization helps to desynchronize the cache eviction from worst-case cyclic scan patterns that are slightly larger than the cache capacity, reducing thrashing while preserving the general benefits of ARC's Recency/Frequency balance.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+from collections import OrderedDict
+
+# Global ARC State
+=======
+from collections import OrderedDict
+import random
+import itertools
+
+# Global ARC State
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    if replace_t1:
+        return next(iter(m_t1))
+    else:
+        return next(iter(m_t2))
+=======
+    target_map = m_t1 if replace_t1 else m_t2
+
+    # Randomized victim selection from bottom K items (approx. LRU)
+    # This mitigates worst-case synchronization with cyclic loops
+    k = 5
+    candidates = list(itertools.islice(target_map, k))
+
+    if candidates:
+        return random.choice(candidates)
+    return next(iter(target_map))
+>>>>>>> REPLACE
+</DIFF>

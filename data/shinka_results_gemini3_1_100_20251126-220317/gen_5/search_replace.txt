@@ -1,0 +1,125 @@
+<NAME>
+lfu_da_ghost
+</NAME>
+
+<DESCRIPTION>
+I propose upgrading the LFU-DA algorithm to include "Ghost Frequency" history.
+Standard LFU-DA resets an item's frequency to 1 when it is evicted and later re-inserted. This loses valuable information about the item's past popularity, making it vulnerable to eviction again if the working set is slightly larger than the cache.
+By maintaining a `ghost_freq` map for evicted items (limited to the cache capacity), we can restore an item's previous frequency upon re-insertion.
+This allows frequently accessed items to quickly regain their high priority ($P = F + L$) even after being temporarily evicted, significantly improving performance on looping workloads or shifting working sets.
+The `ghost_freq` is managed as a LRU queue (using Python's insertion-ordered dict) to discard the history of items that haven't been seen for a long time, ensuring scan resistance and bounded memory usage.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+# LFU-DA State
+algo_state = {
+    'priority': {},      # key -> priority (float)
+    'freq': {},          # key -> frequency (int)
+    'last_access': {},   # key -> last access timestamp (int)
+    'L': 0.0,            # Aging factor
+    'max_time': 0        # Track time to detect trace resets
+}
+
+def _check_reset(current_time):
+    # If time goes backwards, we are likely processing a new trace
+    if current_time < algo_state['max_time']:
+        algo_state['priority'].clear()
+        algo_state['freq'].clear()
+        algo_state['last_access'].clear()
+        algo_state['L'] = 0.0
+        algo_state['max_time'] = 0
+    algo_state['max_time'] = current_time
+=======
+# LFU-DA State with Ghost History
+algo_state = {
+    'priority': {},      # key -> priority (float)
+    'freq': {},          # key -> frequency (int)
+    'last_access': {},   # key -> last access timestamp (int)
+    'ghost_freq': {},    # key -> frequency (int) of evicted items
+    'L': 0.0,            # Aging factor
+    'max_time': 0        # Track time to detect trace resets
+}
+
+def _check_reset(current_time):
+    # If time goes backwards, we are likely processing a new trace
+    if current_time < algo_state['max_time']:
+        algo_state['priority'].clear()
+        algo_state['freq'].clear()
+        algo_state['last_access'].clear()
+        algo_state['ghost_freq'].clear()
+        algo_state['L'] = 0.0
+        algo_state['max_time'] = 0
+    algo_state['max_time'] = current_time
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Insert: F = 1, P = 1 + L
+    '''
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+    algo_state['freq'][key] = 1
+    algo_state['priority'][key] = 1.0 + algo_state['L']
+    algo_state['last_access'][key] = cache_snapshot.access_count
+=======
+def update_after_insert(cache_snapshot, obj):
+    '''
+    Insert: F = 1 (or restored from ghost), P = F + L
+    '''
+    _check_reset(cache_snapshot.access_count)
+    key = obj.key
+
+    # Restore frequency if in ghost
+    freq = 1
+    if key in algo_state['ghost_freq']:
+        freq = algo_state['ghost_freq'].pop(key) + 1
+
+    algo_state['freq'][key] = freq
+    algo_state['priority'][key] = freq + algo_state['L']
+    algo_state['last_access'][key] = cache_snapshot.access_count
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Evict: Update L to the priority of the evicted object.
+    '''
+    # Note: _check_reset not needed here as it usually follows evict/insert sequence
+    key = evicted_obj.key
+    if key in algo_state['priority']:
+        # L becomes the priority of the victim
+        algo_state['L'] = algo_state['priority'][key]
+        del algo_state['priority'][key]
+
+    if key in algo_state['freq']:
+        del algo_state['freq'][key]
+
+    if key in algo_state['last_access']:
+        del algo_state['last_access'][key]
+=======
+def update_after_evict(cache_snapshot, obj, evicted_obj):
+    '''
+    Evict: Update L, move freq to ghost.
+    '''
+    # Note: _check_reset not needed here as it usually follows evict/insert sequence
+    key = evicted_obj.key
+    if key in algo_state['priority']:
+        # L becomes the priority of the victim
+        algo_state['L'] = algo_state['priority'][key]
+        del algo_state['priority'][key]
+
+    if key in algo_state['freq']:
+        # Move frequency to ghost
+        algo_state['ghost_freq'][key] = algo_state['freq'][key]
+        del algo_state['freq'][key]
+
+    if key in algo_state['last_access']:
+        del algo_state['last_access'][key]
+
+    # Limit ghost size to cache capacity
+    capacity = cache_snapshot.capacity
+    while len(algo_state['ghost_freq']) > capacity:
+        # Remove oldest inserted (LRU of ghost)
+        algo_state['ghost_freq'].pop(next(iter(algo_state['ghost_freq'])))
+>>>>>>> REPLACE
+</DIFF>
